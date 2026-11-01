@@ -128,6 +128,26 @@ test('the exporter error names each trigger without its value and requires an ex
   } finally { f.close() }
 })
 
+test('near-miss values of the off-switch variables still block', async () => {
+  const f = fixture()
+  try {
+    for (const [key, value] of [['COPILOT_OTEL_ENABLED', 'FALSE '], ['COPILOT_OTEL_ENABLED', 'true'], ['OTEL_SDK_DISABLED', '1'], ['COPILOT_OTEL_FILE_EXPORTER_PATH', `${devNull}.log`]] as const) {
+      f.environment[key] = value
+      await assert.rejects(f.invoke('superagent_snapshot'), new RegExp(`Active: env ${key}\\.$`), `${key}=${value}`)
+      delete f.environment[key]
+    }
+  } finally { f.close() }
+})
+
+test('the privacy command also disables the Agent Host span exporter', async () => {
+  const f = fixture()
+  try {
+    f.values['chat.agentHost.otel.dbSpanExporter.enabled'] = true
+    await f.command('privacy')
+    assert.equal(f.values['chat.agentHost.otel.dbSpanExporter.enabled'], false)
+  } finally { f.close() }
+})
+
 test('exporters active at startup are reported until reload', async () => {
   const f = fixture()
   try {
