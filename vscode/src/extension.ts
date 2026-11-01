@@ -30,7 +30,8 @@ function exporterFindings(): string[] {
   // Copilot can enable debug file logging by experiment, which getConfiguration cannot see; require an explicit opt-out.
   const debugLog = 'agentDebugLog.fileLogging.enabled', debugLogInspect = copilot.inspect(debugLog)
   const debugLogOptedOut = copilot.get(debugLog) === false
-    && [debugLogInspect?.workspaceFolderValue, debugLogInspect?.workspaceValue, debugLogInspect?.globalValue].some(value => value !== undefined)
+    && !!debugLogInspect && ['policyValue', 'workspaceFolderLanguageValue', 'workspaceFolderValue', 'workspaceLanguageValue', 'workspaceValue', 'globalLanguageValue', 'globalValue']
+      .some(scope => (debugLogInspect as Record<string, unknown>)[scope] !== undefined)
   return [
     ...['otel.enabled', 'otel.dbSpanExporter.enabled', 'otel.outfile', 'chatDebug.fileLogging.enabled'].filter(key => enabled(copilot, key)).map(key => `github.copilot.chat.${key}`),
     ...debugLogOptedOut ? [] : [`github.copilot.chat.${debugLog}`],
