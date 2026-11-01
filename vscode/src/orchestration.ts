@@ -528,10 +528,10 @@ export class AutomationService {
           if (ref) this.runtime.engine.bindThread(ticketId, ref, true)
           const result = this.runtime.engine.report(ticketId, value)
           let answered: { channel: ChannelRef; text: string } | undefined
-          if (value.answers && result.channels.length) {
+          const channel = value.answers ? this.runtime.repositories.triggers.get(value.answers)?.channel : undefined
+          if (value.answers && channel) {
             this.runtime.engine.reply({ purpose: 'answer', ticketId, triggerId: value.answers, text: value.summary })
-            const channel = this.runtime.repositories.triggers.get(value.answers)?.channel
-            if (channel) answered = { channel, text: value.summary }
+            answered = { channel, text: value.summary }
           }
           this.relayReport(result, answered)
           return result

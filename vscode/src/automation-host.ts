@@ -6,7 +6,7 @@ import type { OutboundMessage, ThreadRef, Ticket, Trigger } from '../../src/core
 import { CopilotBackend } from './copilot.ts'
 import { AutomationService } from './orchestration.ts'
 import { automationGate } from './settings.ts'
-import { SuperagentPanel } from './panel.ts'
+import { SuperagentPanel, type SettingsActionResult } from './panel.ts'
 import { ticketPermission } from './permissions.ts'
 import type { TicketRuntime } from './runtime.ts'
 import type { Worktrees } from './worktree.ts'
@@ -314,13 +314,14 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
     s.start(); panel.show(); notify()
   }
 
-  async function action(message: Record<string, unknown>): Promise<void> {
+  async function action(message: Record<string, unknown>): Promise<SettingsActionResult | void> {
     assertCurrent()
     const action = message.action, id = typeof message.id === 'string' ? message.id : ''
     if (action === 'refresh') { panel.refresh(); return }
     if (action === 'start') { await start(); return }
     if (action === 'configureSources') { await vscode.commands.executeCommand('workbench.action.openSettings', 'superagent'); return }
     const s = await get(), h = owner!
+    let result: SettingsActionResult | undefined
     switch (action) {
       case 'poll': await s.pollNow(); break
       case 'stopService':
@@ -348,10 +349,14 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
       }
       case 'saveSettings':
         if (!Number.isSafeInteger(message.revision)) throw new Error('Invalid settings revision')
-        s.saveSettings(message.value, message.revision as number); s.kick(); break
+        s.saveSettings(message.value, message.revision as number)
+        result = { type: 'settings', action: 'saveSettings', settings: s.settings }
+        s.kick(); break
       case 'restoreSettings':
         if (!Number.isSafeInteger(message.revision) || !Number.isSafeInteger(message.baseRevision)) throw new Error('Invalid settings revision')
-        s.restoreSettings(message.revision as number, message.baseRevision as number); break
+        s.restoreSettings(message.revision as number, message.baseRevision as number)
+        result = { type: 'settings', action: 'restoreSettings', settings: s.settings }
+        break
       case 'previewWorker': case 'previewAssessor': {
         const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content: s.previewPrompt(action === 'previewWorker' ? 'worker' : 'assessor') })
         await vscode.window.showTextDocument(doc); break
@@ -359,6 +364,7 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
       default: throw new Error('Unknown supervision action')
     }
     notify()
+    return result
   }
 
   const register = (name: string, callback: () => Promise<unknown>) => context.subscriptions.push(vscode.commands.registerCommand(`superagent.${name}`, () =>

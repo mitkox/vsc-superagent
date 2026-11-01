@@ -87,6 +87,7 @@ function fixture(initial: Record<string, unknown> = {}) {
     initialize: () => commands.get('superagent.dashboard')!(),
     start: () => commands.get('superagent.startService')!(),
     save: (value: unknown) => panel.action({ action: 'saveSettings', revision: snapshot().settings.revision, value }),
+    restore: (revision: number) => panel.action({ action: 'restoreSettings', revision, baseRevision: snapshot().settings.revision }),
     poll: () => panel.action({ action: 'poll' }),
     respond: (handler: (url: URL) => unknown) => { response = handler },
     onSignIn: (handler: () => void) => { signIn = handler },
@@ -469,4 +470,34 @@ test('resumed tickets discover a new PR without reopening their historical close
     assert.ok(f.runtime.get(ticket.id).follows?.some(follow => follow.thread === `${oldThread.source}:8` && follow.own && !follow.closed))
     assert.equal(f.runtime.get(ticket.id).ended, undefined)
   } finally { await f.close() }
+})
+
+test('native settings action results capture their committed revision before an unrelated settings commit', async () => {
+  for (const action of ['saveSettings', 'restoreSettings']) {
+    const f = fixture()
+    try {
+      await f.initialize()
+      const original = f.snapshot().settings.revision
+      if (action === 'restoreSettings') await f.save({ enabled: true })
+      const base = f.snapshot().settings.revision, expectedEnabled = action === 'saveSettings'
+      let queued = false
+      const unsubscribe = f.runtime.repositories.onCommit(() => {
+        if (!queued && f.snapshot().settings.revision === base + 1) {
+          queued = true
+          queueMicrotask(() => f.runtime.repositories.mutateAutomation(data => {
+            data.settings!.revision++
+            data.settings!.value.enabled = !expectedEnabled
+          }))
+        }
+      })
+      const result = await (action === 'saveSettings' ? f.save({ enabled: true }) : f.restore(original))
+      unsubscribe()
+      assert.ok(result)
+      assert.equal(result.type, 'settings'); assert.equal(result.action, action)
+      assert.equal(result.settings.revision, base + 1)
+      assert.equal((result.settings.value as AutomationSettings).enabled, expectedEnabled)
+      assert.equal(f.snapshot().settings.revision, base + 2)
+      assert.equal(f.snapshot().settings.value.enabled, !expectedEnabled)
+    } finally { await f.close() }
+  }
 })

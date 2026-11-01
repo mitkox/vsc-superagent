@@ -12,7 +12,7 @@ body{font:13px var(--vscode-font-family);color:var(--vscode-foreground);backgrou
 <main id="content"></main>
 <script nonce="${nonce}">
 const api = acquireVsCodeApi();
-let snapshot = {}, tab = 'Overview', dirty = false;
+let snapshot = {}, tab = 'Overview', draft, pending, nextRequest = 0;
 const content = document.getElementById('content');
 const send = (action, payload = {}) => api.postMessage({ action, ...payload });
 function node(tag, text, parent, cls) { const el = document.createElement(tag); if (text !== undefined)
@@ -20,6 +20,16 @@ function node(tag, text, parent, cls) { const el = document.createElement(tag); 
     el.className = cls; if (parent)
     parent.append(el); return el; }
 function json(value) { return JSON.stringify(value, null, 2); }
+function loadDraft(settings) { draft = { text: json(settings?.value || {}), baseRevision: settings?.revision || 0, dirty: false }; }
+function currentDraft() { if (!draft) loadDraft(snapshot.settings); return draft; }
+function settingsAction(action, payload) {
+    if (pending) return;
+    const current = currentDraft();
+    pending = { requestId: 'settings-' + (++nextRequest), action, baseRevision: current.baseRevision };
+    document.getElementById('notice').textContent = '';
+    send(action, { ...payload, requestId: pending.requestId });
+    render();
+}
 function button(parent, label, action, id) { const el = node('button', label, parent); el.onclick = () => send(action, id ? { id } : {}); return el; }
 function rows(name) { return Array.isArray(snapshot[name]) ? snapshot[name] : []; }
 function matches(value) { return json(value).toLowerCase().includes(document.getElementById('search').value.toLowerCase()); }
@@ -33,7 +43,6 @@ function ticketCard(ticket, parent) { const card = node('article', undefined, pa
 } button(actions, 'Read conversation', 'conversation', ticket.id); const trace = rows('sessions').find(s => s.ticketId === ticket.id); if (trace)
     detail(card, 'Copilot session and transcript', trace); detail(card, 'Ticket, mandate and inputs', ticket); }
 function render() {
-    const saved = tab === 'Settings' && dirty ? document.getElementById('settings')?.value : undefined;
     content.replaceChildren();
     document.querySelectorAll('[data-tab]').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
     const tickets = rows('tickets').filter(matches);
@@ -93,22 +102,27 @@ function render() {
     }
     else if (tab === 'Settings') {
         node('p', 'Policy, worker concurrency, models, proactive rules and prompt sections. Saving creates a retained revision.', content);
-        node('label', 'Settings revision ' + (snapshot.settings?.revision || 0), content);
+        const current = currentDraft();
+        node('label', 'Draft base revision ' + current.baseRevision + ' · Current revision ' + (snapshot.settings?.revision || 0) + (current.dirty ? ' · Unsaved changes' : ''), content);
         const editor = node('textarea', undefined, content);
         editor.id = 'settings';
         editor.setAttribute('aria-label', 'Superagent settings JSON');
-        editor.value = saved ?? json(snapshot.settings?.value || {});
-        editor.oninput = () => { dirty = true; };
+        editor.value = current.text;
+        editor.disabled = !!pending;
+        editor.oninput = () => { if (!pending) { current.text = editor.value; current.dirty = true; } };
         const tools = node('div', undefined, content, 'toolbar');
         const save = button(tools, 'Save settings', 'unused');
-        save.onclick = () => { try {
-            const value = JSON.parse(editor.value);
-            send('saveSettings', { value, revision: snapshot.settings?.revision || 0 });
-            dirty = false;
+        save.disabled = !!pending;
+        save.onclick = () => { if (pending) return; try {
+            const value = JSON.parse(current.text);
+            settingsAction('saveSettings', { value, revision: current.baseRevision });
         }
         catch {
             document.getElementById('notice').textContent = 'Settings must be valid JSON.';
         } };
+        const reload = button(tools, 'Reload current settings', 'unused');
+        reload.disabled = !!pending;
+        reload.onclick = () => { if (!pending) { loadDraft(snapshot.settings); render(); } };
         button(tools, 'Preview worker prompt', 'previewWorker');
         button(tools, 'Preview assessment prompt', 'previewAssessor');
         if (snapshot.promptDefaultsChanged?.length)
@@ -117,7 +131,8 @@ function render() {
             const card = node('article', undefined, content);
             node('strong', 'Revision ' + version.revision + ' · ' + (version.at || ''), card);
             const restore = button(card, 'Restore this revision', 'unused');
-            restore.onclick = () => send('restoreSettings', { revision: version.revision, baseRevision: snapshot.settings?.revision || 0 });
+            restore.disabled = !!pending;
+            restore.onclick = () => settingsAction('restoreSettings', { revision: version.revision, baseRevision: current.baseRevision });
             detail(card, 'Saved settings', version);
         }
     }
@@ -125,12 +140,34 @@ function render() {
 document.querySelectorAll('[data-action]').forEach(el => el.onclick = () => send(el.dataset.action));
 document.querySelectorAll('[data-tab]').forEach(el => el.onclick = () => { tab = el.dataset.tab; render(); });
 document.getElementById('search').oninput = render;
-window.addEventListener('message', event => { if (event.data.type === 'state') {
-    snapshot = event.data.value;
-    render();
-}
-else if (event.data.type === 'notice')
-    document.getElementById('notice').textContent = event.data.text; });
+window.addEventListener('message', event => {
+    const message = event.data;
+    if (!message || typeof message !== 'object') return;
+    if (message.type === 'state') {
+        const incoming = message.value, previous = snapshot.settings;
+        const fresh = Number.isSafeInteger(incoming.settings?.revision) && incoming.settings.revision >= (previous?.revision || 0);
+        snapshot = !fresh && previous ? { ...incoming, settings: previous } : incoming;
+        if (draft && !draft.dirty && !pending && fresh && incoming.settings.revision > draft.baseRevision) loadDraft(incoming.settings);
+        render();
+    }
+    else if (message.type === 'settingsResult') {
+        if (!pending || message.requestId !== pending.requestId || message.action !== pending.action
+            || message.settings?.revision !== pending.baseRevision + 1 || !message.settings.value || typeof message.settings.value !== 'object' || Array.isArray(message.settings.value)) return;
+        loadDraft(message.settings);
+        if ((snapshot.settings?.revision || 0) < message.settings.revision) snapshot = { ...snapshot, settings: message.settings };
+        pending = undefined;
+        render();
+    }
+    else if (message.type === 'notice') {
+        if (message.requestId && (!pending || message.requestId !== pending.requestId || message.action !== pending.action)) return;
+        document.getElementById('notice').textContent = message.text;
+        if (pending && message.requestId === pending.requestId && message.action === pending.action) {
+            draft.dirty = true;
+            pending = undefined;
+            render();
+        }
+    }
+});
 send('refresh');
 </script></body></html>`
 }

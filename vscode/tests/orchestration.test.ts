@@ -565,6 +565,74 @@ test('a coalesced ready answer still sends a distinct later PR merge notificatio
   } finally { await f.clean() }
 })
 
+for (const family of ['github', 'teams'] as const) {
+  for (const state of ['ready', 'waiting', 'progress', 'blocked', 'failed', 'dropped'] as const) {
+    test(`${family} ${state} answers to native followups commit without a source reply channel`, async () => {
+      const f = fixture(async request => {
+        if (f.runs.length === 1) await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'waiting', summary: 'Waiting for the operator.' })
+        else await new Promise<void>(resolve => request.signal.addEventListener('abort', () => resolve(), { once: true }))
+      })
+      try {
+        f.service.saveSettings({ sources: { [family]: { enabled: true, allowedActors: ['owner'] } } }, f.service.settings.revision)
+        const source = `${family}:scope`
+        f.inbox.push(trigger('source-request', { source, actor: { source, id: 'owner' }, threads: [{ source, id: '1' }], channel: { source, thread: `${source}:1`, address: {} } }))
+        f.service.start(); await f.service.pollNow(); await eventually(() => f.runs.length === 1 && f.service.snapshot().health.workers === 0)
+        const ticket = f.runtime.list()[0]!
+        f.runtime.followup(ticket.id, 'Native question about this repair')
+        await eventually(() => f.runs.length === 2)
+        const local = f.runtime.context(ticket.id).messages.find(message => message.source === 'vscode')!
+        assert.equal(local.channel, undefined)
+        assert.equal(f.runtime.get(ticket.id).channels.length, 1)
+        await assert.doesNotReject(() => f.runs[1]!.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state, summary: 'Recorded local answer.', reply_to_trigger_id: local.id }))
+        const current = f.runtime.get(ticket.id)
+        assert.equal(current.assignments.at(-1)?.report?.state, state)
+        assert.ok(current.answers?.includes(local.id))
+        assert.equal(f.service.snapshot().effects.filter(effect => effect.kind === 'outbound').length, state === 'ready' ? 1 : 0)
+        if (state === 'ready') {
+          await eventually(() => f.sent.length === 1)
+          assert.equal(f.sent[0]!.channel.thread, `${source}:1`)
+        }
+      } finally { await f.clean() }
+    })
+  }
+
+  test(`${family} an unreplyable source followup still records its answer and relays the provider result`, async () => {
+    const f = fixture(async request => {
+      if (f.runs.length === 1) await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'waiting', summary: 'Waiting for source context.' })
+      else await new Promise<void>(resolve => request.signal.addEventListener('abort', () => resolve(), { once: true }))
+    })
+    try {
+      f.service.saveSettings({ sources: { [family]: { enabled: true, allowedActors: ['owner'] } } }, f.service.settings.revision)
+      const source = `${family}:scope`, item = (id: string, channel?: ChannelRef) => trigger(id, { source, actor: { source, id: 'owner' }, threads: [{ source, id: '1' }], channel })
+      f.inbox.push(item('provider-origin', { source, thread: `${source}:1`, address: {} })); f.service.start(); await f.service.pollNow()
+      await eventually(() => f.runs.length === 1 && f.service.snapshot().health.workers === 0)
+      f.inbox.push(item('missing-channel-question')); await f.service.pollNow(); await eventually(() => f.runs.length === 2)
+      await assert.doesNotReject(() => f.runs[1]!.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'ready', summary: 'Provider result remains deliverable.', reply_to_trigger_id: 'missing-channel-question' }))
+      assert.equal(f.runtime.list()[0]!.assignments.at(-1)?.report?.state, 'ready')
+      assert.equal(f.service.snapshot().effects.filter(effect => effect.kind === 'outbound').length, 1)
+      await eventually(() => f.sent.length === 1)
+    } finally { await f.clean() }
+  })
+}
+
+test('a provider question reached by a local-origin ticket receives its explicit answer', async () => {
+  const f = fixture(async request => {
+    if (f.runs.length === 1) await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'waiting', summary: 'Waiting for a source question.' })
+    else await new Promise<void>(resolve => request.signal.addEventListener('abort', () => resolve(), { once: true }))
+  })
+  try {
+    const ticket = f.runtime.create('Investigate the approved local request'); f.service.start()
+    await eventually(() => f.runs.length === 1 && f.service.snapshot().health.workers === 0)
+    f.runtime.engine.bindThread(ticket.id, { source: 'github:scope', id: 'issue-1' }, false)
+    f.inbox.push(trigger('source-question')); await f.service.pollNow(); await eventually(() => f.runs.length === 2)
+    assert.equal(f.runtime.get(ticket.id).channels.length, 0)
+    await f.runs[1]!.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'ready', summary: 'The explicit source answer.', reply_to_trigger_id: 'source-question' })
+    assert.equal(f.service.snapshot().effects.filter(effect => effect.kind === 'outbound').length, 1)
+    await eventually(() => f.sent.length === 1)
+    assert.equal(f.sent[0]!.text, 'The explicit source answer.')
+  } finally { await f.clean() }
+})
+
 test('a source PR merge relays one final completion notice to the original Teams conversation', async () => {
   const f = fixture(async request => {
     f.runtime.engine.bindThread(request.ticketId, { source: 'github:scope', id: '42' }, true)
