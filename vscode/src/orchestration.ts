@@ -54,6 +54,7 @@ export class AutomationService {
   private running = false
   private disposed = false
   private scheduled = false
+  private pumping = false
   private pollTimer?: ReturnType<typeof setTimeout>
   private retryTimer?: ReturnType<typeof setTimeout>
   private pollController?: AbortController
@@ -141,12 +142,15 @@ export class AutomationService {
   }
 
   kick(): void {
-    if (!this.running || this.disposed || this.scheduled || this.recovering) return
+    if (!this.running || this.disposed || this.scheduled || this.recovering || this.pumping) return
     this.scheduled = true
     queueMicrotask(() => {
       this.scheduled = false
       if (!this.running || this.disposed) return
+      // The pump observes its own commits in this pass; only later activity needs another pass.
+      this.pumping = true
       try { this.pump() } catch (error) { this.problem('scheduler', error) }
+      finally { this.pumping = false }
     })
   }
 

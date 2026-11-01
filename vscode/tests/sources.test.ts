@@ -194,6 +194,23 @@ test('Teams reads only configured Graph scope and permitted human messages as pl
   assert.equal(items[0]?.source, 'teams')
 })
 
+test('Teams bot-only source policy collects listed applications without granting human authority', async () => {
+  const bot = '44444444-4444-4444-4444-444444444444'
+  let requests = 0
+  const items = await pollTeams({ ...teams, allowedActors: [], allowedBots: [bot] }, undefined, async () => {
+    requests++
+    return json({ value: [message('101', { from: { application: { id: bot } } }),
+      message('102', { from: { application: { id: actor } } }), message('103', { from: { user: { id: bot, tenantId: tenant } } })] })
+  })
+  assert.equal(requests, 1)
+  assert.equal(items.length, 1)
+  assert.equal(items[0]?.actor, bot)
+  assert.equal(items[0]?.context?.provider, 'teams')
+  assert.equal(items[0]?.context?.human, false)
+  assert.equal(items[0]?.context?.allowedActor, false)
+  assert.equal(sourceTrigger(items[0]!).human, false)
+})
+
 test('Teams event IDs bind configured tenant, scope and edited message text', async () => {
   const read = (input = teams, content = 'First') => pollTeams(input, undefined, async () => json({ value: [message('100', {
     from: { user: { id: actor } }, body: { contentType: 'text', content },

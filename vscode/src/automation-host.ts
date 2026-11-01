@@ -80,21 +80,25 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
       scopes: writing ? ['issues:write', 'pull_requests:write'] : [] }
   }
 
+  function sourceSettings() {
+    const native = sourcePolicy(), policyKey = 'source-configuration-fingerprint', policyFingerprint = fingerprint(native)
+    if (owner!.runtime.readData<string>(policyKey) !== policyFingerprint) {
+      service!.saveSettings({ sources: native }, service!.settings.revision)
+      owner!.runtime.writeData(policyKey, policyFingerprint)
+    }
+    return service!.settings.value.sources
+  }
+
   async function poll(signal: AbortSignal): Promise<Trigger[]> {
     const h = owner!
-    const sourceSettings = sourcePolicy()
-    const policyKey = 'source-configuration-fingerprint', policyFingerprint = fingerprint(sourceSettings)
-    if (h.runtime.readData<string>(policyKey) !== policyFingerprint) {
-      service!.saveSettings({ ...service!.settings.value, sources: sourceSettings }, service!.settings.revision)
-      h.runtime.writeData(policyKey, policyFingerprint)
-    }
+    const sources = sourceSettings()
     // Each source commits received events and its cursor together, before acknowledging progress.
     const commit = (key: string, events: ReturnType<typeof sourceTrigger>[], cursor: unknown) => {
       assertCurrent(); signal.throwIfAborted()
       h.runtime.repositories.atomic(() => { events.forEach(event => h.runtime.engine.receive(event)); h.runtime.writeData(key, cursor) })
     }
     const errors: string[] = []
-    if (sourceSettings.github.enabled) {
+    if (sources.github.enabled) {
       try {
         const base = await github(), ref = githubThreadRef(base, 1), key = `source:github:${ref.source}`
         const previous = h.runtime.readData<{ since: string; reviews?: GitHubReviewCursor }>(key)
@@ -106,9 +110,9 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
           const provider = trigger.meta.provider as SourceContext | undefined
           return provider?.provider === 'github' && provider.isPullRequest && trigger.source === ref.source && subscribed.has(provider.number) ? [provider.number] : []
         }), ...h.runtime.list().flatMap(ticket => (ticket.follows ?? []).filter(follow => follow.thread.startsWith(`${ref.source}:`)).map(follow => Number(follow.thread.slice(ref.source.length + 1))))])]
-        const cfg = { ...base, since: previous?.since ?? new Date(Date.now() - 86400000).toISOString(), subscribedNumbers,
-          observeIssues: sourceSettings.github.allowUnaddressed, observePullRequests: sourceSettings.github.allowUnaddressed,
-          observeComments: sourceSettings.github.allowUnaddressed, observeReviews: sourceSettings.github.allowUnaddressed }
+        const cfg = { ...base, allowedActors: sources.github.allowedActors, allowedBots: sources.github.allowedBots, since: previous?.since ?? new Date(Date.now() - 86400000).toISOString(), subscribedNumbers,
+          observeIssues: sources.github.allowUnaddressed, observePullRequests: sources.github.allowUnaddressed,
+          observeComments: sources.github.allowUnaddressed, observeReviews: sources.github.allowUnaddressed }
         const items = await pollGitHub(cfg, signal)
         let reviews: Awaited<ReturnType<typeof pollGitHubReviewsBatch>>
         try { reviews = await pollGitHubReviewsBatch(cfg, previous?.reviews, signal) }
@@ -141,13 +145,14 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
         }
       } catch { signal.throwIfAborted(); errors.push('GitHub source failed; check source scope, permissions and pagination.') }
     }
-    if (sourceSettings.teams.enabled) {
+    if (sources.teams.enabled) {
       try {
         let base = await teams(config().get('delivery.enabled', false))
         if (config().get('teams.syncMembership', false)) {
           await syncMembers(false, base, signal)
-          base = { ...base, allowedActors: config().get('teams.allowedActors', []) }
         }
+        const policy = service!.settings.value.sources.teams
+        base = { ...base, allowedActors: policy.allowedActors, allowedBots: policy.allowedBots }
         const scopes = [...base.chatIds.map(chat => ({ chatIds: [chat], channels: [] as TeamsSourceConfig['channels'] })),
           ...base.channels.map(channel => ({ chatIds: [] as string[], channels: [channel] }))]
         for (const scope of scopes) {
@@ -259,6 +264,7 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
           }
           return resources.read(ticketId, channel, credential, input, signal)
         } })
+      sourceSettings()
       return service
     })().finally(() => { initializing = undefined })
     return initializing
@@ -277,7 +283,8 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
     const s = await get()
     const health = await backend!.check()
     if (!health.authenticated) throw new Error('Sign in to the configured Copilot CLI before starting Superagent')
-    s.saveSettings({ ...s.settings.value, enabled: true, sources: sourcePolicy() }, s.settings.revision)
+    sourceSettings()
+    s.saveSettings({ enabled: true }, s.settings.revision)
     await config().update('service.enabled', true, vscode.ConfigurationTarget.Global)
     s.start(); panel.show(); notify()
   }

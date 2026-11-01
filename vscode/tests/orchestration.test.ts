@@ -47,6 +47,29 @@ test('source trigger is assessed, runs in a persistent session and sends the res
   } finally { await f.clean() }
 })
 
+test('a delayed assessment yields to timers without repeatedly committing its deadline check', async () => {
+  const f = fixture()
+  let commits = 0, timerFired = false
+  const unsubscribe = f.runtime.repositories.onCommit(() => {
+    // Bound the broken microtask loop so this regression fails instead of hanging the test runner.
+    if (++commits === 100) void f.service.stop()
+  })
+  const assess = f.backend.assess
+  f.backend.assess = async (...args) => {
+    await new Promise(resolve => setTimeout(resolve, 10))
+    timerFired = true
+    return assess(...args)
+  }
+  try {
+    f.inbox.push(trigger('delayed-assessment')); f.service.start(); await f.service.pollNow()
+    await eventually(() => commits >= 100 || !!f.runtime.list()[0]?.ended)
+    assert.ok(commits < 100, 'The scheduler kept committing before the assessment timer could run')
+    assert.equal(timerFired, true)
+    assert.equal(f.runs.length, 1)
+    assert.equal(f.runtime.list()[0]?.ended?.outcome, 'completed')
+  } finally { unsubscribe(); await f.clean() }
+})
+
 test('a local or Teams-origin worker can resolve an approved GitHub alias for context without new authority', async () => {
   const f = fixture(async request => {
     await request.tools.find(tool => tool.name === 'orchestrator_thread_follow')!.invoke({ thread: 'github:9', reason: 'Related issue' })

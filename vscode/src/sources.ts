@@ -540,7 +540,7 @@ export function validateTeams(config: TeamsSourceConfig): void {
 }
 export async function pollTeamsBatch(config: TeamsSourceConfig, cursor?: TeamsBatchCursor, signal?: AbortSignal, transport: typeof fetch = fetch): Promise<{ items: InboxItem[]; next?: TeamsBatchCursor }> {
   validateTeams(config)
-  if (!config.allowedActors.length && !config.subscribedThreads?.length) return { items: [] }
+  if (!config.allowedActors.length && !config.allowedBots?.length && !config.subscribedThreads?.length) return { items: [] }
   if (cursor && (config.chatIds.length !== 0 || config.channels.length !== 1 || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0 || cursor.offset > 50
     || cursor.token !== undefined && (typeof cursor.token !== 'string' || !cursor.token || cursor.token.length > 8192)
     || cursor.offset > 0 && (typeof cursor.pageHash !== 'string' || !/^[a-f0-9]{64}$/.test(cursor.pageHash)))) fail('Invalid source configuration')
@@ -552,9 +552,10 @@ export async function pollTeamsBatch(config: TeamsSourceConfig, cursor?: TeamsBa
     const references = 'chatId' in receiving ? teamsReferences(message, receiving.chatId) : []
     const rootMessageId = root ?? (text(message.replyToId) || references[0] || messageId)
     const human = !!user && !application, allowedActor = human && allowed.has(actor.toLowerCase())
+    const allowedBot = !!application && (config.allowedBots?.some(value => value.toLowerCase() === actor.toLowerCase()) ?? false)
     const subscribed = config.subscribedThreads?.includes(`${scope}:${rootMessageId}`) ?? false
     if (!UUID.test(actor) || actor.toLowerCase() === config.accountId?.toLowerCase() || !TEAMS_ID.test(messageId) || ['.', '..'].includes(messageId)
-      || !TEAMS_ID.test(rootMessageId) || ['.', '..'].includes(rootMessageId) || !subscribed && !allowedActor
+      || !TEAMS_ID.test(rootMessageId) || ['.', '..'].includes(rootMessageId) || !subscribed && !allowedActor && !allowedBot
       || message.deletedDateTime || message.messageType !== 'message' || !body || user?.tenantId !== undefined && text(user.tenantId).toLowerCase() !== config.tenantId.toLowerCase()) return
     if (!recent(message.lastModifiedDateTime ?? message.createdDateTime, config.since)) return
     const content = teamsText(body)
