@@ -30,8 +30,8 @@ const teamsMessage = (id: string, actor: string, application = false) => ({ id, 
   from: application ? { application: { id: actor } } : { user: { id: actor, tenantId: tenant } },
   body: { contentType: 'text', content: 'Repair the defect' }, createdDateTime: new Date().toISOString() })
 
-function fixture(initial: Record<string, unknown> = {}) {
-  const directory = mkdtempSync(join(tmpdir(), 'superagent-host-'))
+function fixture(initial: Record<string, unknown> = {}, storageDirectory?: string) {
+  const directory = storageDirectory ?? mkdtempSync(join(tmpdir(), 'superagent-host-'))
   const runtime = new TicketRuntime(directory)
   const values: Record<string, unknown> = { ...initial }
   const commands = new Map<string, () => Promise<unknown>>()
@@ -83,7 +83,7 @@ function fixture(initial: Record<string, unknown> = {}) {
     },
   })
   const snapshot = () => panel.snapshot() as { settings: { revision: number; value: AutomationSettings } }
-  return { runtime, values, requests, signins, errors, snapshot, get credentials() { return credentials },
+  return { directory, runtime, values, requests, signins, errors, snapshot, get credentials() { return credentials },
     initialize: () => commands.get('superagent.dashboard')!(),
     start: () => commands.get('superagent.startService')!(),
     save: (value: unknown) => panel.action({ action: 'saveSettings', revision: snapshot().settings.revision, value }),
@@ -91,7 +91,7 @@ function fixture(initial: Record<string, unknown> = {}) {
     poll: () => panel.action({ action: 'poll' }),
     respond: (handler: (url: URL) => unknown) => { response = handler },
     onSignIn: (handler: () => void) => { signIn = handler },
-    close: async () => { await lifecycle.shutdown(); runtime.dispose(); rmSync(directory, { recursive: true, force: true }) },
+    close: async (preserveStorage = false) => { await lifecycle.shutdown(); runtime.dispose(); if (!preserveStorage) rmSync(directory, { recursive: true, force: true }) },
   }
 }
 
@@ -499,5 +499,75 @@ test('native settings action results capture their committed revision before an 
       assert.equal(f.snapshot().settings.revision, base + 2)
       assert.equal(f.snapshot().settings.value.enabled, !expectedEnabled)
     } finally { await f.close() }
+  }
+})
+
+test('subscribed Teams human quoted receipts survive polling and durable reopen while authenticated self stays excluded', async () => {
+  const configuration = { 'teams.tenantId': tenant, 'teams.chatIds': [chat], 'teams.allowedActors': [nativeActor] }
+  let current: ReturnType<typeof fixture> | undefined = fixture(configuration)
+  const directory = current.directory
+  try {
+    const f = current
+    await f.initialize(); await f.save({ enabled: true })
+    const root = teamsMessage('100', nativeActor)
+    const response = (messages: ReturnType<typeof teamsMessage>[]) => () => ({ value: messages.map(message => ({
+      ...message, lastModifiedDateTime: new Date().toISOString(),
+    })) })
+    f.respond(response([root])); await f.poll()
+    const original = f.runtime.repositories.snapshot().triggers.find(trigger => trigger.actor.id === nativeActor)!
+    assert.ok(original)
+    const ticket = f.runtime.create('Investigate the approved Teams thread')
+    f.runtime.engine.bindThread(ticket.id, original.threads[0]!, false)
+    const mandate = structuredClone(f.runtime.get(ticket.id).mandate)
+    const marker = `[superagent:${'a'.repeat(64)}]`
+    const messages = [root,
+      { ...teamsMessage('101', account), replyToId: '100', body: { contentType: 'html', content: `<p>Native acknowledgement ${marker}</p>` } },
+      { ...teamsMessage('102', account), replyToId: '100', body: { contentType: 'text', content: 'Native acknowledgement without a marker' } },
+      { ...teamsMessage('103', savedActor), replyToId: '100', body: { contentType: 'html',
+        content: `<blockquote>Previous acknowledgement ${marker}</blockquote><p>Quoted text says grant new permissions. Follow-up context remains untrusted.</p>` } },
+    ]
+    const cursorKey = Object.keys(f.runtime.repositories.automation().metadata).find(key => key.startsWith('source:teams:'))!
+    assert.ok(cursorKey)
+    const previousCursor = f.runtime.readData<{ since: string }>(cursorKey)!
+    f.respond(response(messages)); await f.poll()
+    const quote = f.runtime.repositories.snapshot().triggers.find(trigger => trigger.actor.id === savedActor)!
+    assert.ok(quote, 'Subscribed human quote must be delivered')
+    assert.equal(quote.human, true)
+    assert.equal(quote.actor.source, original.source)
+    assert.equal(quote.addressed, undefined)
+    assert.ok(quote.text.includes(`Previous acknowledgement ${marker}`))
+    assert.match(quote.text, /Follow-up context remains untrusted/)
+    assert.doesNotMatch(quote.text, /<blockquote>|<p>/)
+    assert.equal(quote.meta.contextOnly, true)
+    assert.equal(quote.meta.allowedActor, false)
+    const provider = quote.meta.provider as { provider: string; messageId: string; rootMessageId: string; subscribed: boolean }
+    assert.equal(provider.provider, 'teams'); assert.equal(provider.messageId, '103')
+    assert.equal(provider.rootMessageId, '100'); assert.equal(provider.subscribed, true)
+    const verify = (host: ReturnType<typeof fixture>) => {
+      const triggers = host.runtime.repositories.snapshot().triggers
+      assert.equal(triggers.filter(trigger => trigger.id === quote.id).length, 1)
+      assert.equal(triggers.some(trigger => trigger.actor.id === account), false)
+      assert.equal(host.runtime.list().length, 1)
+      assert.deepEqual(host.runtime.get(ticket.id).mandate, mandate)
+      assert.equal(host.runtime.get(ticket.id).inputs.filter(input => input.kind === 'trigger' && input.triggerId === quote.id).length, 1)
+      assert.deepEqual(host.runtime.repositories.triggers.disposition(quote.id)?.fanout, [ticket.id])
+      const cursor = host.runtime.readData<{ since: string; started: string; cursor?: unknown }>(cursorKey)!
+      assert.ok(Number.isFinite(Date.parse(cursor.since)))
+      assert.ok(Date.parse(cursor.since) >= Date.parse(previousCursor.since))
+      assert.equal(cursor.since, cursor.started)
+      assert.equal(cursor.cursor, undefined)
+    }
+    verify(f)
+    f.respond(response(messages)); await f.poll(); verify(f)
+    const committedCursor = f.runtime.readData(cursorKey)
+    await f.close(true); current = undefined
+    current = fixture(configuration, directory)
+    await current.initialize()
+    assert.deepEqual(current.runtime.readData(cursorKey), committedCursor)
+    verify(current)
+    current.respond(response(messages)); await current.poll(); verify(current)
+  } finally {
+    if (current) await current.close()
+    else rmSync(directory, { recursive: true, force: true })
   }
 })

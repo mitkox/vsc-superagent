@@ -566,8 +566,6 @@ export async function pollTeamsBatch(config: TeamsSourceConfig, cursor?: TeamsBa
     if (!recent(message.lastModifiedDateTime ?? message.createdDateTime, config.since)) return
     const content = teamsText(body)
     if (!content.trim()) return
-    // Our own deterministic delivery marker is excluded even when native auth has not supplied an account ID yet.
-    if (/\[superagent:[a-f0-9]{64}\]/.test(content)) return
     let url: string | undefined
     if (typeof message.webUrl === 'string') {
       try { const parsed = new URL(message.webUrl); if (parsed.protocol === 'https:' && ['teams.microsoft.com', 'teams.cloud.microsoft'].includes(parsed.hostname) && !parsed.username && !parsed.password) url = parsed.href } catch {}

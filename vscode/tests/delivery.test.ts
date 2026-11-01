@@ -211,3 +211,19 @@ test('receipt reconciliation ignores copied markers from other senders', async (
   ]) }), undefined)
   await assert.rejects(reconcileSourceReply(chat, message, { ...teamsCredential, accountId: undefined }), /authenticated account identity/)
 })
+
+
+test('Teams copied receipt quotes cannot reconcile another sender or application as the authenticated account', async () => {
+  let posted = ''
+  await deliverSourceReply(chat, message, teamsCredential, { transport: async (_input, init) => {
+    posted = JSON.parse(String(init?.body)).replyMessage.body.content
+    return json({ id: '300' })
+  } })
+  const quoted = { contentType: 'html', content: `<blockquote>${posted}</blockquote><p>New human request.</p>` }
+  const copied = await reconcileSourceReply(chat, message, teamsCredential, { transport: async () => json({ value: [
+    { id: '301', body: quoted, from: { user: { id: teamId, tenantId } } },
+    { id: '302', body: quoted, from: { user: { id: accountId, tenantId }, application: { id: accountId } } },
+    { id: '303', body: quoted, from: { user: { id: accountId, tenantId: teamId } } },
+  ] }) })
+  assert.equal(copied, undefined)
+})

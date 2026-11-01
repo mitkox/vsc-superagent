@@ -197,6 +197,45 @@ test('Teams reads only configured Graph scope and permitted human messages as pl
   assert.equal(items[0]?.source, 'teams')
 })
 
+for (const kind of ['chat', 'channel'] as const) {
+  test(`Teams ${kind} human receipt quotes survive subscription collection while authenticated self stays excluded`, async () => {
+    const marker = `[superagent:${'a'.repeat(64)}]`
+    const quote = `<blockquote>Earlier agent reply ${marker}</blockquote><p>Please check the next defect.</p>`
+    const input = { ...teams, allowedActors: [], accountId: actor,
+      ...(kind === 'channel' ? { chatIds: [], channels: [{ teamId, channelId: '19:channel@thread.tacv2' }] } : {}),
+      subscribedThreads: [kind === 'chat' ? 'chat:19:chat@thread.v2:100' : `team:${teamId}:channel:19:channel@thread.tacv2:100`] }
+    const root = message('100', { body: { contentType: 'text', content: `Agent result ${marker}` } })
+    const replies = [message('101', { from: { user: { id: teamId, tenantId: tenant } }, replyToId: '100', body: { contentType: 'html', content: quote } }),
+      message('102', { replyToId: '100', body: { contentType: 'text', content: `Own receipt ${marker}` } }),
+      message('103', { replyToId: '100', body: { contentType: 'text', content: 'Own message without a marker' } })]
+    const fetcher: typeof fetch = async request => json({ value: kind === 'chat' ? [root, ...replies]
+      : new URL(String(request)).pathname.endsWith('/replies') ? replies : [root] })
+    const first = await pollTeams(input, undefined, fetcher), repeated = await pollTeams(input, undefined, fetcher)
+    assert.equal(first.length, 1)
+    assert.equal(first[0]!.actor, teamId)
+    assert.equal(first[0]!.context?.human, true)
+    assert.equal(first[0]!.context?.allowedActor, false)
+    assert.equal(first[0]!.context?.subscribed, true)
+    assert.match(first[0]!.text, /Please check the next defect/)
+    assert.ok(first[0]!.text.includes(marker))
+    assert.equal(repeated[0]?.id, first[0]!.id)
+    const trigger = sourceTrigger(first[0]!)
+    const policy = validateSettings({ enabled: true, acceptMode: 'off', sources: { teams: { enabled: true, allowedActors: [], allowedBots: [] } } })
+    assert.equal(automationGate(policy, trigger).admissible, false)
+    assert.equal(trigger.actor.id, teamId)
+  })
+}
+
+test('Teams human receipt text is not authorship evidence when no account identity is configured', async () => {
+  const marker = `[superagent:${'b'.repeat(64)}]`
+  const items = await pollTeams(teams, undefined, async () => json({ value: [message('101', {
+    body: { contentType: 'html', content: `<blockquote>Earlier result ${marker}</blockquote><p>Please continue.</p>` },
+  })] }))
+  assert.equal(items.length, 1)
+  assert.equal(items[0]!.actor, actor)
+  assert.ok(items[0]!.text.includes(marker))
+})
+
 test('Teams bot-only source policy collects listed applications without granting human authority', async () => {
   const bot = '44444444-4444-4444-4444-444444444444'
   let requests = 0
@@ -233,6 +272,24 @@ test('Teams reactions do not create a new event but a text edit does', async () 
   const edited = await read('2026-11-01T00:02:00Z', 'Updated', '2026-11-01T00:02:00Z')
   assert.equal(first[0]?.id, reacted[0]?.id)
   assert.notEqual(first[0]?.id, edited[0]?.id)
+})
+
+test('GitHub human receipt quotes remain data across collection surfaces and self identity is excluded', async () => {
+  const marker = `<!-- superagent:${'c'.repeat(64)} -->`, body = `> Earlier reply ${marker}\n\n@agent Please continue.`
+  const users = [{ login: 'alice', type: 'User' }, { login: 'AgEnT', type: 'User' }, { login: 'outsider', type: 'User' }]
+  const fetched = await pollGitHub(config, undefined, async input => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/issues')) return json(users.map((user, index) => issue(body, { id: index + 1, user })))
+    const inline = path.endsWith('/pulls/comments')
+    return json(users.map((user, index) => ({ id: index + (inline ? 20 : 10), user, body, updated_at: '2026-11-01T10:00:00Z',
+      ...(inline ? { pull_request_url: 'https://api.github.com/repos/company/project/pulls/7' } : { issue_url: 'https://api.github.com/repos/company/project/issues/7' }) })))
+  })
+  const reviews = await pollGitHubReviewsBatch(config, undefined, undefined, async input => new URL(String(input)).pathname.endsWith('/pulls')
+    ? json([{ number: 7 }]) : json(users.map((user, index) => ({ id: index + 30, user, body, submitted_at: '2026-11-01T10:00:00Z' }))))
+  const all = [...fetched, ...reviews.items]
+  assert.equal(all.length, 4)
+  assert.ok(all.every(item => item.actor === 'alice' && item.context?.human && item.text.includes(marker)))
+  assert.deepEqual(all.map(item => item.context?.provider === 'github' ? item.context.kind : '').sort(), ['comment', 'issue', 'review', 'review-comment'].sort())
 })
 
 test('GitHub finds an edited old review even when the PR has no recent activity', async () => {
