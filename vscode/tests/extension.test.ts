@@ -4,7 +4,7 @@ import { buildSync } from 'esbuild'
 import { runInNewContext } from 'node:vm'
 import { createRequire } from 'node:module'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { devNull, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 
@@ -20,7 +20,7 @@ function fixture() {
   const commands = new Map<string, () => Promise<unknown>>()
   const tools = new Map<string, { invoke(options: { input: unknown }, token: { isCancellationRequested: boolean }): Promise<{ content: { value: string }[] }> }>()
   const state = new Map<string, unknown>(), secrets = new Map<string, string>()
-  const values: Record<string, unknown> = { 'telemetry.telemetryLevel': 'off' }
+  const values: Record<string, unknown> = { 'telemetry.telemetryLevel': 'off', 'github.copilot.chat.agentDebugLog.fileLogging.enabled': false }
   const inputs: string[] = [], choices: string[] = [], errors: string[] = [], requests: URL[] = [], signins: string[][] = []
   const disposable = { dispose() {} }
   let promptCount = 0, gitActivations = 0
@@ -31,6 +31,7 @@ function fixture() {
     workspace: {
       isTrusted: true, workspaceFolders: [{ uri: { scheme: 'file', fsPath: root } }],
       getConfiguration(section: string) { return { get: (key: string, fallback?: unknown) => values[`${section}.${key}`] ?? fallback,
+        inspect: (key: string) => ({ key: `${section}.${key}`, globalValue: values[`${section}.${key}`] }),
         update: async (key: string, value: unknown) => { values[`${section}.${key}`] = value } } },
       openTextDocument: async (input: unknown) => input,
     },
@@ -96,6 +97,45 @@ test('Copilot telemetry exporters cannot bypass disabled VS Code product telemet
     f.environment.OTEL_EXPORTER_OTLP_ENDPOINT = 'https://collector.invalid'
     await assert.rejects(f.invoke('superagent_snapshot'), /OpenTelemetry/)
     assert.equal(f.gitActivations, 0); assert.equal(f.requests.length, 0)
+  } finally { f.close() }
+})
+
+test('values Copilot writes to switch exporting off do not block work', async () => {
+  const f = fixture()
+  try {
+    f.inputs.push('Approved task'); await f.command('new')
+    f.choices.push('first', 'Open isolated worktree'); await f.command('open'); f.reload()
+    Object.assign(f.environment, { COPILOT_OTEL_FILE_EXPORTER_PATH: devNull, COPILOT_OTEL_ENABLED: 'false',
+      OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: 'false', OTEL_SDK_DISABLED: 'true' })
+    const snapshot = JSON.parse((await f.invoke('superagent_snapshot')).content[0]!.value)
+    assert.equal(snapshot.messages[0].text, 'Approved task')
+    f.environment.COPILOT_OTEL_FILE_EXPORTER_PATH = '/tmp/traces.jsonl'
+    await assert.rejects(f.invoke('superagent_snapshot'), /Active: env COPILOT_OTEL_FILE_EXPORTER_PATH\.$/)
+  } finally { f.close() }
+})
+
+test('the exporter error names each trigger without its value and requires an explicit debug-log opt-out', async () => {
+  const f = fixture()
+  try {
+    f.environment.OTEL_EXPORTER_OTLP_HEADERS = 'authorization=private-collector-token'
+    f.values['github.copilot.chat.chatDebug.fileLogging.enabled'] = true
+    delete f.values['github.copilot.chat.agentDebugLog.fileLogging.enabled']
+    const error = await f.invoke('superagent_snapshot').then(() => assert.fail('expected rejection'), (e: Error) => e.message)
+    assert.match(error, /github\.copilot\.chat\.chatDebug\.fileLogging\.enabled/)
+    assert.match(error, /github\.copilot\.chat\.agentDebugLog\.fileLogging\.enabled/)
+    assert.match(error, /env OTEL_EXPORTER_OTLP_HEADERS/)
+    assert.doesNotMatch(error, /private-collector-token/)
+  } finally { f.close() }
+})
+
+test('exporters active at startup are reported until reload', async () => {
+  const f = fixture()
+  try {
+    f.values['chat.agentHost.otel.enabled'] = true; f.reload()
+    f.values['chat.agentHost.otel.enabled'] = false
+    await assert.rejects(f.invoke('superagent_snapshot'), /Active: chat\.agentHost\.otel\.enabled \(until reload\)\.$/)
+    f.reload()
+    await assert.rejects(f.invoke('superagent_snapshot'), (e: Error) => !/OpenTelemetry/.test(e.message))
   } finally { f.close() }
 })
 
