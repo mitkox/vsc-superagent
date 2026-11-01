@@ -5,9 +5,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import type { OutboundMessage, ThreadRef, Trigger } from '../../src/core/index.ts'
+import type { ChannelRef, OutboundMessage, ThreadRef, Trigger } from '../../src/core/index.ts'
 import type { AgentBackend, AgentRun } from '../src/agent-backend.ts'
-import { AutomationService } from '../src/orchestration.ts'
+import { AutomationService, DEFAULT_AUTOMATION_SETTINGS } from '../src/orchestration.ts'
 import { TicketRuntime } from '../src/runtime.ts'
 
 const trigger = (id: string, options: Partial<Trigger> = {}): Trigger => ({
@@ -168,6 +168,27 @@ test('settings are versioned, conflict checked, and prompts can be restored', as
     f.service.restoreSettings(1, 2)
     assert.equal(f.service.settings.revision, 3)
     assert.doesNotMatch(f.service.previewPrompt('worker'), /Be concise/)
+  } finally { await f.clean() }
+})
+
+test('restoring a full settings revision removes absent optional fields while partial saves retain them', async () => {
+  const f = fixture()
+  try {
+    const historical = structuredClone(f.service.settings.value)
+    f.service.saveSettings({ execution: { model: 'worker-model' }, assessment: { model: 'assessor-model' },
+      prompts: { skills: [{ name: 'local', description: 'Local guidance', content: 'Use the local test command.' }] },
+      sources: { github: { admission: { unlistedAddressed: 'explicit' } } } }, 1)
+    f.service.saveSettings({ prompts: { communication: 'Keep replies concise.' } }, 2)
+    assert.equal(f.service.settings.value.execution.model, 'worker-model')
+    assert.equal(f.service.settings.value.assessment.model, 'assessor-model')
+    assert.equal(f.service.settings.value.prompts.skills?.[0]?.name, 'local')
+    assert.equal(f.service.settings.value.sources.github.admission?.unlistedAddressed, 'explicit')
+    f.service.restoreSettings(1, 3)
+    assert.deepEqual(f.service.settings.value, historical)
+    assert.equal(f.service.snapshot().history.at(-1)?.origin, 'restore')
+    assert.equal(f.service.snapshot().history.at(-1)?.predecessor, 3)
+    f.service.restoreSettings(0, 4)
+    assert.deepEqual(f.service.settings.value, DEFAULT_AUTOMATION_SETTINGS)
   } finally { await f.clean() }
 })
 
@@ -441,6 +462,106 @@ test('a dropped report can still deliver an explicitly requested answer without 
     assert.equal(f.service.snapshot().effects.filter(effect => effect.kind === 'outbound').length, 1)
     assert.equal(f.sent.length, 1)
     assert.equal(f.sent[0]!.text, summary)
+  } finally { await f.clean() }
+})
+
+for (const state of ['ready', 'waiting', 'progress', 'blocked', 'failed', 'dropped'] as const) {
+  test(`an explicit ${state} answer sends one source message across later pumps`, async () => {
+    const f = fixture(async request => {
+      await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state, summary: 'The requested answer.', reply_to_trigger_id: 'answer-question' })
+    })
+    try {
+      f.inbox.push(trigger('answer-question')); f.service.start(); await f.service.pollNow()
+      await eventually(() => f.sent.length >= 1 && f.service.snapshot().health.workers === 0)
+      assert.equal(f.sent.length, 1)
+      assert.equal(f.service.snapshot().effects.filter(effect => effect.kind === 'outbound').length, 1)
+      f.service.kick(); await new Promise(resolve => setTimeout(resolve, 10))
+      assert.equal(f.sent.length, 1)
+    } finally { await f.clean() }
+  })
+}
+
+const githubChannel = (thread: string, root?: string, url = 'https://github.com/owner/repo/issues/1'): ChannelRef => ({
+  source: 'github:scope', thread: `github:scope:${thread}`,
+  address: { origin: 'https://api.github.com', repository: 'owner/repo', number: thread, ...(root ? { reviewRootCommentId: root } : {}), url },
+})
+const teamsChannel = (root: string, messageId: string): ChannelRef => ({ source: 'teams:scope', thread: `teams:scope:${root}`,
+  address: { tenantId: 'tenant', chatId: 'chat', rootMessageId: root, messageId, url: `https://teams.microsoft.com/message/${messageId}` } })
+for (const [name, origin, question, expected] of [
+  ['GitHub issue followup URLs', githubChannel('1'), githubChannel('1', undefined, 'https://github.com/owner/repo/issues/1#issuecomment-2'), 1],
+  ['one inline review root', githubChannel('1', '100'), githubChannel('1', '100', 'https://github.com/owner/repo/pull/1#discussion_r101'), 1],
+  ['different GitHub inline roots', githubChannel('1', '100'), githubChannel('1', '200'), 2],
+  ['different GitHub issues', githubChannel('1'), githubChannel('2'), 2],
+  ['Teams messages in one root', teamsChannel('100', '100'), teamsChannel('100', '101'), 1],
+  ['different Teams roots', teamsChannel('100', '100'), teamsChannel('200', '201'), 2],
+] as const) {
+  test(`ready answers respect delivery destinations for ${name}`, async () => {
+    const f = fixture(async request => {
+      await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke(f.runs.length === 1
+        ? { state: 'waiting', summary: 'Waiting for a question.' }
+        : { state: 'ready', summary: 'The requested answer.', reply_to_trigger_id: 'later-question' })
+    })
+    try {
+      f.service.saveSettings({ sources: { teams: { enabled: true, allowedActors: ['owner'] } } }, f.service.settings.revision)
+      const item = (id: string, channel: ChannelRef) => trigger(id, { source: channel.source, actor: { source: channel.source, id: 'owner' },
+        threads: [{ source: channel.source, id: channel.thread.slice(channel.source.length + 1) }], channel })
+      f.inbox.push(item('origin-request', origin)); f.service.start(); await f.service.pollNow()
+      await eventually(() => f.runs.length === 1 && f.service.snapshot().health.workers === 0)
+      const ticket = f.runtime.list()[0]!
+      if (origin.thread !== question.thread) f.runtime.engine.bindThread(ticket.id, { source: question.source, id: question.thread.slice(question.source.length + 1) }, false)
+      f.inbox.push(item('later-question', question)); await f.service.pollNow()
+      await eventually(() => f.runs.length >= 2 && f.service.snapshot().health.workers === 0 && f.sent.length >= expected)
+      assert.equal(f.sent.length, expected)
+      assert.equal(f.sent.filter(message => message.channel.address.url === question.address.url && message.channel.address.reviewRootCommentId === question.address.reviewRootCommentId).length >= 1, true)
+      f.service.kick(); await new Promise(resolve => setTimeout(resolve, 10))
+      assert.equal(f.sent.length, expected)
+    } finally { await f.clean() }
+  })
+}
+
+test('coalesced ready-answer relay markers survive reopening durable state', async () => {
+  const f = fixture(async request => { await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'ready', summary: 'The requested answer.', reply_to_trigger_id: 'durable-question' }) })
+  let reopened: TicketRuntime | undefined, service: AutomationService | undefined
+  try {
+    f.inbox.push(trigger('durable-question')); f.service.start(); await f.service.pollNow()
+    await eventually(() => f.sent.length >= 1 && f.service.snapshot().health.workers === 0)
+    assert.equal(f.sent.length, 1)
+    await f.service.dispose(); f.runtime.dispose()
+    reopened = new TicketRuntime(f.directory)
+    service = new AutomationService(reopened, { backend: f.backend, prepare: async () => f.directory, poll: async () => [], send: async message => { f.sent.push(message) } })
+    service.start(); await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(f.sent.length, 1)
+    assert.equal(service.snapshot().effects.filter(effect => effect.kind === 'outbound').length, 1)
+  } finally { await service?.dispose(); reopened?.dispose(); await f.clean() }
+})
+
+test('an explicit answer preserves a separate pending human question', async () => {
+  const f = fixture(async request => {
+    const report = request.tools.find(tool => tool.name === 'orchestrator_report')!
+    await report.invoke({ state: 'blocked', summary: 'Need target context.', human_action: 'Which target should be checked?', question_for_trigger_id: 'question-and-answer' })
+    await report.invoke({ state: 'waiting', summary: 'The initial behavior is understood.', reply_to_trigger_id: 'question-and-answer' })
+  })
+  try {
+    f.inbox.push(trigger('question-and-answer')); f.service.start(); await f.service.pollNow()
+    await eventually(() => f.sent.length >= 2 && f.service.snapshot().health.workers === 0)
+    assert.equal(f.sent.length, 2)
+    assert.deepEqual(f.sent.map(message => message.text).sort(), ['The initial behavior is understood.', 'Which target should be checked?'].sort())
+  } finally { await f.clean() }
+})
+
+test('a coalesced ready answer still sends a distinct later PR merge notification', async () => {
+  const f = fixture(async request => {
+    f.runtime.engine.bindThread(request.ticketId, { source: 'github:scope', id: '42' }, true)
+    await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'ready', summary: 'The requested repair is ready.', reply_to_trigger_id: 'ready-and-merge' })
+  })
+  try {
+    f.inbox.push(trigger('ready-and-merge')); f.service.start(); await f.service.pollNow()
+    await eventually(() => f.sent.length >= 1 && f.service.snapshot().health.workers === 0)
+    assert.equal(f.sent.length, 1)
+    f.runtime.engine.threadClosed({ source: 'github:scope', id: '42' }, 'merged', new Date().toISOString())
+    await eventually(() => f.sent.length >= 2)
+    assert.equal(f.sent.length, 2)
+    assert.match(f.sent[1]!.text, /Pull request merged/)
   } finally { await f.clean() }
 })
 
