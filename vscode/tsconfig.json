@@ -1,0 +1,8 @@
+{
+  "compilerOptions": {
+    "target": "ES2023", "lib": ["ES2023", "DOM"], "module": "NodeNext", "moduleResolution": "NodeNext",
+    "strict": true, "noUncheckedIndexedAccess": true, "skipLibCheck": true,
+    "allowImportingTsExtensions": true, "noEmit": true, "types": ["node", "vscode"]
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts", "../src/core/**/*.ts"]
+}

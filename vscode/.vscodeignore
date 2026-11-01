@@ -1,0 +1,8 @@
+**
+!package.json
+!README.md
+!LICENSE
+!SECURITY.md
+!agents/**
+!dist/extension.cjs
+!dist/extension.cjs.sha256
