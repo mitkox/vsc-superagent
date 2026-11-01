@@ -16,6 +16,8 @@ export interface PendingEffect {
   ticketId?: string
   assignmentId?: string
   inputIds?: string[]
+  /** Proposals may carry inputIds; this marks the durably selected delivery batch. */
+  inputIdsSelected?: boolean
   candidate?: Candidate
   /** A human message owned by these workers; only a stop may be decided on this path. */
   followup?: { triggerId: string; ticketIds: string[] }
@@ -89,6 +91,7 @@ const validAutomation = (value: unknown): boolean => record(value) && value.vers
   && Array.isArray(value.effects) && value.effects.every(row => record(row) && text(row.id) && ['assessment', 'start', 'deliver', 'stop', 'outbound'].includes(String(row.kind))
     && ['pending', 'running', 'completed', 'cancelled', 'failed'].includes(String(row.status)) && Number.isSafeInteger(row.attempts) && typeof row.nextAttemptAt === 'number'
     && text(row.createdAt) && text(row.updatedAt) && optional(row.ticketId, text) && optional(row.assignmentId, text) && optional(row.inputIds, strings)
+    && optional(row.inputIdsSelected, value => typeof value === 'boolean') && (row.inputIdsSelected !== true || strings(row.inputIds))
     && optional(row.followup, value => record(value) && text(value.triggerId) && strings(value.ticketIds))
     && (row.kind !== 'assessment' || record(row.candidate) || record(row.followup)) && (row.kind !== 'outbound' || (record(row.message) && text(row.message.id) && text(row.message.text) && record(row.message.channel))))
   && Array.isArray(value.sessions) && value.sessions.every(row => record(row) && text(row.ticketId) && text(row.sessionId) && Array.isArray(row.revisions)

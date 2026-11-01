@@ -395,7 +395,7 @@ export class AutomationService {
       })
       return
     }
-    if (effect.kind === 'deliver' && effect.attempts === 1 && !(effect.inputIds ?? []).some(id => ticket.undelivered.includes(id))) { this.cancel(effect.id); return }
+    if (effect.kind === 'deliver' && !effect.inputIdsSelected && !(effect.inputIds ?? []).some(id => ticket.undelivered.includes(id))) { this.cancel(effect.id); return }
     let session = this.runtime.repositories.automation().sessions.find(item => item.ticketId === ticket.id)
     if (!session) {
       session = { ticketId: ticket.id, sessionId: `superagent-${ticket.id}-${randomUUID()}`, status: 'idle', revisions: [], transcript: [] }
@@ -407,7 +407,10 @@ export class AutomationService {
     this.authorized(ticket.id, effect.assignmentId!, signal)
     if (assignment.state === 'pending') this.runtime.engine.assignmentStarted(ticket.id, assignment.id)
     ticket = this.runtime.get(ticket.id)
-    const inputIds = effect.inputIds ?? (effect.kind === 'start' ? [...ticket.undelivered] : [])
+    const pending = new Set(ticket.undelivered)
+    const inputIds = effect.inputIdsSelected ? [...effect.inputIds ?? []]
+      : (effect.inputIds ?? (effect.kind === 'start' ? ticket.undelivered : [])).filter(id => pending.has(id))
+    if (effect.kind === 'deliver' && !inputIds.length) { this.cancel(effect.id); return }
     const revision = this.settings.revision
     this.runtime.repositories.atomic(() => {
       this.runtime.repositories.mutateAutomation(data => {
@@ -415,7 +418,7 @@ export class AutomationService {
         row.directory = directory; row.assignmentId = assignment.id; row.status = 'working'
         if (!row.revisions.includes(revision)) row.revisions.push(revision)
         const queued = data.effects.find(item => item.id === effect.id)
-        if (queued) queued.inputIds = [...inputIds]
+        if (queued) { queued.inputIds = [...inputIds]; queued.inputIdsSelected = true }
       })
       this.runtime.engine.inputsDelivered(ticket.id, assignment.id, inputIds)
     })
