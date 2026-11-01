@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { TicketRuntime } from '../src/runtime.ts'
+import type { TeamsContext } from '../src/sources.ts'
 
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'vsc-superagent-runtime-'))
@@ -212,5 +213,40 @@ test('a completed ticket can resume from a locally approved followup and persist
     f.runtime.dispose()
     reopened = new TicketRuntime(f.directory)
     assert.match(reopened.context(ticket.id).messages.at(-1)!.text, /keyboard support/)
+  } finally { reopened?.dispose(); f.clean() }
+})
+
+test('native approval preserves provider channels, subscriptions and full source context across restart', () => {
+  const f = fixture()
+  let reopened: TicketRuntime | undefined
+  try {
+    const context: TeamsContext = { provider: 'teams', tenantId: 'approved-tenant', chatId: 'approved-chat', rootMessageId: 'root-1', messageId: 'reply-2', sourceConfigId: 'teams:config', nativeThreadId: 'root-1', human: true, bot: false, allowedActor: true, subscribed: false, addressed: 'mention' }
+    const ticket = f.runtime.create('Fix the deployment issue', { source: 'teams', id: 'event-2', actor: 'requester', thread: 'root-1', url: 'https://teams.microsoft.com/l/message/root-1', context })
+    assert.equal(ticket.mandate.actor.source, 'vscode')
+    assert.match(ticket.channels[0]?.source ?? '', /^teams:/)
+    assert.equal(ticket.channels[0]?.address.messageId, 'reply-2')
+    f.runtime.dispose()
+    reopened = new TicketRuntime(f.directory)
+    const message = reopened.context(ticket.id).messages[0]!
+    assert.equal(message.source, 'vscode')
+    assert.equal(message.url, 'https://teams.microsoft.com/l/message/root-1')
+    assert.deepEqual(message.meta.provider, context)
+    assert.ok(reopened.repositories.threads.list().some(thread => thread.ref.source.startsWith('teams:') && thread.subscriptions.includes(ticket.id)))
+  } finally { reopened?.dispose(); f.clean() }
+})
+
+test('source cursor metadata extends legacy state under the same checksum and lock', () => {
+  const f = fixture()
+  let reopened: TicketRuntime | undefined
+  try {
+    f.runtime.create('Legacy local ticket')
+    assert.equal(JSON.parse(readFileSync(join(f.directory, 'state.json'), 'utf8')).data.extension, undefined)
+    f.runtime.writeData('source:github:cursor', { since: '2026-11-01T00:00:00Z', ids: ['event-1'] })
+    assert.throws(() => f.runtime.writeData('__proto__', {}), /metadata key/i)
+    f.runtime.dispose(); reopened = new TicketRuntime(f.directory)
+    assert.deepEqual(reopened.readData('source:github:cursor'), { since: '2026-11-01T00:00:00Z', ids: ['event-1'] })
+    const state = JSON.parse(readFileSync(join(f.directory, 'state.json'), 'utf8'))
+    assert.equal(state.version, 1)
+    assert.equal(state.data.extension.version, 1)
   } finally { reopened?.dispose(); f.clean() }
 })

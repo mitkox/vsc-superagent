@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
+import { pollDefaultBranchChecks } from '../src/sources.ts'
 import { test } from 'node:test'
-import { pollTeams, pollTeamsBatch, pollGitHub, pollGitHubReviewsBatch, readPullRequest, type GitHubSourceConfig } from '../src/sources.ts'
+import { pollTeams, pollTeamsBatch, pollGitHub, pollGitHubReviewsBatch, readPullRequest, sourceTrigger, sourceSubscription,
+  githubThreadRef, discoverOwnPullRequests, pollGitHubChecks, readGitHubThread, type GitHubSourceConfig } from '../src/sources.ts'
 
 const config: GitHubSourceConfig = {
   origin: 'https://api.github.com', repository: 'company/project', account: 'agent', allowedActors: ['Alice'], token: 'secret-token',
@@ -10,6 +12,31 @@ const issue = (body = '@agent fix this', overrides = {}) => ({
   updated_at: '2026-11-01T10:00:00Z', ...overrides,
 })
 const json = (value: unknown, headers?: HeadersInit) => new Response(JSON.stringify(value), { headers })
+
+test('default-branch CI is read at its actual head and emitted as inferred context', async () => {
+  const head = 'a'.repeat(40), requests: string[] = []
+  const event = await pollDefaultBranchChecks(config, undefined, async input => {
+    const path = new URL(String(input)).pathname; requests.push(path)
+    if (path === '/repos/company/project') return json({ default_branch: 'main' })
+    if (path.endsWith('/branches/main')) return json({ commit: { sha: head } })
+    if (path.endsWith('/statuses')) return json([{ id: 5, state: 'failure', context: 'build' }])
+    return json({ check_runs: [] })
+  })
+  assert.equal(event.human, false)
+  assert.equal(event.threads[0]?.id, 'branch:main')
+  assert.match(event.text, /build: failure/)
+  assert.ok(requests.includes(`/repos/company/project/commits/${head}/check-runs`))
+})
+
+test('a changed approval state on a subscribed review generates a fresh context event', async () => {
+  const read = (state: string) => pollGitHubReviewsBatch({ ...config, subscribedNumbers: [7] }, undefined, undefined, async input =>
+    new URL(String(input)).pathname.endsWith('/reviews')
+      ? json([{ id: 22, user: { login: 'alice', type: 'User' }, body: '', state, submitted_at: '2026-11-01T00:00:00Z' }])
+      : json([{ number: 7 }]))
+  const approved = await read('APPROVED'), dismissed = await read('DISMISSED')
+  assert.equal(approved.items.length, 1)
+  assert.notEqual(approved.items[0]!.id, dismissed.items[0]!.id)
+})
 
 test('GitHub scopes credentials and every request to its configured repository and origin', async () => {
   const requests: URL[] = []
@@ -345,4 +372,138 @@ test('PR lifecycle reads use the configured repository and validate provider fac
   await assert.rejects(readPullRequest(config, -1), /Invalid source configuration/)
   await assert.rejects(readPullRequest(config, 7, undefined, async () => json({ number: 8, state: 'closed', merged: true, head: { sha: 'a'.repeat(40) } })), /Invalid source response/)
   await assert.rejects(readPullRequest(config, 7, undefined, async () => json({ number: 7, state: 'open', merged: true, head: { sha: 'a'.repeat(40) } })), /Invalid source response/)
+})
+
+test('subscribed GitHub review followups retain native review location and do not gain authority', async () => {
+  const result = await pollGitHub({ ...config, subscribedNumbers: [7], allowedActors: [] }, undefined, async input => json(
+    new URL(String(input)).pathname.endsWith('/pulls/comments') ? [{ id: 303, body: 'Please handle this',
+      pull_request_url: 'https://api.github.com/repos/company/project/pulls/7', user: { login: 'reviewer', type: 'User' },
+      in_reply_to_id: 300, pull_request_review_id: 90, path: 'src/file.ts', line: 42, original_line: 41,
+      diff_hunk: '@@ -1 +1 @@\n-old\n+new', commit_id: 'a'.repeat(40), created_at: '2026-11-01T00:00:00Z' }] : []))
+  assert.equal(result.length, 1)
+  const context = result[0]!.context!
+  assert.equal(context.provider, 'github')
+  if (context.provider !== 'github') assert.fail('GitHub context required')
+  assert.equal(context.reviewRootCommentId, 300); assert.equal(context.commentId, 303); assert.equal(context.reviewId, 90)
+  assert.equal(context.path, 'src/file.ts'); assert.equal(context.line, 42); assert.equal(context.originalLine, 41)
+  assert.equal(context.allowedActor, false); assert.equal(context.subscribed, true); assert.equal(context.human, true)
+  const trigger = sourceTrigger(result[0]!)
+  assert.equal(trigger.threads[0]?.source, trigger.channel?.source)
+  assert.equal(trigger.threads[0]?.id, '7'); assert.equal(trigger.channel?.address.reviewRootCommentId, '300')
+  assert.equal(trigger.meta.contextOnly, true); assert.equal(trigger.addressed, undefined)
+  assert.deepEqual(trigger.threads[0], githubThreadRef(config, 7))
+  assert.deepEqual(trigger.meta.provider, context)
+})
+
+test('GitHub subscriptions include unlisted bots as context and still exclude the configured agent', async () => {
+  const comments = [
+    { id: 30, user: { login: 'checks[bot]', type: 'Bot' }, body: 'CI feedback' },
+    { id: 31, user: { login: 'outsider', type: 'User' }, body: 'Followup' },
+    { id: 32, user: { login: 'agent', type: 'User' }, body: '@agent own reply' },
+  ].map(row => ({ ...row, issue_url: 'https://api.github.com/repos/company/project/issues/7' }))
+  const fetcher: typeof fetch = async input => json(new URL(String(input)).pathname.endsWith('/issues/comments') ? comments : [])
+  assert.deepEqual(await pollGitHub(config, undefined, fetcher), [])
+  const items = await pollGitHub({ ...config, subscribedNumbers: [7] }, undefined, fetcher)
+  assert.equal(items.length, 2)
+  assert.equal(items[0]!.context?.bot, true); assert.equal(sourceTrigger(items[0]!).human, false)
+  assert.equal(items[0]!.context?.allowedActor, false)
+  const observed = await pollGitHub({ ...config, observeComments: true, allowedBots: ['checks[bot]'] }, undefined, fetcher)
+  assert.equal(observed.length, 1); assert.equal(sourceTrigger(observed[0]!).human, false)
+})
+
+test('source identities distinguish repositories and Teams tenants while preserving native thread IDs', async () => {
+  const read = (repository: string) => pollGitHub({ ...config, repository }, undefined, async input => json(new URL(String(input)).pathname.endsWith('/issues') ? [issue()] : []))
+  const left = sourceTrigger((await read('company/project'))[0]!), right = sourceTrigger((await read('company/other'))[0]!)
+  assert.notEqual(left.source, right.source); assert.equal(left.threads[0]!.id, right.threads[0]!.id)
+  const [entry] = await pollTeams(teams, undefined, async () => json({ value: [message()] }))
+  const trigger = sourceTrigger(entry!)
+  assert.equal(trigger.threads[0]!.id, '100')
+  assert.equal(trigger.channel!.address.chatId, '19:chat@thread.v2')
+  assert.equal(trigger.channel!.address.rootMessageId, '100')
+  assert.equal(sourceSubscription(entry!.context!), entry!.thread)
+  assert.throws(() => sourceTrigger({ id: 'legacy', source: 'teams', actor, text: 'old', thread: '100' }), /refresh the inbox/)
+})
+
+test('subscribed Teams roots receive other humans and bot replies and exclude native self messages', async () => {
+  const input = { ...teams, chatIds: [], channels: [{ teamId, channelId: '19:channel@thread.tacv2' }], accountId: actor,
+    subscribedThreads: [`team:${teamId}:channel:19:channel@thread.tacv2:100`] }
+  const result = await pollTeams(input, undefined, async input => json({ value: new URL(String(input)).pathname.endsWith('/replies') ? [
+    message('101', { from: { user: { id: teamId } }, replyToId: '100', createdDateTime: '2026-11-01T00:00:00Z', webUrl: 'https://teams.microsoft.com/l/message/channel/101' }),
+    message('102', { from: { application: { id: tenant } }, replyToId: '100' }), message('103'),
+  ] : [message()] }))
+  assert.equal(result.length, 2)
+  const first = result[0]!.context!
+  if (first.provider !== 'teams') assert.fail('Teams context required')
+  assert.equal(first.messageId, '101'); assert.equal(first.rootMessageId, '100')
+  assert.equal(first.teamId, teamId); assert.equal(first.channelId, '19:channel@thread.tacv2')
+  assert.equal(first.tenantId, tenant); assert.equal(first.allowedActor, false); assert.equal(first.createdAt, '2026-11-01T00:00:00Z')
+  assert.equal(result[1]!.context!.bot, true); assert.equal(sourceTrigger(result[1]!).human, false)
+})
+
+test('Teams quoted chat followups bind the original subscribed root and reject cross-chat quote links', async () => {
+  const quoted = (chat: string) => `<blockquote itemid="https://teams.microsoft.com/l/message/${encodeURIComponent(chat)}/100">original</blockquote><p>Followup</p>`
+  const input = { ...teams, allowedActors: [], subscribedThreads: ['chat:19:chat@thread.v2:100'] }
+  const result = await pollTeams(input, undefined, async () => json({ value: [
+    message('101', { from: { user: { id: teamId } }, body: { contentType: 'html', content: quoted(teams.chatIds[0]!) } }),
+    message('102', { from: { user: { id: teamId } }, body: { contentType: 'html', content: quoted('other-chat') } }),
+  ] }))
+  assert.equal(result.length, 1); assert.equal(result[0]!.thread, input.subscribedThreads[0])
+})
+
+test('bounded thread history reads retain reviews and comments regardless of intake actor gates', async () => {
+  const calls: string[] = []
+  const items = await readGitHubThread({ ...config, allowedActors: [] }, 7, undefined, async input => {
+    const path = new URL(String(input)).pathname; calls.push(path)
+    if (path.endsWith('/issues/7')) return json(issue('Description', { pull_request: {} }))
+    if (path.endsWith('/issues/7/comments')) return json([{ id: 10, body: 'Unlisted comment', user: { login: 'other', type: 'User' } }])
+    if (path.endsWith('/reviews')) return json([{ id: 11, body: 'Changes requested', state: 'CHANGES_REQUESTED', user: { login: 'other', type: 'User' } }])
+    return json([{ id: 12, body: 'Inline', path: 'file.ts', line: 8, user: { login: 'other', type: 'User' } }])
+  })
+  assert.equal(items.length, 4); assert.equal(calls.length, 4)
+  assert.ok(calls.every(path => path.startsWith('/repos/company/project/')))
+  assert.equal(items[2]!.context!.provider === 'github' && items[2]!.context!.state, 'CHANGES_REQUESTED')
+})
+
+test('PR discovery filters by native author and lifecycle reads retain claim evidence', async () => {
+  const data = { number: 7, state: 'open', merged: false, draft: true, user: { login: 'agent' }, head: { sha: 'b'.repeat(40), ref: 'superagent/ticket-1' } }
+  const discovered = await discoverOwnPullRequests(config, undefined, async input => {
+    assert.equal(new URL(String(input)).pathname, '/repos/company/project/pulls')
+    return json([data, { ...data, number: 8, user: { login: 'other' } }])
+  })
+  assert.equal(discovered.length, 1); assert.equal(discovered[0]!.branch, 'superagent/ticket-1')
+  const pull = await readPullRequest(config, 7, undefined, async () => json(data))
+  assert.equal(pull.author, 'agent'); assert.equal(pull.branch, 'superagent/ticket-1'); assert.equal(pull.draft, true)
+})
+
+test('CI polling reads statuses and checks for the exact head and produces stable context-only events', async () => {
+  const head = 'a'.repeat(40), calls: string[] = []
+  const fetcher: typeof fetch = async input => {
+    const path = new URL(String(input)).pathname; calls.push(path)
+    if (path.endsWith('/pulls/7')) return json({ number: 7, state: 'open', merged: false, head: { sha: head } })
+    if (path.endsWith('/statuses')) return json([{ id: 1, context: 'lint', state: 'success', updated_at: '2026-11-01T00:00:00Z' }])
+    assert.equal(path, `/repos/company/project/commits/${head}/check-runs`)
+    return json({ check_runs: [{ id: 2, name: 'test', status: 'completed', conclusion: 'failure', completed_at: '2026-11-01T00:00:01Z' }] })
+  }
+  const input = { ...config, subscribedNumbers: [7] }
+  const first = await pollGitHubChecks(input, undefined, undefined, fetcher), repeated = await pollGitHubChecks(input, undefined, undefined, fetcher)
+  assert.equal(calls.length, 6); assert.equal(first[0]!.id, repeated[0]!.id)
+  assert.match(first[0]!.text, /lint: success/); assert.match(first[0]!.text, /test: failure/)
+  const trigger = sourceTrigger(first[0]!)
+  assert.equal(trigger.human, false); assert.equal(trigger.meta.contextOnly, true)
+  assert.equal(first[0]!.context!.provider === 'github' && first[0]!.context!.commitId, head)
+})
+
+test('Graph messageReference attachments and quote chains preserve the subscribed original chat thread', async () => {
+  const reference = (messageId: string) => [{ contentType: 'messageReference', content: JSON.stringify({ messageId, messagePreview: 'Untrusted quoted text' }) }]
+  const result = await pollTeams({ ...teams, allowedActors: [], subscribedThreads: ['chat:19:chat@thread.v2:100'] }, undefined, async () => json({ value: [
+    message('102', { from: { user: { id: teamId } }, attachments: reference('101') }),
+    message('101', { from: { user: { id: teamId } }, attachments: reference('100') }),
+    message('100', { from: { user: { id: teamId } } }),
+  ] }))
+  assert.equal(result.length, 3)
+  assert.ok(result.every(item => item.thread === 'chat:19:chat@thread.v2:100'))
+  const context = result[0]!.context!
+  assert.equal(context.provider === 'teams' && context.rootMessageId, '100')
+  assert.deepEqual(context.provider === 'teams' && context.referencedMessageIds, ['101'])
+  assert.deepEqual(sourceTrigger(result[0]!).threads.map(thread => thread.id), ['100', '101'])
 })

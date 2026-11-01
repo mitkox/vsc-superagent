@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { Engine, latestAssignment, runningAssignment } from '../../src/core/index.ts'
-import type { Policy, ReportState, Ticket, Trigger } from '../../src/core/index.ts'
+import type { Policy, ReportState, SourceScope, Ticket, Trigger } from '../../src/core/index.ts'
 import { DurableRepositories } from './state.ts'
+import type { SourceContext } from './sources.ts'
+import { sourceTrigger } from './sources.ts'
 
-export interface ExternalOrigin { source: string; id: string; actor: string }
+export interface ExternalOrigin { source: string; id: string; actor: string; context?: SourceContext; url?: string; thread?: string }
 
 const REPORT_STATES = new Set<ReportState>(['progress', 'waiting', 'ready', 'blocked', 'failed', 'dropped'])
 const POLICY_VERSION = 'vscode-local-approval-v1'
@@ -14,7 +16,9 @@ function boundedText(value: unknown, label = 'text'): string {
 }
 
 function validateOrigin(origin: ExternalOrigin | undefined): void {
-  if (origin && (!origin.source || !origin.id || !origin.actor || Object.values(origin).some(value => typeof value !== 'string' || value.length > 1_000 || value.includes('\0')))) throw new Error('Invalid external origin')
+  if (!origin) return
+  if (!origin.source || !origin.id || !origin.actor || [origin.source, origin.id, origin.actor, origin.url ?? '', origin.thread ?? ''].some(value => typeof value !== 'string' || value.length > 4_000 || value.includes('\0'))) throw new Error('Invalid external origin')
+  if (origin.context !== undefined && (!origin.context || typeof origin.context !== 'object' || origin.context.provider !== origin.source || JSON.stringify(origin.context).length > 100_000 || JSON.stringify(origin.context).includes('\\u0000'))) throw new Error('Invalid external provider context')
 }
 
 /**
@@ -23,9 +27,14 @@ function validateOrigin(origin: ExternalOrigin | undefined): void {
  */
 export class TicketRuntime {
   private readonly repo: DurableRepositories
-  private readonly engine: Engine
-  constructor(storageDir: string) {
+  /** Native integration boundary; never hand the complete engine to a model. */
+  readonly engine: Engine
+  private automation = false
+  private automatedPolicy?: () => Policy
+  private automatedScope?: SourceScope
+  constructor(storageDir: string, options: { automation?: boolean } = {}) {
     this.repo = new DurableRepositories(storageDir)
+    this.automation = options.automation === true || this.repo.automation().activated
     const policy: Policy = {
       version: POLICY_VERSION,
       get paused() { return false },
@@ -38,20 +47,51 @@ export class TicketRuntime {
     }
     this.engine = new Engine({
       repo: this.repo,
-      policy: () => ({ ...policy, paused: this.repo.paused }),
-      scope: { scope: input => input.source === 'vscode' ? { listened: true, observed: false } : { listened: false, reason: 'localApprovalRequired' } },
-      assessor: { request: () => { throw new Error('Autonomous assessments are disabled') } },
-      executor: { start: () => {}, deliver: () => {}, stop: () => {} },
+      policy: () => this.automatedPolicy ? this.automatedPolicy() : { ...policy, paused: this.repo.paused },
+      scope: { scope: input => this.automatedScope ? this.automatedScope.scope(input) : input.source === 'vscode' ? { listened: true, observed: false } : { listened: false, reason: 'localApprovalRequired' } },
+      assessor: {
+        request: candidate => {
+          if (!this.automation) throw new Error('Autonomous assessments are disabled')
+          this.repo.enqueue({ id: `assessment:${candidate.evalId}`, kind: 'assessment', candidate })
+        },
+        release: evalId => {
+          if (!this.automation) return
+          this.repo.mutateAutomation(data => {
+            const effect = data.effects.find(row => row.id === `assessment:${evalId}`)
+            if (effect && effect.status === 'pending') effect.status = 'cancelled'
+          })
+        },
+      },
+      executor: {
+        start: (ticket, assignment) => { if (this.automation) this.repo.enqueue({ id: `start:${assignment.id}`, kind: 'start', ticketId: ticket.id, assignmentId: assignment.id }) },
+        deliver: (ticket, assignment) => {
+          if (!this.automation || !ticket.undelivered.length) return
+          const identity = createHash('sha256').update(JSON.stringify(ticket.undelivered)).digest('hex')
+          this.repo.enqueue({ id: `deliver:${assignment.id}:${identity}`, kind: 'deliver', ticketId: ticket.id, assignmentId: assignment.id, inputIds: [...ticket.undelivered] })
+        },
+        stop: (ticket, assignment, reason) => { if (this.automation) this.repo.enqueue({ id: `stop:${assignment.id}`, kind: 'stop', ticketId: ticket.id, assignmentId: assignment.id, reason }) },
+      },
       outbox: {
-        send: () => { throw new Error('External delivery requires separate operator approval') },
-        status: () => undefined,
-        withdraw: () => {},
+        send: message => {
+          if (!this.automation) throw new Error('External delivery requires separate operator approval')
+          this.repo.enqueue({ id: `outbound:${message.id}`, kind: 'outbound', ticketId: message.ticketId, message })
+        },
+        status: id => {
+          const effect = this.repo.automation().effects.find(row => row.id === `outbound:${id}`)
+          return !effect ? undefined : effect.status === 'completed' ? 'sent' : effect.status === 'cancelled' ? 'dropped' : 'pending'
+        },
+        withdraw: id => {
+          if (this.automation) this.repo.mutateAutomation(data => {
+            const effect = data.effects.find(row => row.id === `outbound:${id}`)
+            if (effect && ['pending', 'running', 'failed'].includes(effect.status)) effect.status = 'cancelled'
+          })
+        },
       },
       emit: event => this.repo.audit(event.type, 'ticketId' in event.data ? event.data.ticketId : undefined),
     })
     try {
       this.repo.atomic(() => {
-        for (const ticket of this.repo.tickets.open()) {
+        for (const ticket of this.automation ? [] : this.repo.tickets.open()) {
           const assignment = runningAssignment(ticket)
           if (!assignment || ['ready', 'waiting', 'blocked', 'failed'].includes(assignment.report?.state ?? '')) continue
           this.engine.report(ticket.id, { state: 'blocked', summary: 'The extension host stopped during work. Inspect the worktree and external state, then explicitly retry before continuing.' })
@@ -61,6 +101,18 @@ export class TicketRuntime {
   }
 
   get paused(): boolean { return this.repo.paused }
+  get repositories(): DurableRepositories { this.repo.assertOpen(); return this.repo }
+  configureAutomation(policy: () => Policy, scope: SourceScope): void {
+    this.repo.assertOpen(); this.automation = true; this.automatedPolicy = policy; this.automatedScope = scope
+  }
+  readData<T = unknown>(key: string): T | undefined { this.repo.assertOpen(); return this.repo.automation().metadata[key] as T | undefined }
+  writeData(key: string, value: unknown): void {
+    if (!/^[a-zA-Z0-9._:-]{1,200}$/.test(key) || ['__proto__', 'constructor', 'prototype'].includes(key)) throw new Error('Invalid metadata key')
+    let encoded: string | undefined
+    try { encoded = JSON.stringify(value) } catch { throw new Error('Metadata must be JSON data') }
+    if (value !== undefined && (encoded === undefined || Buffer.byteLength(encoded) > 1_000_000)) throw new Error('Metadata exceeds the size limit')
+    this.repo.mutateAutomation(data => { if (value === undefined) delete data.metadata[key]; else data.metadata[key] = JSON.parse(encoded!) })
+  }
   list(): Ticket[] { this.repo.assertOpen(); return this.repo.tickets.list() }
   get(id: string): Ticket {
     this.repo.assertOpen()
@@ -70,12 +122,12 @@ export class TicketRuntime {
     return ticket
   }
 
-  context(id: string): { ticket: Ticket; messages: { id: string; text: string; at: string }[] } {
+  context(id: string): { ticket: Ticket; messages: Trigger[] } {
     const ticket = this.get(id)
     const triggerIds = new Set([ticket.origin.triggerId, ...ticket.inputs.flatMap(input => input.kind === 'trigger' ? [input.triggerId] : [])])
     const messages = [...triggerIds].flatMap(triggerId => {
       const trigger = this.repo.triggers.get(triggerId)
-      return trigger ? [{ id: trigger.id, text: trigger.text, at: trigger.at }] : []
+      return trigger ? [trigger] : []
     })
     return { ticket, messages }
   }
@@ -111,7 +163,11 @@ export class TicketRuntime {
     const origin = this.repo.triggers.get(ticket.origin.triggerId)
     if (!origin?.threads[0]) throw new Error('Ticket origin is missing')
     return this.repo.atomic(() => {
-      this.engine.receive(this.trigger(request, origin.threads[0]!.id, externalOrigin))
+      const primary = origin.threads[0]!
+      const trigger = this.trigger(request, primary.source === 'vscode' ? primary.id : `followup-${randomUUID()}`, externalOrigin)
+      this.engine.receive(trigger)
+      // A named native follow-up belongs to its chosen ticket, including a ticket whose origin is a provider thread.
+      if (!this.get(id).inputs.some(input => input.kind === 'trigger' && input.triggerId === trigger.id)) this.engine.attach(id, trigger.id)
       return this.get(id)
     })
   }
@@ -188,10 +244,13 @@ export class TicketRuntime {
   dispose(): void { this.repo.dispose() }
 
   private trigger(text: string, thread: string, origin?: ExternalOrigin): Trigger {
+    const provider = origin?.context ? sourceTrigger({ id: origin.id, source: origin.context.provider, actor: origin.actor, text, thread: origin.thread ?? origin.context.nativeThreadId, context: origin.context, ...(origin.url ? { url: origin.url } : {}) }) : undefined
     return {
-      id: randomUUID(), source: 'vscode', threads: [{ source: 'vscode', id: thread }],
+      id: randomUUID(), source: 'vscode', threads: [{ source: 'vscode', id: thread }, ...(provider?.threads ?? [])],
       actor: { source: 'vscode', id: 'local-operator' }, human: true, addressed: 'direct',
-      at: new Date().toISOString(), text, meta: origin ? { externalOrigin: { ...origin }, locallyApproved: true } : { locallyApproved: true },
+      at: new Date().toISOString(), text, ...(origin?.url ? { url: origin.url } : {}),
+      ...(provider?.channel ? { channel: provider.channel } : {}),
+      meta: origin ? { externalOrigin: structuredClone(origin), ...(origin.context ? { provider: structuredClone(origin.context) } : {}), locallyApproved: true } : { locallyApproved: true },
     }
   }
   private requireUnpaused(): void { if (this.repo.paused) throw new Error('Superagent processing is paused') }

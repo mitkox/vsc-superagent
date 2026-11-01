@@ -1,7 +1,47 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
-import type { Decision, Repositories, Thread, Ticket, Trigger, TriggerDisposition } from '../../src/core/index.ts'
+import { hostname } from 'node:os'
+import type { Candidate, Decision, OutboundMessage, Repositories, Thread, Ticket, Trigger, TriggerDisposition } from '../../src/core/index.ts'
+import type { AutomationSettings, SettingsVersion } from './settings.ts'
+
+export interface PendingEffect {
+  id: string
+  kind: 'assessment' | 'start' | 'deliver' | 'stop' | 'outbound'
+  status: 'pending' | 'running' | 'completed' | 'cancelled' | 'failed'
+  createdAt: string
+  updatedAt: string
+  attempts: number
+  nextAttemptAt: number
+  ticketId?: string
+  assignmentId?: string
+  inputIds?: string[]
+  candidate?: Candidate
+  /** A human message owned by these workers; only a stop may be decided on this path. */
+  followup?: { triggerId: string; ticketIds: string[] }
+  message?: OutboundMessage
+  reason?: string
+  error?: string
+}
+export interface SessionRecord {
+  ticketId: string
+  sessionId: string
+  directory?: string
+  assignmentId?: string
+  status: 'idle' | 'working' | 'interrupted' | 'stopped'
+  revisions: number[]
+  transcript: { type: string; text: string; at: string }[]
+}
+export interface AutomationData {
+  version: 1
+  activated: boolean
+  settings?: { revision: number; value: AutomationSettings }
+  history: SettingsVersion[]
+  effects: PendingEffect[]
+  sessions: SessionRecord[]
+  metadata: Record<string, unknown>
+  health: { at: string; component: string; error: string }[]
+}
 
 interface AuditEntry { at: string; action: string; ticketId?: string }
 interface StateData {
@@ -12,6 +52,7 @@ interface StateData {
   tickets: Ticket[]
   decisions: Decision[]
   audit: AuditEntry[]
+  extension?: AutomationData
 }
 
 const MAX_STATE_BYTES = 16 * 1024 * 1024
@@ -41,6 +82,18 @@ const closed = (value: unknown): boolean => record(value) && text(value.at) && [
 const ended = (value: unknown): boolean => record(value) && text(value.at) && ['executor', 'human'].includes(String(value.by))
   && ['completed', 'merged', 'closed', 'dropped', 'stopped'].includes(String(value.outcome)) && optional(value.reason, text)
 class CommitDurabilityError extends Error {}
+const automationData = (): AutomationData => ({ version: 1, activated: false, history: [], effects: [], sessions: [], metadata: {}, health: [] })
+const validAutomation = (value: unknown): boolean => record(value) && value.version === 1 && typeof value.activated === 'boolean'
+  && record(value.metadata) && Array.isArray(value.history) && value.history.every(row => record(row) && Number.isSafeInteger(row.revision) && record(row.value))
+  && optional(value.settings, row => record(row) && Number.isSafeInteger(row.revision) && record(row.value))
+  && Array.isArray(value.effects) && value.effects.every(row => record(row) && text(row.id) && ['assessment', 'start', 'deliver', 'stop', 'outbound'].includes(String(row.kind))
+    && ['pending', 'running', 'completed', 'cancelled', 'failed'].includes(String(row.status)) && Number.isSafeInteger(row.attempts) && typeof row.nextAttemptAt === 'number'
+    && text(row.createdAt) && text(row.updatedAt) && optional(row.ticketId, text) && optional(row.assignmentId, text) && optional(row.inputIds, strings)
+    && optional(row.followup, value => record(value) && text(value.triggerId) && strings(value.ticketIds))
+    && (row.kind !== 'assessment' || record(row.candidate) || record(row.followup)) && (row.kind !== 'outbound' || (record(row.message) && text(row.message.id) && text(row.message.text) && record(row.message.channel))))
+  && Array.isArray(value.sessions) && value.sessions.every(row => record(row) && text(row.ticketId) && text(row.sessionId) && Array.isArray(row.revisions)
+    && ['idle', 'working', 'interrupted', 'stopped'].includes(String(row.status)) && Array.isArray(row.transcript) && row.transcript.every(event => record(event) && text(event.type) && text(event.text) && text(event.at)))
+  && Array.isArray(value.health) && value.health.every(row => record(row) && text(row.at) && text(row.component) && text(row.error))
 
 /** The persisted envelope is versioned and checksummed; malformed state is never silently reset. */
 function validate(value: unknown): StateData {
@@ -61,8 +114,44 @@ function validate(value: unknown): StateData {
       && optional(row.attention, value => record(value) && text(value.id) && text(value.question)) && optional(row.delivery, value => record(value) && text(value.error) && text(value.at)))
     && rows('decisions', row => text(row.id) && text(row.evalId) && text(row.threadKey) && strings(row.triggerIds) && text(row.policyVersion) && text(row.at) && Array.isArray(row.reason))
     && rows('audit', row => text(row.at) && text(row.action) && (row.ticketId === undefined || text(row.ticketId)))
-  if (!valid || digest(data as unknown as StateData) !== value.checksum) throw new Error('Corrupt Superagent state checksum or records')
+  if (!valid || !optional(data.extension, validAutomation) || digest(data as unknown as StateData) !== value.checksum) throw new Error('Corrupt Superagent state checksum or records')
   return data as unknown as StateData
+}
+
+/** All new owners serialize acquisition and stale-owner removal; no check/unlink race can remove a newer live lock. */
+function acquireLock(lockPath: string, token: string): void {
+  const guardPath = `${lockPath}.acquire`
+  let guard: number
+  try { guard = openSync(guardPath, 'wx', 0o600) }
+  catch { throw new Error('Superagent lock acquisition is in progress or was interrupted. Verify all hosts have stopped before removing state.lock.acquire.') }
+  try {
+    writeFileSync(guard, JSON.stringify({ pid: process.pid, host: hostname(), token }))
+    fsyncSync(guard)
+    let lock: number
+    try { lock = openSync(lockPath, 'wx', 0o600) }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      let dead = false
+      try {
+        const stat = lstatSync(lockPath)
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4096 || (process.platform !== 'win32' && (stat.mode & 0o077) !== 0)) throw new Error('Unsafe lock')
+        const owner: unknown = JSON.parse(readFileSync(lockPath, 'utf8'))
+        if (!record(owner) || !Number.isSafeInteger(owner.pid) || (owner.pid as number) <= 0 || owner.host !== hostname() || typeof owner.token !== 'string' || !owner.token) throw new Error('Unidentifiable lock owner')
+        try { process.kill(owner.pid as number, 0) }
+        catch (signalError) { dead = (signalError as NodeJS.ErrnoException).code === 'ESRCH' }
+      } catch { /* A malformed, remote, permission-denied or otherwise unidentifiable owner is preserved. */ }
+      if (!dead) throw new Error('Superagent state lock is held by another host or its owner cannot be verified. Verify the host has stopped before removing state.lock.')
+      // The acquisition guard excludes every other new owner throughout stale removal and replacement.
+      unlinkSync(lockPath)
+      lock = openSync(lockPath, 'wx', 0o600)
+    }
+    try { writeFileSync(lock, JSON.stringify({ pid: process.pid, host: hostname(), token })); fsyncSync(lock) }
+    catch (error) { unlinkSync(lockPath); throw error }
+    finally { closeSync(lock) }
+  } finally {
+    closeSync(guard)
+    unlinkSync(guardPath)
+  }
 }
 
 /** Synchronous transactions commit an atomic file replacement before returning to any caller. */
@@ -73,6 +162,7 @@ export class DurableRepositories implements Repositories {
   private readonly lockPath: string
   private readonly statePath: string
   private readonly lockToken = randomUUID()
+  private readonly listeners = new Set<() => void>()
 
   constructor(private readonly directory: string) {
     if (!isAbsolute(directory)) throw new Error('Superagent storage directory must be absolute')
@@ -82,13 +172,7 @@ export class DurableRepositories implements Repositories {
     if (process.platform !== 'win32' && (directoryStat.mode & 0o077) !== 0) throw new Error('Superagent storage directory must have private 0700 permissions')
     this.lockPath = join(directory, 'state.lock')
     this.statePath = join(directory, 'state.json')
-    let lock: number
-    try { lock = openSync(this.lockPath, 'wx', 0o600) }
-    catch { throw new Error('Superagent state lock is held by another host. If the host crashed, verify it has stopped before removing state.lock.') }
-    try {
-      writeFileSync(lock, JSON.stringify({ pid: process.pid, token: this.lockToken }))
-      fsyncSync(lock)
-    } finally { closeSync(lock) }
+    acquireLock(this.lockPath, this.lockToken)
     try {
       let stat
       try { stat = lstatSync(this.statePath) }
@@ -110,17 +194,40 @@ export class DurableRepositories implements Repositories {
     this.data.audit = this.data.audit.slice(-2_000)
   }
   assertOpen(): void { if (this.disposed) throw new Error('Superagent runtime is disposed') }
+  onCommit(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
+  automation(): AutomationData { this.assertOpen(); return clone(this.data.extension ?? automationData()) }
+  mutateAutomation<T>(work: (data: AutomationData) => T): T {
+    return this.atomic(() => { this.data.extension ??= automationData(); return work(this.data.extension) })
+  }
+  snapshot(): { triggers: Trigger[]; dispositions: [string, TriggerDisposition][]; threads: Thread[]; tickets: Ticket[]; decisions: Decision[]; audit: AuditEntry[] } {
+    this.assertOpen()
+    const { extension: _, paused: __, ...records } = this.data
+    return clone(records)
+  }
+  enqueue(effect: Omit<PendingEffect, 'status' | 'createdAt' | 'updatedAt' | 'attempts' | 'nextAttemptAt'>): void {
+    this.mutateAutomation(data => {
+      if (data.effects.some(row => row.id === effect.id)) return
+      const at = new Date().toISOString()
+      data.effects.push({ ...clone(effect), status: 'pending', createdAt: at, updatedAt: at, attempts: 0, nextAttemptAt: 0 })
+    })
+  }
 
   atomic<T>(work: () => T): T {
     this.assertOpen()
     const before = clone(this.data)
     this.depth++
+    let committed = false
     try {
       const result = work()
-      if (this.depth === 1) this.persist()
+      if (this.depth === 1) { this.persist(); committed = true }
       return result
     } catch (error) { if (!(error instanceof CommitDurabilityError)) this.data = before; throw error }
-    finally { this.depth-- }
+    finally {
+      this.depth--
+      if (committed) for (const listener of this.listeners) {
+        try { listener() } catch { /* Observers cannot undo an already durable commit. */ }
+      }
+    }
   }
 
   private persist(): void {

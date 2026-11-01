@@ -3,3 +3,5 @@ dist/
 coverage/
 *.vsix
 .env
+.artifacts/
+.context/compound-engineering/
