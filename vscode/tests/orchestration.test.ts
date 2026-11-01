@@ -5,10 +5,11 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import type { ChannelRef, OutboundMessage, ThreadRef, Trigger } from '../../src/core/index.ts'
+import type { ChannelRef, OutboundMessage, ThreadRef, Ticket, Trigger } from '../../src/core/index.ts'
 import type { AgentBackend, AgentRun } from '../src/agent-backend.ts'
 import { AutomationService, DEFAULT_AUTOMATION_SETTINGS } from '../src/orchestration.ts'
 import { TicketRuntime } from '../src/runtime.ts'
+import { githubThreadRef, readPullRequest } from '../src/sources.ts'
 
 const trigger = (id: string, options: Partial<Trigger> = {}): Trigger => ({
   id, source: 'github:scope', threads: [{ source: 'github:scope', id: 'issue-1' }],
@@ -19,7 +20,7 @@ async function eventually(check: () => boolean) {
   const deadline = Date.now() + 3000
   while (!check()) { if (Date.now() > deadline) assert.fail('Automation did not settle'); await new Promise(resolve => setTimeout(resolve, 5)) }
 }
-function fixture(run?: (request: AgentRun) => Promise<void>, extra: { send?: (message: OutboundMessage) => Promise<void>; prepare?: () => Promise<string>; resolveThread?: (family: 'github' | 'teams', id: string, signal: AbortSignal) => Promise<ThreadRef> } = {}) {
+function fixture(run?: (request: AgentRun) => Promise<void>, extra: { claimPullRequest?: (ticket: Ticket, number: number, signal: AbortSignal) => Promise<ThreadRef>; send?: (message: OutboundMessage) => Promise<void>; prepare?: () => Promise<string>; resolveThread?: (family: 'github' | 'teams', id: string, signal: AbortSignal) => Promise<ThreadRef> } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'superagent-automation-'))
   const runtime = new TicketRuntime(directory)
   const inbox: Trigger[] = [], sent: OutboundMessage[] = [], runs: AgentRun[] = []
@@ -28,7 +29,7 @@ function fixture(run?: (request: AgentRun) => Promise<void>, extra: { send?: (me
     run: async request => { runs.push(request); if (run) await run(request); else await request.tools.find(tool => tool.name === 'superagent_report')!.invoke({ state: 'ready', summary: 'Fixed and verified' }) },
     abort: async () => {}, dispose: async () => {},
   }
-  const service = new AutomationService(runtime, { backend, prepare: extra.prepare ?? (async () => directory), resolveThread: extra.resolveThread, poll: async () => inbox.splice(0), send: async message => { if (extra.send) await extra.send(message); sent.push(message) } })
+  const service = new AutomationService(runtime, { backend, prepare: extra.prepare ?? (async () => directory), resolveThread: extra.resolveThread, claimPullRequest: extra.claimPullRequest, poll: async () => inbox.splice(0), send: async message => { if (extra.send) await extra.send(message); sent.push(message) } })
   service.saveSettings({ enabled: true, sources: { github: { enabled: true, allowedActors: ['owner'], allowedBots: [], allowUnaddressed: true }, teams: { enabled: false, allowedActors: [], allowedBots: [], allowUnaddressed: false } }, execution: { retryBaseMs: 10 } }, 0)
   return { directory, runtime, service, inbox, sent, runs, backend, clean: async () => { await service.dispose(); runtime.dispose(); rmSync(directory, { recursive: true, force: true }) } }
 }
@@ -692,4 +693,32 @@ test('unverifiable lock owners and interrupted acquisition guards are preserved 
     assert.equal(readFileSync(`${lock}.acquire`, 'utf8'), 'interrupted-acquisition')
     assert.equal(readFileSync(lock, 'utf8'), body)
   } finally { rmSync(directory, { recursive: true, force: true }) }
+})
+
+test('a verified open PR rebind waits for its new close instead of completing from historical closure', async () => {
+  const config = { origin: 'https://api.github.com', repository: 'company/project', account: 'agent', allowedActors: [], token: 'credential' }
+  const ref = githubThreadRef(config, 42)
+  let claims = 0, reported = false
+  const f = fixture(async request => {
+    await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'ready', summary: 'The reopened PR is ready', pr_number: 42 })
+    reported = true
+  }, { claimPullRequest: async (_ticket, number) => {
+    const pr = await readPullRequest(config, number, undefined, async () => Response.json({ number, state: 'open', merged: false, head: { sha: 'a'.repeat(40) } }))
+    assert.equal(pr.state, 'open'); claims++
+    return githubThreadRef(config, number)
+  } })
+  try {
+    const ticket = f.runtime.create('Finish the reopened PR')
+    f.runtime.engine.bindThread(ticket.id, ref, false)
+    const current = f.runtime.get(ticket.id)
+    current.follows![0]!.closed = { at: '2026-01-01T00:00:00.000Z', outcome: 'closed' }
+    f.runtime.repositories.atomic(() => f.runtime.repositories.tickets.save(current))
+    f.service.start()
+    await eventually(() => reported)
+    assert.equal(claims, 1)
+    assert.equal(f.runtime.get(ticket.id).ended, undefined)
+    assert.deepEqual(f.runtime.get(ticket.id).follows, [{ thread: `${ref.source}:42`, own: true }])
+    f.runtime.engine.threadClosed(ref, 'merged', new Date().toISOString())
+    assert.equal(f.runtime.get(ticket.id).ended?.outcome, 'merged')
+  } finally { await f.clean() }
 })

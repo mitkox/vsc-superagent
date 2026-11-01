@@ -109,6 +109,7 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
     if (sources.github.enabled) {
       try {
         const base = await github(), ref = githubThreadRef(base, 1), key = `source:github:${ref.source}`
+        h.runtime.reconcileGitHubBindings(base)
         const previous = h.runtime.readData<{ since: string; reviews?: GitHubReviewCursor }>(key)
         const started = new Date(Date.now() - 2000).toISOString()
         const subscribedNumbers = h.runtime.repositories.threads.list().filter(thread => thread.ref.source === ref.source && thread.subscriptions.length)
@@ -247,6 +248,7 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
     const sourcePull = original?.threads.some(ref => ref.source === thread.source && ref.id === thread.id)
     if (!sourcePull && (pr.author?.toLowerCase() !== cfg.account.toLowerCase() || pr.branch !== `superagent/${ticket.id}`))
       throw new Error('PR is neither this ticket’s source PR nor its own agent branch')
+    owner!.runtime.reconcileGitHubBindings(cfg)
     return thread
   }
 

@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { Engine, latestAssignment, runningAssignment } from '../../src/core/index.ts'
-import type { Policy, ReportState, SourceScope, Ticket, Trigger } from '../../src/core/index.ts'
+import { Engine, latestAssignment, runningAssignment, threadKey } from '../../src/core/index.ts'
+import type { Follow, Policy, ReportState, SourceScope, Ticket, Trigger } from '../../src/core/index.ts'
 import { DurableRepositories } from './state.ts'
-import type { SourceContext } from './sources.ts'
-import { sourceTrigger } from './sources.ts'
+import type { GitHubRepositoryScope, SourceContext } from './sources.ts'
+import { githubRepositoryRef, sourceTrigger } from './sources.ts'
 
 export interface ExternalOrigin { source: string; id: string; actor: string; context?: SourceContext; url?: string; thread?: string }
 
@@ -200,23 +200,64 @@ export class TicketRuntime {
     return this.repo.atomic(() => this.engine.report(id, { state, summary: report, ...(attention ? { question: attention } : {}) }))
   }
 
-  reportWithPullRequest(id: string, state: ReportState, summary: string, question: string | undefined, number: number, source: string): Ticket {
+  reportWithPullRequest(id: string, state: ReportState, summary: string, question: string | undefined, number: number, source: GitHubRepositoryScope): Ticket {
     this.get(id)
     this.pullRequestNumber(number)
     if (!REPORT_STATES.has(state)) throw new Error('Invalid report state')
     const report = boundedText(summary, 'report summary')
     const attention = question === undefined ? undefined : boundedText(question, 'question')
-    const ref = this.pullRequestRef(number, source)
+    githubRepositoryRef(source, number)
     if (!this.matchesPullRequestSource(id, source)) throw new Error('Ticket follows another GitHub source')
     return this.repo.atomic(() => {
-      this.engine.bindThread(id, ref, true)
+      this.reconcileGitHubBindings(source)
+      this.engine.bindThread(id, githubRepositoryRef(source, number), true)
       return this.engine.report(id, { state, summary: report, ...(attention ? { question: attention } : {}) })
     })
   }
 
-  matchesPullRequestSource(id: string, source: string): boolean {
-    const prefix = `github:${createHash('sha256').update(boundedText(source, 'pull request source')).digest('hex')}:pr-`
-    return (this.get(id).follows ?? []).every(follow => !follow.thread.startsWith('github:') || follow.thread.startsWith(prefix))
+  matchesPullRequestSource(id: string, source: GitHubRepositoryScope): boolean {
+    const canonical = `${githubRepositoryRef(source, 1).source}:`, legacy = this.legacyPullRequestPrefix(source)
+    return (this.get(id).follows ?? []).every(follow => !follow.thread.startsWith('github:') || follow.thread.startsWith(canonical) || this.legacyPullRequestNumber(follow.thread, legacy) !== undefined)
+  }
+
+  /** Migrate only aliases derived from the proved native repository configuration. Historical threads stay readable. */
+  reconcileGitHubBindings(source: GitHubRepositoryScope): void {
+    const namespace = githubRepositoryRef(source, 1).source, prefix = this.legacyPullRequestPrefix(source)
+    this.repo.atomic(() => {
+      for (const legacy of this.repo.threads.list()) {
+        const number = this.legacyPullRequestNumber(legacy.key, prefix)
+        if (number === undefined || legacy.ref.source !== 'github' || threadKey(legacy.ref) !== legacy.key) continue
+        const ref = { source: namespace, id: String(number) }, key = threadKey(ref)
+        const current = this.repo.threads.get(key)
+        const subscriptions = [...new Set([...current?.subscriptions ?? [], ...legacy.subscriptions])]
+        // Existing canonical permissions win; new subscribers retain the legacy read-only restriction.
+        const context = [...new Set([...current?.context ?? [], ...(legacy.context ?? []).filter(id => legacy.subscriptions.includes(id) && !current?.subscriptions.includes(id))])]
+        if (!current || JSON.stringify(subscriptions) !== JSON.stringify(current.subscriptions) || JSON.stringify(context) !== JSON.stringify(current.context ?? [])) {
+          this.repo.threads.save({ ...current ?? { key, ref, createdAt: legacy.createdAt, correlated: [], pending: [], meta: {} },
+            subscriptions, ...(context.length ? { context } : {}) })
+        }
+        // Move active subscriptions once; keeping them on the alias would undo a later canonical unsubscribe.
+        // Its context/history remain intact for the immutable triggers that still name the old thread.
+        if (legacy.subscriptions.length) {
+          legacy.subscriptions = []
+          this.repo.threads.save(legacy)
+        }
+      }
+      for (const ticket of this.repo.tickets.list()) {
+        if (!ticket.follows?.some(follow => this.legacyPullRequestNumber(follow.thread, prefix) !== undefined)) continue
+        const follows = new Map<string, Follow>()
+        // Prefer the canonical record's verified closure when both aliases exist.
+        for (const follow of ticket.follows.filter(follow => this.legacyPullRequestNumber(follow.thread, prefix) === undefined)) follows.set(follow.thread, follow)
+        for (const follow of ticket.follows) {
+          const number = this.legacyPullRequestNumber(follow.thread, prefix)
+          if (number === undefined) continue
+          const key = `${namespace}:${number}`, current = follows.get(key)
+          follows.set(key, { thread: key, own: !!current?.own || follow.own, ...(current?.closed ?? follow.closed ? { closed: current?.closed ?? follow.closed } : {}) })
+        }
+        ticket.follows = [...follows.values()]
+        this.repo.tickets.save(ticket)
+      }
+    })
   }
 
   stop(id: string): Ticket { this.get(id); return this.repo.atomic(() => this.engine.stopTicket(id, 'Stopped locally by the operator')) }
@@ -227,18 +268,24 @@ export class TicketRuntime {
     this.repo.atomic(() => { this.repo.setPaused(value); this.repo.audit(value ? 'processing.paused' : 'processing.resumed') })
   }
 
-  bindPullRequest(id: string, number: number, own: boolean, source: string): Ticket {
+  bindPullRequest(id: string, number: number, own: boolean, source: GitHubRepositoryScope): Ticket {
     this.get(id)
     this.pullRequestNumber(number)
     if (typeof own !== 'boolean') throw new Error('Invalid pull request ownership')
-    return this.repo.atomic(() => this.engine.bindThread(id, this.pullRequestRef(number, source), own))
+    return this.repo.atomic(() => {
+      this.reconcileGitHubBindings(source)
+      return this.engine.bindThread(id, githubRepositoryRef(source, number), own)
+    })
   }
 
-  closePullRequest(number: number, outcome: 'merged' | 'closed', source: string): void {
+  closePullRequest(number: number, outcome: 'merged' | 'closed', source: GitHubRepositoryScope): void {
     this.repo.assertOpen()
     this.pullRequestNumber(number)
     if (outcome !== 'merged' && outcome !== 'closed') throw new Error('Invalid pull request outcome')
-    this.repo.atomic(() => this.engine.threadClosed(this.pullRequestRef(number, source), outcome, new Date().toISOString()))
+    this.repo.atomic(() => {
+      this.reconcileGitHubBindings(source)
+      this.engine.threadClosed(githubRepositoryRef(source, number), outcome, new Date().toISOString())
+    })
   }
 
   dispose(): void { this.repo.dispose() }
@@ -260,9 +307,14 @@ export class TicketRuntime {
       return prior?.source === origin.source && prior.id === origin.id
     }))
   }
-  private pullRequestRef(number: number, source: string): { source: string; id: string } {
-    const identity = boundedText(source, 'pull request source')
-    return { source: 'github', id: `${createHash('sha256').update(identity).digest('hex')}:pr-${number}` }
+  private legacyPullRequestPrefix(source: GitHubRepositoryScope): string {
+    const credentialKey = `github:${createHash('sha256').update(JSON.stringify([source.origin, source.repository])).digest('hex')}`
+    return `github:${createHash('sha256').update(credentialKey).digest('hex')}:pr-`
+  }
+  private legacyPullRequestNumber(key: string, prefix: string): number | undefined {
+    if (!key.startsWith(prefix)) return
+    const suffix = key.slice(prefix.length), number = Number(suffix)
+    return Number.isSafeInteger(number) && number > 0 && String(number) === suffix ? number : undefined
   }
   private pullRequestNumber(number: number): void { if (!Number.isSafeInteger(number) || number <= 0) throw new Error('Invalid pull request number') }
 }

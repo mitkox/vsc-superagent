@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { buildSync } from 'esbuild'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -571,3 +572,74 @@ test('subscribed Teams human quoted receipts survive polling and durable reopen 
     else rmSync(directory, { recursive: true, force: true })
   }
 })
+
+const oldPullRef = (number: number, repository = 'company/project') => {
+  const hash = (text: string) => createHash('sha256').update(text).digest('hex')
+  const sourceKey = `github:${hash(JSON.stringify(['https://api.github.com', repository]))}`
+  return { source: 'github', id: `${hash(sourceKey)}:pr-${number}` }
+}
+for (const scenario of ['legacy-only', 'mixed-open', 'canonical-already-closed'] as const) {
+  test(`persisted ${scenario} PR bindings reconcile canonically and close ready tickets after restart`, async () => {
+    const configuration = { 'github.repository': 'company/project', 'github.allowedActors': [] }
+    let current: ReturnType<typeof fixture> | undefined = fixture(configuration)
+    const directory = current.directory
+    try {
+      const f = current
+      await f.initialize(); await f.save({ enabled: true })
+      const owner = f.runtime.create('Ready native PR repair'), legacy = oldPullRef(42), canonical = githubThreadRef(repositoryConfig, 42)
+      const legacyKey = `${legacy.source}:${legacy.id}`, canonicalKey = `${canonical.source}:${canonical.id}`
+      f.runtime.engine.bindThread(owner.id, legacy, true)
+      if (scenario !== 'legacy-only') f.runtime.engine.bindThread(owner.id, canonical, true)
+      const reader = f.runtime.create('Read historical PR context')
+      f.runtime.engine.followForContext(reader.id, legacy)
+      const unrelated = f.runtime.create('Other repository PR'), other = oldPullRef(99, 'unrelated/project')
+      f.runtime.engine.bindThread(unrelated.id, other, true)
+      const unrelatedBefore = structuredClone(f.runtime.get(unrelated.id).follows)
+      const historical = { id: 'historical-native-pr-source', source: 'github', threads: [legacy],
+        actor: { source: 'github', id: 'owner' }, human: true, at: new Date().toISOString(), text: 'Historical source context remains immutable',
+        channel: { source: 'github', thread: legacyKey, address: { origin: 'https://api.github.com', repository: 'company/project', number: '42' } }, meta: { historical: true } }
+      f.runtime.repositories.atomic(() => f.runtime.repositories.triggers.save(historical))
+      f.runtime.begin(owner.id); f.runtime.report(owner.id, 'ready', 'Ready for review')
+      if (scenario === 'canonical-already-closed') f.runtime.engine.threadClosed(canonical, 'merged', new Date().toISOString())
+      assert.equal(f.runtime.get(owner.id).ended, undefined)
+      await f.close(true); current = undefined
+      current = fixture(configuration, directory)
+      const reopened = current
+      await reopened.initialize()
+      reopened.respond(url => url.pathname.endsWith('/pulls/42') ? { ...pull(42, true, scenario !== 'mixed-open'), head: { sha: head } } : [])
+      await reopened.poll()
+      const expectedOutcome = scenario === 'mixed-open' ? 'closed' : 'merged'
+      const normalized = reopened.runtime.get(owner.id)
+      assert.equal(normalized.ended?.outcome, expectedOutcome)
+      assert.deepEqual(normalized.follows?.map(follow => follow.thread), [canonicalKey])
+      assert.equal(normalized.follows?.[0]?.own, true)
+      assert.equal(normalized.follows?.[0]?.closed?.outcome, expectedOutcome)
+      assert.ok(reopened.requests.some(({ url }) => url.pathname.endsWith('/pulls/42')))
+      assert.equal(reopened.requests.some(({ url }) => url.pathname.endsWith('/pulls/99')), false)
+      const proveScope = (host: ReturnType<typeof fixture>) => {
+        assert.deepEqual(host.runtime.repositories.triggers.get(historical.id), historical)
+        const oldThread = host.runtime.repositories.threads.get(legacyKey)!
+        assert.deepEqual(oldThread.ref, legacy)
+        assert.equal(oldThread.subscriptions.includes(reader.id), false)
+        assert.ok(oldThread.context?.includes(reader.id))
+        const canonicalThread = host.runtime.repositories.threads.get(canonicalKey)!
+        assert.ok(canonicalThread.subscriptions.includes(reader.id))
+        assert.ok(canonicalThread.context?.includes(reader.id))
+        assert.equal(canonicalThread.context?.includes(owner.id) ?? false, false)
+        assert.equal(host.runtime.get(reader.id).follows, undefined)
+        assert.deepEqual(host.runtime.get(unrelated.id).follows, unrelatedBefore)
+      }
+      proveScope(reopened)
+      const stable = structuredClone(normalized)
+      await reopened.poll()
+      assert.deepEqual(reopened.runtime.get(owner.id), stable)
+      await reopened.close(true); current = undefined
+      current = fixture(configuration, directory)
+      await current.initialize()
+      current.respond(url => url.pathname.endsWith('/pulls/42') ? { ...pull(42, true, scenario !== 'mixed-open'), head: { sha: head } } : [])
+      await current.poll()
+      assert.deepEqual(current.runtime.get(owner.id), stable)
+      proveScope(current)
+    } finally { if (current) await current.close(); else rmSync(directory, { recursive: true, force: true }) }
+  })
+}

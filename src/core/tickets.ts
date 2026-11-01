@@ -77,14 +77,16 @@ export class Tickets extends EnginePart {
   threadClosed(thread: ThreadRef, outcome: 'merged' | 'closed', at: string): void {
     const closed = threadKey(thread)
     for (const ticket of this.repo.tickets.open()) {
-      const follow = ticket.follows?.find(item => item.thread === closed && !item.closed)
+      const follow = ticket.follows?.find(item => item.thread === closed)
       if (!follow) continue
-      follow.closed = { at, outcome }
-      this.repo.tickets.save(ticket)
+      if (!follow.closed) {
+        follow.closed = { at, outcome }
+        this.repo.tickets.save(ticket)
+      }
       const done = this.followsDone(ticket)
-      if (!done || this.unfinished(ticket, at)) continue
+      if (!done || this.unfinished(ticket, follow.closed.at)) continue
       // Work resumed after the close and finished ends now.
-      const resumed = Date.parse(latestAssignment(ticket)?.createdAt ?? '') > Date.parse(at)
+      const resumed = Date.parse(latestAssignment(ticket)?.createdAt ?? '') > Date.parse(follow.closed.at)
       this.end(ticket.id, 'executor', done.outcome, resumed ? this.now() : done.at)
     }
   }

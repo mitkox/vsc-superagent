@@ -1,10 +1,19 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { TicketRuntime } from '../src/runtime.ts'
-import type { TeamsContext } from '../src/sources.ts'
+import type { GitHubRepositoryScope, TeamsContext } from '../src/sources.ts'
+import { githubRepositoryRef, githubThreadRef } from '../src/sources.ts'
+import { reached, threadKey } from '../../src/core/index.ts'
+
+const githubScope = { origin: 'https://api.github.com', repository: 'company/project' }
+const legacyRef = (scope: GitHubRepositoryScope, number: number) => {
+  const hash = (value: string) => createHash('sha256').update(value).digest('hex')
+  return { source: 'github', id: `${hash(`github:${hash(JSON.stringify([scope.origin, scope.repository]))}`)}:pr-${number}` }
+}
 
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'vsc-superagent-runtime-'))
@@ -81,9 +90,9 @@ test('a ready ticket follows its pull request until it closes', () => {
   try {
     const ticket = f.runtime.create('Fix the documented regression')
     f.runtime.begin(ticket.id)
-    f.runtime.bindPullRequest(ticket.id, 42, true, 'test-repository')
+    f.runtime.bindPullRequest(ticket.id, 42, true, githubScope)
     assert.equal(f.runtime.report(ticket.id, 'ready', 'Pull request 42 ready for review').ended, undefined)
-    f.runtime.closePullRequest(42, 'merged', 'test-repository')
+    f.runtime.closePullRequest(42, 'merged', githubScope)
     assert.equal(f.runtime.get(ticket.id).ended?.outcome, 'merged')
   } finally { f.clean() }
 })
@@ -93,7 +102,7 @@ test('a rejected report leaves its proposed PR binding unmodified', () => {
   try {
     const ticket = f.runtime.create('Fix the regression')
     f.runtime.begin(ticket.id)
-    assert.throws(() => f.runtime.reportWithPullRequest(ticket.id, 'ready', 'Ready', 'Open question', 42, 'repo'), /question.*ready/i)
+    assert.throws(() => f.runtime.reportWithPullRequest(ticket.id, 'ready', 'Ready', 'Open question', 42, githubScope), /question.*ready/i)
     assert.equal(f.runtime.get(ticket.id).follows?.length ?? 0, 0)
     assert.equal(f.runtime.report(ticket.id, 'ready', 'Ready').ended?.outcome, 'completed')
   } finally { f.clean() }
@@ -104,13 +113,13 @@ test('closing a PR in one repository cannot complete the same PR number in anoth
   try {
     const a = f.runtime.create('Fix repository A')
     f.runtime.begin(a.id)
-    f.runtime.bindPullRequest(a.id, 42, true, 'https://github.example/a/repo')
+    f.runtime.bindPullRequest(a.id, 42, true, { origin: 'https://github.example/api/v3', repository: 'a/repo' })
     f.runtime.report(a.id, 'ready', 'A ready for review')
     const b = f.runtime.create('Fix repository B')
     f.runtime.begin(b.id)
-    f.runtime.bindPullRequest(b.id, 42, true, 'https://github.example/b/repo')
+    f.runtime.bindPullRequest(b.id, 42, true, { origin: 'https://github.example/api/v3', repository: 'b/repo' })
     f.runtime.report(b.id, 'ready', 'B ready for review')
-    f.runtime.closePullRequest(42, 'merged', 'https://github.example/a/repo')
+    f.runtime.closePullRequest(42, 'merged', { origin: 'https://github.example/api/v3', repository: 'a/repo' })
     assert.equal(f.runtime.get(a.id).ended?.outcome, 'merged')
     assert.equal(f.runtime.get(b.id).ended, undefined)
   } finally { f.clean() }
@@ -179,7 +188,7 @@ test('runtime validates tool arguments and refuses operations after disposal', (
     assert.throws(() => f.runtime.create('x'.repeat(51_000)), /text/i)
     assert.throws(() => f.runtime.get('../outside'), /ticket/i)
     const ticket = f.runtime.create('Validate every public command')
-    assert.throws(() => f.runtime.bindPullRequest(ticket.id, -1, true, 'test-repository'), /pull request/i)
+    assert.throws(() => f.runtime.bindPullRequest(ticket.id, -1, true, githubScope), /pull request/i)
     assert.throws(() => f.runtime.report(ticket.id, 'arbitrary' as never, 'invalid'), /state/i)
     f.runtime.dispose()
     assert.throws(() => f.runtime.create('A request after disposal'), /disposed/i)
@@ -249,4 +258,84 @@ test('source cursor metadata extends legacy state under the same checksum and lo
     assert.equal(state.version, 1)
     assert.equal(state.data.extension.version, 1)
   } finally { reopened?.dispose(); f.clean() }
+})
+
+test('native reports share authenticated collector identities and explicit rebinds reopen historical closures', () => {
+  const f = fixture()
+  try {
+    const ticket = f.runtime.create('Repair the issue'), other = f.runtime.create('Keep this older PR record')
+    f.runtime.begin(ticket.id)
+    const ref = githubThreadRef({ ...githubScope, account: 'agent', allowedActors: [], token: 'credential' }, 42)
+    f.runtime.reportWithPullRequest(ticket.id, 'ready', 'Ready for review', undefined, 42, githubScope)
+    assert.deepEqual(f.runtime.get(ticket.id).follows, [{ thread: threadKey(ref), own: true }])
+    assert.equal(f.runtime.matchesPullRequestSource(ticket.id, githubScope), true)
+    f.runtime.engine.bindThread(other.id, ref, false)
+    const state = f.runtime.get(other.id)
+    state.follows![0]!.closed = { at: '2026-01-01T00:00:00.000Z', outcome: 'merged' }
+    f.runtime.repositories.atomic(() => f.runtime.repositories.tickets.save(state))
+    f.runtime.bindPullRequest(other.id, 42, true, githubScope)
+    assert.deepEqual(f.runtime.get(other.id).follows, [{ thread: threadKey(ref), own: true }])
+    f.runtime.begin(other.id)
+    const historical = f.runtime.get(other.id)
+    historical.follows![0]!.closed = state.follows![0]!.closed
+    f.runtime.repositories.atomic(() => f.runtime.repositories.tickets.save(historical))
+    assert.equal(f.runtime.reportWithPullRequest(other.id, 'ready', 'Reopened PR ready', undefined, 42, githubScope).ended, undefined)
+    assert.deepEqual(f.runtime.get(other.id).follows, [{ thread: threadKey(ref), own: true }])
+  } finally { f.clean() }
+})
+
+test('legacy migration proves the exact origin and repository and preserves historical read-only context', () => {
+  const f = fixture()
+  try {
+    const ticket = f.runtime.create('Retain context while upgrading'), old = legacyRef(githubScope, 42)
+    const otherScope = { ...githubScope, repository: 'other/project' }, foreign = legacyRef(otherScope, 42)
+    const otherOrigin = legacyRef({ ...githubScope, origin: 'https://github.example/api/v3' }, 42)
+    f.runtime.engine.followForContext(ticket.id, old)
+    f.runtime.engine.bindThread(ticket.id, foreign, true)
+    f.runtime.engine.bindThread(ticket.id, otherOrigin, true)
+    const arbitrary = { source: 'github', id: `${'a'.repeat(64)}:pr-42` }
+    f.runtime.engine.bindThread(ticket.id, arbitrary, true)
+    const before = f.runtime.context(ticket.id), oldThread = f.runtime.repositories.threads.get(threadKey(old))!
+    f.runtime.reconcileGitHubBindings(githubScope)
+    const canonical = githubRepositoryRef(githubScope, 42), key = threadKey(canonical)
+    const migrated = f.runtime.repositories.threads.get(key)!
+    assert.deepEqual(migrated.subscriptions, [ticket.id])
+    assert.deepEqual(migrated.context, [ticket.id])
+    assert.deepEqual(f.runtime.context(ticket.id), before)
+    assert.deepEqual(f.runtime.repositories.threads.get(threadKey(old))!.context, oldThread.context)
+    for (const ref of [foreign, otherOrigin, arbitrary]) assert.ok(f.runtime.get(ticket.id).follows?.some(follow => follow.thread === threadKey(ref)))
+    assert.equal(f.runtime.matchesPullRequestSource(ticket.id, githubScope), false)
+    // An explicit later bind can authorize this same thread; historical context must not undo it on the next poll.
+    f.runtime.engine.bindThread(ticket.id, canonical, false)
+    f.runtime.reconcileGitHubBindings(githubScope)
+    assert.equal(f.runtime.repositories.threads.get(key)!.context?.includes(ticket.id) ?? false, false)
+    // Once explicitly removed, migration/restart must not re-add the moved subscription.
+    f.runtime.engine.unsubscribe(key)
+    f.runtime.reconcileGitHubBindings(githubScope)
+    assert.deepEqual(f.runtime.repositories.threads.get(key)!.subscriptions, [])
+  } finally { f.clean() }
+})
+
+
+test('mixed alias migration preserves each existing canonical read and write permission', () => {
+  const f = fixture()
+  try {
+    const writer = f.runtime.create('Keep canonical write access'), reader = f.runtime.create('Keep canonical context only')
+    const old = legacyRef(githubScope, 42), canonical = githubRepositoryRef(githubScope, 42), key = threadKey(canonical)
+    f.runtime.engine.bindThread(writer.id, canonical, true)
+    f.runtime.engine.followForContext(writer.id, old)
+    f.runtime.engine.followForContext(reader.id, canonical)
+    f.runtime.engine.bindThread(reader.id, old, true)
+    f.runtime.reconcileGitHubBindings(githubScope)
+    const current = f.runtime.repositories.threads.get(key)!
+    assert.deepEqual(new Set(current.subscriptions), new Set([writer.id, reader.id]))
+    assert.deepEqual(current.context, [reader.id])
+    const message = { id: 'new-source-message', source: canonical.source, threads: [canonical], actor: { source: canonical.source, id: 'person' }, human: true,
+      at: new Date().toISOString(), text: 'Source follow-up', meta: {} }
+    const thread = (key: string) => f.runtime.repositories.threads.get(key)
+    assert.equal(reached(f.runtime.get(writer.id), message, thread, false), true)
+    assert.equal(reached(f.runtime.get(reader.id), message, thread, false), false)
+    f.runtime.reconcileGitHubBindings(githubScope)
+    assert.deepEqual(f.runtime.repositories.threads.get(key), current)
+  } finally { f.clean() }
 })

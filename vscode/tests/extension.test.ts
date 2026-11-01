@@ -1,4 +1,5 @@
 import { buildSync } from "esbuild";
+import { githubThreadRef } from "../src/sources.ts";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -848,4 +849,39 @@ test("GitHub source changes during SecretStorage retrieval and credential remova
   } finally {
     f.close();
   }
+});
+
+test("native PR reports use collector identity and merged readback closes them after reload", async () => {
+  const f = fixture();
+  try {
+    f.values["superagent.github.origin"] = "https://api.github.com";
+    f.values["superagent.github.repository"] = "company/project";
+    f.values["superagent.github.account"] = "agent";
+    f.inputs.push("Approved native PR repair");
+    await f.command("new");
+    f.choices.push("first", "Open isolated worktree");
+    await f.command("open");
+    f.reload();
+    await f.invoke("superagent_snapshot");
+    const reported = JSON.parse((await f.invoke("superagent_report", {
+      state: "ready", summary: "Ready for review", pullRequest: 42,
+    })).content[0]!.value);
+    const canonical = githubThreadRef({ origin: "https://api.github.com", repository: "company/project", account: "agent",
+      allowedActors: [], token: "native-test-credential" }, 42);
+    assert.equal(reported.follows.length, 1);
+    assert.equal(reported.follows[0].thread, `${canonical.source}:${canonical.id}`);
+    assert.equal(reported.follows[0].own, true);
+    assert.equal(reported.ended, undefined);
+    f.inputs.push("private-native-read-token");
+    await f.command("secrets");
+    f.reload();
+    f.response({ number: 42, state: "closed", merged: true, head: { sha: "a".repeat(40) }, merged_at: new Date().toISOString() });
+    f.choices.push("first", "Refresh followed pull requests");
+    await f.command("open");
+    assert.deepEqual(f.errors, []);
+    assert.ok(f.requests.some(url => url.pathname === "/repos/company/project/pulls/42"));
+    await assert.rejects(f.invoke("superagent_snapshot"), /ended/i);
+    f.reload();
+    await assert.rejects(f.invoke("superagent_snapshot"), /ended/i);
+  } finally { f.close(); }
 });

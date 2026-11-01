@@ -254,11 +254,19 @@ export function sourceNamespace(context: SourceContext): string {
   return context.provider === 'github' ? `github:${id(githubBase(context.origin).href, context.repository.toLowerCase())}`
     : `teams:${id(context.tenantId.toLowerCase(), context.chatId ? `chat:${context.chatId}` : `team:${context.teamId?.toLowerCase()}:channel:${context.channelId}`)}`
 }
+export type GitHubRepositoryScope = Pick<GitHubSourceConfig, 'origin' | 'repository'>
+
+/** Shared identity for native reports and authenticated provider adapters; contains no credentials. */
+export function githubRepositoryRef(scope: GitHubRepositoryScope, number: number): ThreadRef {
+  const base = githubBase(scope.origin)
+  if (!REPOSITORY.test(scope.repository) || scope.repository.split('/')[1]?.startsWith('.') || !positive(number)) fail('Invalid source configuration')
+  return { source: `github:${id(base.href, scope.repository.toLowerCase())}`, id: String(number) }
+}
+
 /** Exact repository-scoped domain identity for PR discovery and approved claims. */
 export function githubThreadRef(config: GitHubSourceConfig, number: number): ThreadRef {
-  const base = validateGitHub(config)
-  if (!positive(number)) fail('Invalid source configuration')
-  return { source: `github:${id(base.href, config.repository.toLowerCase())}`, id: String(number) }
+  validateGitHub(config)
+  return githubRepositoryRef(config, number)
 }
 
 /** Converts provider facts into a domain event. No provider flag grants a local execution mandate. */

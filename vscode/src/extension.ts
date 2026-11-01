@@ -13,6 +13,7 @@ import type {
   TeamsSourceConfig,
 } from "./sources.ts";
 import {
+  githubRepositoryRef,
   pollGitHub,
   pollGitHubReviewsBatch,
   pollTeamsBatch,
@@ -335,20 +336,20 @@ export function activate(context: vscode.ExtensionContext): void {
     } else if (action === "Refresh followed pull requests") {
       const config = await github();
       const fingerprint = sourceFingerprint();
-      for (const followed of ticket.follows ?? []) {
-        if (!h.runtime.matchesPullRequestSource(ticket.id, githubKey()))
-          throw new OperatorError(
-            "The GitHub repository differs from this ticket’s PR binding. Restore its approved source configuration before refreshing.",
-          );
-        const number = Number(/:pr-(\d+)$/.exec(followed.thread)?.[1]);
+      if (!h.runtime.matchesPullRequestSource(ticket.id, config))
+        throw new OperatorError(
+          "The GitHub repository differs from this ticket’s PR binding. Restore its approved source configuration before refreshing.",
+        );
+      h.runtime.reconcileGitHubBindings(config);
+      const namespace = githubRepositoryRef(config, 1).source;
+      for (const followed of h.runtime.get(ticket.id).follows ?? []) {
+        if (!followed.thread.startsWith(`${namespace}:`)) continue;
+        const number = Number(followed.thread.slice(namespace.length + 1));
+        if (!Number.isSafeInteger(number) || number < 1) continue;
         const pr = await readPullRequest(config, number, abort.signal);
         verifySources(fingerprint);
         if (pr.state === "closed")
-          h.runtime.closePullRequest(
-            number,
-            pr.merged ? "merged" : "closed",
-            githubKey(),
-          );
+          h.runtime.closePullRequest(number, pr.merged ? "merged" : "closed", config);
       }
     } else if (action === "Open isolated worktree") {
       if (ticket.ended)
@@ -921,7 +922,10 @@ export function activate(context: vscode.ExtensionContext): void {
                 throw new OperatorError(
                   "A stable GitHub repository configuration is required to bind a PR.",
                 );
-              if (!h.runtime.matchesPullRequestSource(ticket.id, binding))
+              if (!h.runtime.matchesPullRequestSource(ticket.id, {
+                origin: settings().get("github.origin", "https://api.github.com"),
+                repository: settings().get("github.repository", ""),
+              }))
                 throw new OperatorError(
                   "This ticket already follows PRs in another GitHub source.",
                 );
@@ -940,7 +944,7 @@ export function activate(context: vscode.ExtensionContext): void {
                     input.summary,
                     input.question,
                     input.pullRequest,
-                    binding,
+                    { origin: settings().get("github.origin", "https://api.github.com"), repository: settings().get("github.repository", "") },
                   );
             return new vscode.LanguageModelToolResult([
               new vscode.LanguageModelTextPart(JSON.stringify(updated)),
