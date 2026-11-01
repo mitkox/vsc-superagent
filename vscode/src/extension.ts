@@ -1,5 +1,6 @@
 import * as vscode from 'vscode'
 import { createHash } from 'node:crypto'
+import { devNull } from 'node:os'
 import { join } from 'node:path'
 import { TicketRuntime } from './runtime.ts'
 import { Worktrees } from './worktree.ts'
@@ -15,6 +16,28 @@ const hash = (value: string) => createHash('sha256').update(value).digest('hex')
 const plain = (value: string) => value.replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g, ' ').slice(0, 300)
 const safeMessage = (error: unknown) => error instanceof OperatorError || error instanceof SourceError ? error.message
   : 'Operation failed. Check source permissions, local storage and repository access. No credentials or remote response bodies were logged.'
+// Values Copilot itself writes into the shared extension host env to switch exporting off.
+const inertEnv = (key: string, value: string) =>
+  (key === 'OTEL_SDK_DISABLED' && /^true$/i.test(value))
+  || (key === 'COPILOT_OTEL_FILE_EXPORTER_PATH' && value === devNull)
+  || (/^(COPILOT_OTEL_ENABLED|COPILOT_OTEL_CAPTURE_IDENTITY|OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT)$/.test(key) && /^(false|0)$/i.test(value))
+
+/** Names (never values) of settings and environment variables that enable telemetry export or debug file logging. */
+function exporterFindings(): string[] {
+  const copilot = vscode.workspace.getConfiguration('github.copilot.chat')
+  const agentHost = vscode.workspace.getConfiguration('chat.agentHost')
+  const enabled = (config: vscode.WorkspaceConfiguration, key: string) => key.endsWith('outfile') ? !!config.get(key) : config.get(key) === true
+  // Copilot can enable debug file logging by experiment, which getConfiguration cannot see; require an explicit opt-out.
+  const debugLog = 'agentDebugLog.fileLogging.enabled', debugLogInspect = copilot.inspect(debugLog)
+  const debugLogOptedOut = copilot.get(debugLog) === false
+    && [debugLogInspect?.workspaceFolderValue, debugLogInspect?.workspaceValue, debugLogInspect?.globalValue].some(value => value !== undefined)
+  return [
+    ...['otel.enabled', 'otel.dbSpanExporter.enabled', 'otel.outfile', 'chatDebug.fileLogging.enabled'].filter(key => enabled(copilot, key)).map(key => `github.copilot.chat.${key}`),
+    ...debugLogOptedOut ? [] : [`github.copilot.chat.${debugLog}`],
+    ...['otel.enabled', 'otel.dbSpanExporter.enabled', 'otel.outfile'].filter(key => enabled(agentHost, key)).map(key => `chat.agentHost.${key}`),
+    ...Object.entries(process.env).filter(([key, value]) => !!value && (key.startsWith('COPILOT_OTEL_') || key.startsWith('OTEL_')) && !inertEnv(key, value)).map(([key]) => `env ${key}`),
+  ]
+}
 
 /** Native extension tools never invoke a model, telemetry client, arbitrary shell, or external write API. */
 export function activate(context: vscode.ExtensionContext): void {
@@ -25,18 +48,8 @@ export function activate(context: vscode.ExtensionContext): void {
   let openingFolder = false
   const changed = new vscode.EventEmitter<void>()
   const abort = new AbortController()
-  const exportersActiveAtStartup = exportersEnabled()
+  const exportersAtStartup = exporterFindings()
   context.subscriptions.push(changed, { dispose() { disposed = true; abort.abort(); current?.runtime.dispose() } })
-
-  function exportersEnabled(): boolean {
-    const copilot = vscode.workspace.getConfiguration('github.copilot.chat')
-    const agentHost = vscode.workspace.getConfiguration('chat.agentHost')
-    return copilot.get('otel.enabled') === true || copilot.get('otel.dbSpanExporter.enabled') === true
-      || copilot.get('agentDebugLog.fileLogging.enabled') === true || !!copilot.get('otel.outfile')
-      || agentHost.get('otel.enabled') === true || !!agentHost.get('otel.outfile')
-      || Object.entries(process.env).some(([key, value]) => !!value && (key.startsWith('COPILOT_OTEL_') || key.startsWith('OTEL_'))
-        && !(key === 'OTEL_SDK_DISABLED' && value.toLowerCase() === 'true'))
-  }
 
   function guard(): string {
     if (disposed || abort.signal.aborted) throw new OperatorError('Superagent is shutting down.')
@@ -47,7 +60,9 @@ export function activate(context: vscode.ExtensionContext): void {
     if (vscode.workspace.getConfiguration('telemetry').get('telemetryLevel') !== 'off' || vscode.env.isTelemetryEnabled) {
       throw new OperatorError('Disable VS Code telemetry before using Superagent. Run Superagent: Apply Local Privacy Settings, then reload if needed.')
     }
-    if (exportersActiveAtStartup || exportersEnabled()) throw new OperatorError('Disable Copilot OpenTelemetry/debug logging and remove telemetry exporter environment variables, then reload VS Code before using Superagent.')
+    const now = exporterFindings()
+    const findings = [...now, ...exportersAtStartup.filter(name => !now.includes(name)).map(name => `${name} (until reload)`)]
+    if (findings.length) throw new OperatorError(`Disable Copilot OpenTelemetry/debug logging and remove telemetry exporter environment variables, then reload VS Code before using Superagent. Active: ${findings.join(', ')}.`)
     return folders[0]!.uri.fsPath
   }
 
@@ -299,7 +314,7 @@ export function activate(context: vscode.ExtensionContext): void {
     for (const key of ['otel.enabled', 'otel.dbSpanExporter.enabled', 'otel.captureContent', 'otel.captureIdentity', 'agentDebugLog.fileLogging.enabled']) await copilot.update(key, false, vscode.ConfigurationTarget.Global)
     await copilot.update('otel.outfile', '', vscode.ConfigurationTarget.Global)
     const agentHost = vscode.workspace.getConfiguration('chat.agentHost')
-    for (const key of ['otel.enabled', 'otel.captureContent']) await agentHost.update(key, false, vscode.ConfigurationTarget.Global)
+    for (const key of ['otel.enabled', 'otel.dbSpanExporter.enabled', 'otel.captureContent']) await agentHost.update(key, false, vscode.ConfigurationTarget.Global)
     await agentHost.update('otel.outfile', '', vscode.ConfigurationTarget.Global)
     await vscode.window.showInformationMessage('Privacy settings applied. Remove telemetry exporter environment variables and reload VS Code before using Superagent.')
   }))
