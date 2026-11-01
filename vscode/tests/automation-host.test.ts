@@ -83,7 +83,7 @@ function fixture(initial: Record<string, unknown> = {}) {
     },
   })
   const snapshot = () => panel.snapshot() as { settings: { revision: number; value: AutomationSettings } }
-  return { runtime, values, requests, signins, errors, snapshot,
+  return { runtime, values, requests, signins, errors, snapshot, get credentials() { return credentials },
     initialize: () => commands.get('superagent.dashboard')!(),
     start: () => commands.get('superagent.startService')!(),
     save: (value: unknown) => panel.action({ action: 'saveSettings', revision: snapshot().settings.revision, value }),
@@ -116,7 +116,7 @@ test('dashboard GitHub policy controls real polling before the first poll and na
     assert.equal(f.runtime.repositories.snapshot().triggers.some(trigger => trigger.text.includes('@agent repair')), false)
     assert.deepEqual(f.snapshot().settings.value.sources.github.allowedActors, [])
     assert.equal(f.snapshot().settings.value.sources.github.allowUnaddressed, false)
-    assert.ok(f.requests.some(request => request.authorization === 'Bearer github-credential-2'))
+    assert.equal(f.credentials, 2)
 
     await f.save({ sources: { github: { enabled: false } } })
     const reads = f.requests.length
@@ -262,7 +262,7 @@ test('automatic polling skips candidate reads when empty source policies authori
       const candidates = f.requests.filter(({ url }) => /\/issues(?:\/comments)?$|\/pulls\/(?:comments|\d+\/reviews)$|\/messages(?:\/|$)/.test(url.pathname)
         || url.pathname.endsWith('/pulls') && url.searchParams.get('per_page') === '25')
       assert.equal(candidates.length, 0, scenario.name)
-      assert.equal(f.requests.filter(({ url }) => url.pathname.endsWith('/pulls')).length, 1, `${scenario.name}: own-PR discovery remains active`)
+      assert.equal(f.requests.filter(({ url }) => url.pathname.endsWith('/pulls')).length, 0, `${scenario.name}: no tickets need PR discovery`)
       assert.ok(f.requests.some(({ url }) => url.pathname === '/v1.0/me'), `${scenario.name}: native identity refresh remains active`)
     } finally { await f.close() }
   }
@@ -301,5 +301,172 @@ test('empty default admission preserves automatic collection for subscribed GitH
     assert.equal((trigger.meta.provider as { subscribed: boolean }).subscribed, true)
     assert.equal(trigger.addressed, undefined)
     assert.ok(f.requests.some(({ url }) => url.pathname.endsWith('/issues')))
+  } finally { await f.close() }
+})
+
+const repositoryConfig = { origin: 'https://api.github.com', repository: 'company/project', account: 'agent', allowedActors: [], token: 'native-test-credential' }
+const pull = (number: number, closed = false, merged = false) => ({ number, state: closed ? 'closed' : 'open', merged,
+  head: { sha: String(number % 10).repeat(40) }, closed_at: closed ? new Date().toISOString() : null,
+  ...(merged ? { merged_at: new Date().toISOString() } : {}) })
+function followPull(runtime: TicketRuntime, number: number) {
+  const ticket = runtime.create(`Track PR #${number}`)
+  runtime.engine.bindThread(ticket.id, githubThreadRef(repositoryConfig, number), true)
+  return ticket
+}
+
+test('failed discovery still delivers known-PR checks and merged lifecycle facts', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': [] })
+  try {
+    await f.initialize(); await f.save({ enabled: true })
+    const known = followPull(f.runtime, 7)
+    f.runtime.create('Repair whose PR association is not known yet')
+    f.respond(url => {
+      if (url.searchParams.has('head') || url.pathname.endsWith('/pulls') && url.searchParams.get('per_page') === '100') throw new Error('Discovery unavailable')
+      if (url.pathname.endsWith('/pulls/7')) return pull(7, true, true)
+      if (url.pathname.endsWith('/statuses')) return [{ id: 1, state: 'success', context: 'build' }]
+      return []
+    })
+    await assert.rejects(f.poll(), /PR discovery|GitHub source failed/)
+    assert.ok(f.runtime.repositories.snapshot().triggers.some(trigger => (trigger.meta.provider as { kind?: string } | undefined)?.kind === 'checks'))
+    assert.equal(f.runtime.get(known.id).follows?.[0]?.closed?.outcome, 'merged')
+    assert.match(f.runtime.repositories.automation().health.at(-1)!.error, /PR discovery/)
+  } finally { await f.close() }
+})
+
+test('one known PR failure does not suppress its independent lifecycle or another PR', async () => {
+  for (const failure of ['checks', 'lifecycle']) {
+    const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': [] })
+    try {
+      await f.initialize(); await f.save({ enabled: true })
+      const first = followPull(f.runtime, 7), second = followPull(f.runtime, 8)
+      let firstReads = 0
+      f.respond(url => {
+        if (url.pathname.endsWith('/pulls/7')) {
+          if (++firstReads === 2 && failure === 'lifecycle') throw new Error('Lifecycle unavailable')
+          return pull(7, true, true)
+        }
+        if (url.pathname.endsWith('/pulls/8')) return pull(8, true)
+        if (url.pathname.endsWith(`/commits/${'7'.repeat(40)}/statuses`) && failure === 'checks') throw new Error('Checks unavailable')
+        if (url.pathname.endsWith('/statuses')) return [{ id: 1, state: 'success', context: 'build' }]
+        return []
+      })
+      await assert.rejects(f.poll(), failure === 'checks' ? /PR #7 CI/ : /PR #7 lifecycle/)
+      assert.equal(firstReads, 2)
+      if (failure === 'checks') assert.equal(f.runtime.get(first.id).follows?.[0]?.closed?.outcome, 'merged')
+      assert.equal(f.runtime.get(second.id).follows?.[0]?.closed?.outcome, 'closed')
+      assert.ok(f.runtime.repositories.snapshot().triggers.some(trigger => (trigger.meta.provider as { kind?: string; number?: number } | undefined)?.kind === 'checks'
+        && (trigger.meta.provider as { number: number }).number === 8))
+    } finally { await f.close() }
+  }
+})
+
+test('failed intake preserves healthy review progress and known-PR monitoring', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': [] })
+  try {
+    await f.initialize(); await f.save({ enabled: true })
+    const known = followPull(f.runtime, 7)
+    f.respond(url => {
+      if (url.pathname.endsWith('/issues')) throw new Error('Intake unavailable')
+      if (url.pathname.endsWith('/pulls')) return [{ number: 7 }]
+      if (url.pathname.endsWith('/pulls/7/reviews')) return [{ id: 20, body: 'Healthy review progress', user: { login: 'reviewer', type: 'User' },
+        state: 'COMMENTED', submitted_at: new Date().toISOString() }]
+      if (url.pathname.endsWith('/pulls/7')) return pull(7, true, true)
+      return []
+    })
+    await assert.rejects(f.poll(), /GitHub intake|GitHub source failed/)
+    assert.ok(f.runtime.repositories.snapshot().triggers.some(trigger => trigger.text === 'Healthy review progress'))
+    assert.equal(f.runtime.get(known.id).follows?.[0]?.closed?.outcome, 'merged')
+  } finally { await f.close() }
+})
+
+test('changed review scans retain committed intake and still poll known PR lifecycle', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': [] })
+  try {
+    await f.initialize(); await f.save({ enabled: true })
+    const known = followPull(f.runtime, 7), key = `source:github:${githubThreadRef(repositoryConfig, 1).source}`
+    const oldSince = '2026-11-01T00:00:00.000Z'
+    f.runtime.writeData(key, { since: oldSince, reviews: { prPage: 2, prOffset: 0, reviewPage: 1, previousPrPageHash: 'a'.repeat(64) } })
+    f.respond(url => url.pathname.endsWith('/issues') ? [githubIssue(7, 'outsider', 'User', 'Healthy intake progress')]
+      : url.pathname.endsWith('/pulls/7') ? pull(7, true, true) : [])
+    await assert.rejects(f.poll(), /GitHub reviews|GitHub source failed/)
+    assert.ok(f.runtime.repositories.snapshot().triggers.some(trigger => trigger.text.includes('Healthy intake progress')))
+    const checkpoint = f.runtime.readData<{ since: string; reviews?: unknown }>(key)!
+    assert.notEqual(checkpoint.since, oldSince)
+    assert.equal(checkpoint.reviews, undefined)
+    assert.equal(f.runtime.get(known.id).follows?.[0]?.closed?.outcome, 'merged')
+  } finally { await f.close() }
+})
+
+test('ticket-branch discovery recovers a closed PR without scanning unrelated history', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': [] })
+  try {
+    await f.initialize(); await f.save({ enabled: true })
+    const ticket = f.runtime.create('Recover a missed PR report'), branch = `superagent/${ticket.id}`
+    f.respond(url => {
+      if (url.pathname.endsWith('/pulls')) return url.searchParams.get('head') === `company:${branch}`
+        ? [{ ...pull(9, true, true), user: { login: 'agent' }, head: { sha: '9'.repeat(40), ref: branch, repo: { full_name: 'company/project' } } }]
+        : Array.from({ length: 100 }, (_, i) => ({ number: i + Number(url.searchParams.get('page')) * 100, user: { login: 'unrelated' } }))
+      if (url.pathname.endsWith('/pulls/9')) return pull(9, true, true)
+      return []
+    })
+    await f.poll()
+    assert.equal(f.runtime.get(ticket.id).follows?.[0]?.closed?.outcome, 'merged')
+    const discovery = f.requests.filter(({ url }) => url.pathname.endsWith('/pulls'))
+    assert.equal(discovery.length, 1)
+    assert.equal(discovery[0]?.url.searchParams.get('head'), `company:${branch}`)
+    assert.equal(discovery[0]?.url.searchParams.get('state'), 'all')
+    assert.equal(discovery[0]?.url.searchParams.get('page'), '1')
+  } finally { await f.close() }
+})
+
+test('PR discovery rotates at most five missing ticket associations per poll', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': [] })
+  try {
+    await f.initialize(); await f.save({ enabled: true })
+    const tickets = Array.from({ length: 12 }, (_, i) => f.runtime.create(`Missing PR association ${i}`))
+    const known = followPull(f.runtime, 7)
+    f.respond(url => url.pathname.endsWith('/pulls/7') ? pull(7) : [])
+    const heads: string[] = []
+    for (let i = 0; i < 3; i++) {
+      const before = f.requests.length
+      await f.poll()
+      const batch = f.requests.slice(before).filter(({ url }) => url.searchParams.has('head'))
+      assert.equal(batch.length, 5)
+      heads.push(...batch.map(({ url }) => url.searchParams.get('head')!))
+    }
+    assert.equal(new Set(heads).size, tickets.length)
+    assert.ok(tickets.every(ticket => heads.includes(`company:superagent/${ticket.id}`)))
+    assert.equal(heads.includes(`company:superagent/${known.id}`), false)
+  } finally { await f.close() }
+})
+
+test('resumed tickets discover a new PR without reopening their historical closed association', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': [] })
+  try {
+    await f.initialize(); await f.save({ enabled: true })
+    const ticket = followPull(f.runtime, 7), oldThread = githubThreadRef(repositoryConfig, 7)
+    f.runtime.begin(ticket.id); f.runtime.report(ticket.id, 'ready', 'First repair is ready')
+    f.runtime.engine.threadClosed(oldThread, 'merged', new Date().toISOString())
+    assert.equal(f.runtime.get(ticket.id).ended?.outcome, 'merged')
+    f.runtime.followup(ticket.id, 'Apply the approved follow-up repair')
+    assert.equal(f.runtime.get(ticket.id).ended, undefined)
+    assert.ok(f.runtime.get(ticket.id).follows?.[0]?.closed)
+    let historicalReopened = false
+    const unsubscribe = f.runtime.repositories.onCommit(() => {
+      if (!f.runtime.get(ticket.id).follows?.find(follow => follow.thread === `${oldThread.source}:7`)?.closed) historicalReopened = true
+    })
+    const branch = `superagent/${ticket.id}`
+    f.respond(url => {
+      if (url.searchParams.has('head')) return [7, 8].map(number => ({ ...pull(number, number === 7, number === 7), user: { login: 'agent' },
+        head: { sha: String(number).repeat(40), ref: branch, repo: { full_name: 'company/project' } } }))
+      if (url.pathname.endsWith('/pulls/7')) return pull(7, true, true)
+      if (url.pathname.endsWith('/pulls/8')) return pull(8)
+      return []
+    })
+    try { await f.poll() } finally { unsubscribe() }
+    assert.ok(f.requests.some(({ url }) => url.searchParams.get('head') === `company:${branch}`))
+    assert.equal(historicalReopened, false)
+    assert.ok(f.runtime.get(ticket.id).follows?.some(follow => follow.thread === `${oldThread.source}:8` && follow.own && !follow.closed))
+    assert.equal(f.runtime.get(ticket.id).ended, undefined)
   } finally { await f.close() }
 })

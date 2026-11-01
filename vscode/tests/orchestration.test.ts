@@ -389,6 +389,61 @@ test('unlisted human and bot followups cannot withdraw a ticket even if an asses
   } finally { await f.clean() }
 })
 
+for (const family of ['github', 'teams'] as const) {
+  test(`${family} dropped work stays silent across restart and resumes on a later human request`, async () => {
+    const f = fixture(async request => {
+      if (f.runs.length > 1) await request.tools.find(tool => tool.name === 'orchestrator_ack')!.invoke({ trigger_id: 'new-actionable-request', text: 'Checking the new actionable request.' })
+      await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke(f.runs.length === 1
+        ? { state: 'dropped', summary: 'Investigation found no defect or actionable request.' }
+        : { state: 'ready', summary: 'The new actionable request is fixed and verified.' })
+    })
+    try {
+      f.service.saveSettings({ sources: { [family]: { enabled: true, allowedActors: ['owner'], allowUnaddressed: true } } }, f.service.settings.revision)
+      const source = `${family}:scope`
+      const item = (id: string) => trigger(id, { source, actor: { source, id: 'owner' }, threads: [{ source, id: 'issue-1' }],
+        channel: { source, thread: `${source}:issue-1`, address: {} } })
+      f.inbox.push(item('no-defect')); f.service.start(); await f.service.pollNow()
+      await eventually(() => !!f.runtime.list()[0]?.ended && f.service.snapshot().health.workers === 0)
+      const ticket = f.runtime.list()[0]!
+      assert.equal(ticket.ended?.outcome, 'dropped')
+      assert.equal(ticket.assignments.at(-1)?.report?.state, 'dropped')
+      assert.equal(f.service.snapshot().effects.some(effect => effect.kind === 'outbound'), false)
+      assert.equal(f.sent.length, 0)
+      await f.service.stop(); f.service.start()
+      await new Promise(resolve => setTimeout(resolve, 10))
+      assert.equal(f.service.snapshot().effects.some(effect => effect.kind === 'outbound'), false)
+      assert.equal(f.sent.length, 0)
+      f.inbox.push(item('new-actionable-request')); await f.service.pollNow()
+      await eventually(() => {
+        const problems = f.service.snapshot().health.problems
+        assert.deepEqual(problems, [])
+        return f.sent.some(message => message.kind === 'reply')
+      })
+      assert.equal(f.sent.filter(message => message.kind === 'reply').length, 1)
+      assert.equal(f.runtime.list().length, 1)
+      assert.equal(f.runtime.get(ticket.id).ended?.outcome, 'completed')
+      assert.match(f.sent.find(message => message.kind === 'reply')!.text, /new actionable request/)
+    } finally { await f.clean() }
+  })
+}
+
+test('a dropped report can still deliver an explicitly requested answer without an automatic result', async () => {
+  const summary = 'The reported behavior is expected; no repair is needed.'
+  const f = fixture(async request => {
+    await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'dropped', summary, reply_to_trigger_id: 'explicit-question' })
+  })
+  try {
+    f.inbox.push(trigger('explicit-question', { text: 'Is this behavior a defect? Please answer this question.' }))
+    f.service.start(); await f.service.pollNow()
+    await eventually(() => !!f.runtime.list()[0]?.ended && f.service.snapshot().health.workers === 0)
+    await eventually(() => f.sent.length >= 1)
+    assert.equal(f.runtime.list()[0]!.ended?.outcome, 'dropped')
+    assert.equal(f.service.snapshot().effects.filter(effect => effect.kind === 'outbound').length, 1)
+    assert.equal(f.sent.length, 1)
+    assert.equal(f.sent[0]!.text, summary)
+  } finally { await f.clean() }
+})
+
 test('a source PR merge relays one final completion notice to the original Teams conversation', async () => {
   const f = fixture(async request => {
     f.runtime.engine.bindThread(request.ticketId, { source: 'github:scope', id: '42' }, true)

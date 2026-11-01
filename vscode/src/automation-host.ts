@@ -122,35 +122,50 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
           admit: sourceAdmission('github'), since: previous?.since ?? new Date(Date.now() - 86400000).toISOString(), subscribedNumbers,
           observeIssues: sources.github.allowUnaddressed, observePullRequests: sources.github.allowUnaddressed,
           observeComments: sources.github.allowUnaddressed, observeReviews: sources.github.allowUnaddressed }
-        const items = await pollGitHub(cfg, signal)
-        let reviews: Awaited<ReturnType<typeof pollGitHubReviewsBatch>>
-        try { reviews = await pollGitHubReviewsBatch(cfg, previous?.reviews, signal) }
-        catch (error) {
-          const reset = restartChangedScan(error, previous, 'reviews')
+        try {
+          const items = await pollGitHub(cfg, signal)
+          commit(key, items.map(sourceTrigger), { ...previous, since: started })
+        } catch { signal.throwIfAborted(); errors.push('GitHub intake could not be read; check permissions and pagination.') }
+        try {
+          const reviews = await pollGitHubReviewsBatch(cfg, previous?.reviews, signal)
+          const since = h.runtime.readData<{ since: string }>(key)?.since ?? cfg.since
+          commit(key, reviews.items.map(sourceTrigger), { since, ...(reviews.next ? { reviews: reviews.next } : {}) })
+        } catch (error) {
+          signal.throwIfAborted()
+          const reset = restartChangedScan(error, h.runtime.readData<{ since: string; reviews?: GitHubReviewCursor }>(key), 'reviews')
           if (reset) h.runtime.writeData(key, reset)
-          throw error
+          errors.push('GitHub reviews could not be read; check permissions and pagination.')
         }
-        commit(key, [...items, ...reviews.items].map(sourceTrigger), { since: started, ...(reviews.next ? { reviews: reviews.next } : {}) })
         if (cfg.observeIssues) {
           try { h.runtime.engine.receive(await pollDefaultBranchChecks(cfg, signal)) }
           catch { signal.throwIfAborted(); errors.push('Default-branch CI could not be read.') }
         }
-        for (const pull of await discoverOwnPullRequests(base, signal)) {
-          const id = /^superagent\/([a-f0-9]{32})$/.exec(pull.branch)?.[1]
-          const ticket = id ? h.runtime.list().find(ticket => ticket.id === id && !ticket.ended) : undefined
-          if (ticket) {
-            const ref = githubThreadRef(base, pull.number)
-            if (pull.state === 'open' || !ticket.follows?.some(follow => follow.thread === threadKey(ref))) h.runtime.engine.bindThread(ticket.id, ref, true)
-            if (!prNumbers.includes(pull.number)) prNumbers.push(pull.number)
-          }
+        const discoveryKey = `source:github-discovery:${ref.source}`
+        const missing = h.runtime.list().filter(ticket => !ticket.ended && !(ticket.follows ?? []).some(follow => follow.own && !follow.closed && follow.thread.startsWith(`${ref.source}:`)))
+          .sort((a, b) => a.id.localeCompare(b.id))
+        const after = h.runtime.readData<string>(discoveryKey) ?? '', offset = missing.findIndex(ticket => ticket.id > after)
+        const rotated = offset < 0 ? missing : [...missing.slice(offset), ...missing.slice(0, offset)]
+        for (const ticket of rotated.slice(0, 5)) {
+          try {
+            for (const pull of await discoverOwnPullRequests(base, `superagent/${ticket.id}`, signal)) {
+              const current = h.runtime.get(ticket.id)
+              if (current.ended) break
+              const thread = githubThreadRef(base, pull.number)
+              if (pull.state === 'open' || !current.follows?.some(follow => follow.thread === threadKey(thread))) h.runtime.engine.bindThread(ticket.id, thread, true)
+              if (!prNumbers.includes(pull.number)) prNumbers.push(pull.number)
+            }
+          } catch { signal.throwIfAborted(); errors.push(`PR discovery for ticket ${ticket.id} could not be read.`) }
+          h.runtime.writeData(discoveryKey, ticket.id)
         }
         for (const number of prNumbers) {
           try {
             const checks = await pollGitHubChecks(cfg, [number], signal)
             h.runtime.repositories.atomic(() => checks.map(sourceTrigger).forEach(event => h.runtime.engine.receive(event)))
+          } catch { signal.throwIfAborted(); errors.push(`PR #${number} CI could not be read.`) }
+          try {
             const pr = await readPullRequest(base, number, signal)
             if (pr.state === 'closed') h.runtime.engine.threadClosed(githubThreadRef(base, number), pr.merged ? 'merged' : 'closed', pr.mergedAt ?? pr.closedAt ?? new Date().toISOString())
-          } catch { signal.throwIfAborted(); errors.push(`PR #${number} CI or lifecycle could not be read.`) }
+          } catch { signal.throwIfAborted(); errors.push(`PR #${number} lifecycle could not be read.`) }
         }
       } catch { signal.throwIfAborted(); errors.push('GitHub source failed; check source scope, permissions and pagination.') }
     }

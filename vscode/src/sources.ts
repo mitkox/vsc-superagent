@@ -636,14 +636,24 @@ export interface PullRequestDiscovery {
   url: string
   author: string
 }
-/** Bounded repository-local discovery; no search API or response-supplied URLs are followed. */
-export async function discoverOwnPullRequests(config: GitHubSourceConfig, signal?: AbortSignal, transport: typeof fetch = fetch): Promise<PullRequestDiscovery[]> {
+/** One repository-scoped page for an exact ticket branch; no unrelated history or response URLs are followed. */
+export async function discoverOwnPullRequests(config: GitHubSourceConfig, branch: string, signal?: AbortSignal, transport: typeof fetch = fetch): Promise<PullRequestDiscovery[]> {
   const base = validateGitHub(config)
-  const rows = await githubPages(base, `/repos/${config.repository}/pulls`, config.token, signal, transport)
-  return rows.filter(pull => text(object(pull.user)?.login).toLowerCase() === config.account.toLowerCase()).map(pull => {
+  if (!/^superagent\/[a-f0-9]{32}$/.test(branch)) fail('Invalid source configuration')
+  const url = new URL(base)
+  url.pathname = `${base.pathname.replace(/\/$/, '')}/repos/${config.repository}/pulls`
+  url.search = new URLSearchParams({ state: 'all', head: `${config.repository.split('/')[0]}:${branch}`, per_page: '100', page: '1' }).toString()
+  const { value, headers } = await request(url, config.token, signal, transport)
+  if (!Array.isArray(value) || value.length > 100 || !value.every(object)) fail('Invalid source response')
+  if (/rel\s*=\s*"?next\b/i.test(headers.get('link') ?? '')) fail('Ticket PR discovery pagination limit exceeded')
+  return (value as RecordValue[]).filter(pull => {
     const head = object(pull.head)
-    if (!positive(pull.number) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(text(head?.sha)) || !['open', 'closed'].includes(text(pull.state))) fail('Invalid source response')
-    return { number: pull.number, head: text(head?.sha), branch: boundedText(text(head?.ref)), state: pull.state as 'open' | 'closed',
+    return text(object(pull.user)?.login).toLowerCase() === config.account.toLowerCase()
+      && text(object(head?.repo)?.full_name).toLowerCase() === config.repository.toLowerCase() && head?.ref === branch
+  }).map(pull => {
+    const head = object(pull.head)!
+    if (!positive(pull.number) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(text(head.sha)) || !['open', 'closed'].includes(text(pull.state))) fail('Invalid source response')
+    return { number: pull.number, head: text(head.sha), branch, state: pull.state as 'open' | 'closed',
       url: githubWeb(base, config.repository, pull.number, true), author: text(object(pull.user)?.login) }
   })
 }

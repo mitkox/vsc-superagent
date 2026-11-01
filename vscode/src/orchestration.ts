@@ -587,7 +587,7 @@ export class AutomationService {
     if (!ticket.channels.length) return
     const report = latestReport(ticket)
     const attention = ticket.attention
-    const result = report && ((!ticket.ended && report.state === 'ready') || ['completed', 'merged', 'dropped'].includes(ticket.ended?.outcome ?? ''))
+    const result = report && ((!ticket.ended && report.state === 'ready') || ['completed', 'merged'].includes(ticket.ended?.outcome ?? ''))
     const identity = attention ? `attention:${attention.id}` : result ? `result:${ticket.id}:${ticket.ended?.outcome ?? report.state}:${report.at}` : undefined
     if (!identity || this.runtime.readData(`relay:${identity}`)) return
     this.runtime.repositories.atomic(() => {

@@ -484,15 +484,31 @@ test('bounded thread history reads retain reviews and comments regardless of int
   assert.equal(items[2]!.context!.provider === 'github' && items[2]!.context!.state, 'CHANGES_REQUESTED')
 })
 
-test('PR discovery filters by native author and lifecycle reads retain claim evidence', async () => {
-  const data = { number: 7, state: 'open', merged: false, draft: true, user: { login: 'agent' }, head: { sha: 'b'.repeat(40), ref: 'superagent/ticket-1' } }
-  const discovered = await discoverOwnPullRequests(config, undefined, async input => {
-    assert.equal(new URL(String(input)).pathname, '/repos/company/project/pulls')
-    return json([data, { ...data, number: 8, user: { login: 'other' } }])
+test('PR discovery binds the native repository owner, author and exact ticket branch', async () => {
+  const branch = `superagent/${'1'.repeat(32)}`
+  const data = { number: 7, state: 'closed', merged: true, draft: false, user: { login: 'agent' },
+    head: { sha: 'b'.repeat(40), ref: branch, repo: { full_name: 'company/project' } } }
+  const discovered = await discoverOwnPullRequests(config, branch, undefined, async input => {
+    const url = new URL(String(input))
+    assert.equal(url.pathname, '/repos/company/project/pulls')
+    assert.equal(url.searchParams.get('state'), 'all')
+    assert.equal(url.searchParams.get('head'), `company:${branch}`)
+    assert.equal(url.searchParams.get('page'), '1')
+    return json([data, { ...data, number: 8, user: { login: 'other' } },
+      { ...data, number: 9, head: { ...data.head, repo: { full_name: 'other/project' } } },
+      { ...data, number: 10, head: { ...data.head, ref: `superagent/${'2'.repeat(32)}` } }])
   })
-  assert.equal(discovered.length, 1); assert.equal(discovered[0]!.branch, 'superagent/ticket-1')
+  assert.equal(discovered.length, 1); assert.equal(discovered[0]!.branch, branch)
+  assert.equal(discovered[0]!.state, 'closed')
   const pull = await readPullRequest(config, 7, undefined, async () => json(data))
-  assert.equal(pull.author, 'agent'); assert.equal(pull.branch, 'superagent/ticket-1'); assert.equal(pull.draft, true)
+  assert.equal(pull.author, 'agent'); assert.equal(pull.branch, branch); assert.equal(pull.merged, true)
+  await assert.rejects(discoverOwnPullRequests(config, branch, undefined, async () => json([{ ...data, head: { ...data.head, sha: 'invalid' } }])), /Invalid source response/)
+  let calls = 0
+  await assert.rejects(discoverOwnPullRequests(config, branch, undefined, async () => {
+    calls++; return json([data], { link: '<https://evil.example/next>; rel="next"' })
+  }), /pagination limit exceeded/)
+  assert.equal(calls, 1)
+  await assert.rejects(discoverOwnPullRequests(config, 'unrelated', undefined, async () => { assert.fail('Invalid branch must not dispatch') }), /Invalid source configuration/)
 })
 
 test('CI polling reads statuses and checks for the exact head and produces stable context-only events', async () => {
