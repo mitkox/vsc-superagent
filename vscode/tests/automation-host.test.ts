@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { runInNewContext } from 'node:vm'
 import { TicketRuntime } from '../src/runtime.ts'
+import { githubThreadRef } from '../src/sources.ts'
 import type { AutomationSettings } from '../src/settings.ts'
 import type { PanelHost } from '../src/panel.ts'
 
@@ -196,5 +197,109 @@ test('native Teams tenant changes during credential refresh still prevent messag
     f.onSignIn(() => { f.values['teams.tenantId'] = account })
     await assert.rejects(f.poll(), /Teams source failed/)
     assert.equal(f.requests.length, 0)
+  } finally { await f.close() }
+})
+
+test('dashboard explicit unlisted admission reaches every GitHub collection path with an empty allowlist', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': [], 'github.observe': false })
+  try {
+    await f.initialize()
+    await f.save({ enabled: true, acceptMode: 'off', sources: { github: { admission: { unlistedAddressed: 'explicit' } } } })
+    f.respond(url => {
+      const updated_at = new Date().toISOString(), user = { login: 'outsider', type: 'User' }, body = '@agent repair this defect'
+      if (url.pathname.endsWith('/issues')) return [githubIssue(1, 'outsider', 'User', body)]
+      if (url.pathname.endsWith('/issues/comments')) return [{ id: 2, user, body, updated_at, issue_url: 'https://api.github.com/repos/company/project/issues/1' }]
+      if (url.pathname.endsWith('/pulls/comments')) return [{ id: 3, user, body, updated_at, path: 'src/a.ts', line: 8, commit_id: head,
+        pull_request_url: 'https://api.github.com/repos/company/project/pulls/7' }]
+      if (url.pathname.endsWith('/pulls/7/reviews')) return [{ id: 4, user, body, submitted_at: updated_at, state: 'COMMENTED', commit_id: head }]
+      if (url.pathname.endsWith('/pulls')) return [{ number: 7 }]
+      return []
+    })
+    await f.poll()
+    const triggers = f.runtime.repositories.snapshot().triggers.filter(trigger => trigger.actor.id === 'outsider')
+    assert.equal(triggers.length, 4)
+    assert.ok(triggers.every(trigger => trigger.human && trigger.addressed === 'mention'))
+    assert.deepEqual(triggers.map(trigger => (trigger.meta.provider as { kind: string }).kind).sort(), ['comment', 'issue', 'review', 'review-comment'])
+    assert.deepEqual(f.snapshot().settings.value.sources.github.allowedActors, [])
+  } finally { await f.close() }
+})
+
+test('dashboard explicit unlisted Teams mentions reach polling with an empty allowlist and observation disabled', async () => {
+  const f = fixture({ 'teams.tenantId': tenant, 'teams.chatIds': [chat], 'teams.allowedActors': [] })
+  try {
+    await f.initialize()
+    await f.save({ enabled: true, acceptMode: 'off', sources: { teams: { allowUnaddressed: false, admission: { unlistedAddressed: 'explicit' } } } })
+    const mentions = [{ mentioned: { user: { id: account } } }]
+    f.respond(() => ({ value: [{ ...teamsMessage('1', savedActor), mentions }, teamsMessage('2', savedActor),
+      { ...teamsMessage('3', bot, true), mentions }] }))
+    await f.poll()
+    const triggers = f.runtime.repositories.snapshot().triggers
+    assert.equal(triggers.length, 1)
+    assert.equal(triggers[0]?.actor.id, savedActor)
+    assert.equal(triggers[0]?.human, true)
+    assert.equal(triggers[0]?.addressed, 'mention')
+    assert.deepEqual(f.snapshot().settings.value.sources.teams.allowedActors, [])
+  } finally { await f.close() }
+})
+
+test('automatic polling skips candidate reads when empty source policies authorize no intake', async () => {
+  const cases = [
+    { name: 'default empty lists', mode: 'observe', observed: false },
+    { name: 'inferred addressed override while off', mode: 'off', observed: false, admission: { unlistedAddressed: 'inferred' } },
+    { name: 'inferred unaddressed override while off', mode: 'off', observed: true, admission: { unlistedUnaddressed: 'inferred' } },
+    { name: 'inferred unaddressed override without observation', mode: 'observe', observed: false, admission: { unlistedUnaddressed: 'inferred' } },
+    { name: 'ignored unlisted cells despite observation', mode: 'observe', observed: true, admission: { unlistedAddressed: 'ignore', unlistedUnaddressed: 'ignore' } },
+  ]
+  for (const scenario of cases) {
+    const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': [], 'teams.tenantId': tenant,
+      'teams.chatIds': [chat], 'teams.allowedActors': [] })
+    try {
+      await f.initialize()
+      const source = { allowUnaddressed: scenario.observed, ...(scenario.admission ? { admission: scenario.admission } : {}) }
+      await f.save({ enabled: true, acceptMode: scenario.mode, sources: { github: source, teams: source } })
+      f.respond(url => url.origin === 'https://graph.microsoft.com' ? { value: [] } : [])
+      await f.poll()
+      const candidates = f.requests.filter(({ url }) => /\/issues(?:\/comments)?$|\/pulls\/(?:comments|\d+\/reviews)$|\/messages(?:\/|$)/.test(url.pathname)
+        || url.pathname.endsWith('/pulls') && url.searchParams.get('per_page') === '25')
+      assert.equal(candidates.length, 0, scenario.name)
+      assert.equal(f.requests.filter(({ url }) => url.pathname.endsWith('/pulls')).length, 1, `${scenario.name}: own-PR discovery remains active`)
+      assert.ok(f.requests.some(({ url }) => url.pathname === '/v1.0/me'), `${scenario.name}: native identity refresh remains active`)
+    } finally { await f.close() }
+  }
+})
+
+test('automatic polling enables viable inferred overrides with empty source lists', async () => {
+  for (const family of ['github', 'teams'] as const) for (const mode of ['observe', 'auto'] as const) for (const addressed of [false, true]) {
+    const f = fixture(family === 'github' ? { 'github.repository': 'company/project', 'github.allowedActors': [] }
+      : { 'teams.tenantId': tenant, 'teams.chatIds': [chat], 'teams.allowedActors': [] })
+    try {
+      await f.initialize()
+      await f.save({ enabled: true, acceptMode: mode, sources: { [family]: { allowUnaddressed: !addressed,
+        admission: addressed ? { unlistedAddressed: 'inferred' } : { unlistedUnaddressed: 'inferred' } } } })
+      f.respond(url => family === 'github' ? url.pathname.endsWith('/issues') ? [githubIssue(1, 'outsider', 'User', addressed ? '@agent repair' : 'Repair')] : []
+        : { value: [{ ...teamsMessage('1', savedActor), ...(addressed ? { mentions: [{ mentioned: { user: { id: account } } }] } : {}) }] })
+      await f.poll()
+      assert.equal(f.runtime.repositories.snapshot().triggers.filter(trigger => trigger.actor.id === (family === 'github' ? 'outsider' : savedActor)).length, 1,
+        `${family}: ${mode}, addressed=${addressed}`)
+    } finally { await f.close() }
+  }
+})
+
+test('empty default admission preserves automatic collection for subscribed GitHub context', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': [], 'github.observe': false })
+  try {
+    await f.initialize()
+    await f.save({ enabled: true })
+    const ticket = f.runtime.create('Track the existing pull request')
+    f.runtime.engine.bindThread(ticket.id, githubThreadRef({ origin: 'https://api.github.com', repository: 'company/project',
+      account: 'agent', allowedActors: [], token: 'native-test-credential' }, 7), true)
+    f.respond(url => url.pathname.endsWith('/issues') ? [githubIssue(7, 'outsider', 'User', 'Unmentioned context')]
+      : url.pathname.endsWith('/pulls/7') ? { number: 7, state: 'open', merged: false, head: { sha: head } } : [])
+    await f.poll()
+    const trigger = f.runtime.repositories.snapshot().triggers.find(trigger => trigger.actor.id === 'outsider')
+    assert.ok(trigger)
+    assert.equal((trigger.meta.provider as { subscribed: boolean }).subscribed, true)
+    assert.equal(trigger.addressed, undefined)
+    assert.ok(f.requests.some(({ url }) => url.pathname.endsWith('/issues')))
   } finally { await f.close() }
 })

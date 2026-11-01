@@ -82,6 +82,7 @@ export interface GitHubSourceConfig {
   observeChecks?: boolean
   /** Bot events are context only, including when explicitly listed here. */
   allowedBots?: string[]
+  admit?: (trigger: Trigger) => boolean
 }
 export interface TeamsSourceConfig {
   /** Native auth must select this tenant. The caller must never reuse a token entered for another tenant. */
@@ -95,6 +96,7 @@ export interface TeamsSourceConfig {
   /** Native `thread` values from approved tickets, never taken from a remote message. */
   subscribedThreads?: string[]
   allowedBots?: string[]
+  admit?: (trigger: Trigger) => boolean
 }
 
 const MAX_BYTES = 1024 * 1024
@@ -242,6 +244,7 @@ export function validateGitHub(config: GitHubSourceConfig): URL {
     || !config.allowedActors.every(actor => LOGIN.test(actor)) || !validSince(config.since)
     || config.subscribedNumbers !== undefined && (!Array.isArray(config.subscribedNumbers) || config.subscribedNumbers.length > 1000 || !config.subscribedNumbers.every(positive))
     || config.allowedBots !== undefined && (!Array.isArray(config.allowedBots) || config.allowedBots.length > 1000 || !config.allowedBots.every(actor => typeof actor === 'string' && /^[a-z\d-]{1,39}(?:\[bot\])?$/i.test(actor)))
+    || config.admit !== undefined && typeof config.admit !== 'function'
     || ['observeIssues', 'observePullRequests', 'observeComments', 'observeReviews', 'observeChecks'].some(key => (config as unknown as RecordValue)[key] !== undefined && typeof (config as unknown as RecordValue)[key] !== 'boolean')) fail('Invalid source configuration')
   return base
 }
@@ -288,7 +291,7 @@ function githubItem(config: GitHubSourceConfig, base: URL, item: RecordValue, nu
   const observed = kind === 'issue' ? config.observeIssues : kind === 'pull' ? config.observePullRequests
     : kind === 'review' || kind === 'review-comment' ? config.observeReviews : config.observeComments
   const listedBot = config.allowedBots?.some(value => value.toLowerCase() === actor.toLowerCase()) ?? false
-  if (!force && !subscribed && !(human && allowedActor && (addressed || observed)) && !(listedBot && observed)) return
+  if (!config.admit && !force && !subscribed && !(human && allowedActor && (addressed || observed)) && !(listedBot && observed)) return
   let url = githubWeb(base, config.repository, number, pull, anchor)
   if (typeof item.html_url === 'string') {
     try {
@@ -310,9 +313,11 @@ function githubItem(config: GitHubSourceConfig, base: URL, item: RecordValue, nu
     ...(typeof item.path === 'string' ? { path: boundedText(item.path) } : {}), ...(positive(item.line) ? { line: item.line } : {}),
     ...(positive(item.original_line) ? { originalLine: item.original_line } : {}), ...(typeof item.diff_hunk === 'string' ? { diffHunk: boundedText(item.diff_hunk) } : {}),
     ...(typeof item.commit_id === 'string' ? { commitId: item.commit_id } : {}), ...(typeof item.state === 'string' ? { state: item.state } : {}) }
-  return { id: `github:${id(base.href, config.repository, kind, String(item.id), actor, text(item.updated_at), body,
+  const candidate: InboxItem = { id: `github:${id(base.href, config.repository, kind, String(item.id), actor, text(item.updated_at), body,
     ...(kind === 'review' ? [text(item.state), text(item.commit_id)] : []))}`,
     source: 'github', actor, text: boundedText(body), thread: String(number), url, context }
+  if (!force && !subscribed && config.admit && !config.admit(sourceTrigger(candidate))) return
+  return candidate
 }
 
 /** Provider facts only; the caller determines which locally approved ticket follows this PR. */
@@ -346,7 +351,7 @@ export async function readPullRequest(config: GitHubSourceConfig, number: number
 /** Explicitly invoked bounded scan. The host persists IDs and obtains native UI approval before creating work. */
 export async function pollGitHub(config: GitHubSourceConfig, signal?: AbortSignal, transport: typeof fetch = fetch): Promise<InboxItem[]> {
   const base = validateGitHub(config)
-  if (!config.allowedActors.length && !config.subscribedNumbers?.length && !config.allowedBots?.length) return []
+  if (!config.allowedActors.length && !config.subscribedNumbers?.length && !config.allowedBots?.length && !config.admit) return []
   const path = `/repos/${config.repository}`
   // Serial reads bound rate use and make a partial failed scan non-authoritative.
   const issues = await githubPages(base, `${path}/issues`, config.token, signal, transport, config.since)
@@ -386,7 +391,7 @@ export interface GitHubReviewCursor {
 export async function pollGitHubReviewsBatch(config: GitHubSourceConfig, cursor?: GitHubReviewCursor, signal?: AbortSignal,
   transport: typeof fetch = fetch): Promise<{ items: InboxItem[]; next?: GitHubReviewCursor }> {
   const base = validateGitHub(config)
-  if (!config.allowedActors.length && !config.subscribedNumbers?.length && !config.allowedBots?.length) return { items: [] }
+  if (!config.allowedActors.length && !config.subscribedNumbers?.length && !config.allowedBots?.length && !config.admit) return { items: [] }
   const state: GitHubReviewCursor = cursor ?? { prPage: 1, prOffset: 0, reviewPage: 1 }
   const digestValid = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
   if (!positive(state.prPage) || state.prPage > 1_000_000 || !Number.isSafeInteger(state.prOffset) || state.prOffset < 0 || state.prOffset > 25
@@ -536,11 +541,12 @@ export function validateTeams(config: TeamsSourceConfig): void {
     || !Array.isArray(config.allowedActors) || config.allowedActors.length > 1000 || !config.allowedActors.every(actor => UUID.test(actor)) || !validSince(config.since)
     || config.accountId !== undefined && !UUID.test(config.accountId)
     || config.allowedBots !== undefined && (!Array.isArray(config.allowedBots) || config.allowedBots.length > 1000 || !config.allowedBots.every(actor => UUID.test(actor)))
+    || config.admit !== undefined && typeof config.admit !== 'function'
     || config.subscribedThreads !== undefined && (!Array.isArray(config.subscribedThreads) || config.subscribedThreads.length > 1000 || !config.subscribedThreads.every(thread => typeof thread === 'string' && thread.length <= 1024 && /^(?:chat:|team:)/.test(thread)))) fail('Invalid source configuration')
 }
 export async function pollTeamsBatch(config: TeamsSourceConfig, cursor?: TeamsBatchCursor, signal?: AbortSignal, transport: typeof fetch = fetch): Promise<{ items: InboxItem[]; next?: TeamsBatchCursor }> {
   validateTeams(config)
-  if (!config.allowedActors.length && !config.allowedBots?.length && !config.subscribedThreads?.length) return { items: [] }
+  if (!config.allowedActors.length && !config.allowedBots?.length && !config.subscribedThreads?.length && !config.admit) return { items: [] }
   if (cursor && (config.chatIds.length !== 0 || config.channels.length !== 1 || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0 || cursor.offset > 50
     || cursor.token !== undefined && (typeof cursor.token !== 'string' || !cursor.token || cursor.token.length > 8192)
     || cursor.offset > 0 && (typeof cursor.pageHash !== 'string' || !/^[a-f0-9]{64}$/.test(cursor.pageHash)))) fail('Invalid source configuration')
@@ -555,7 +561,7 @@ export async function pollTeamsBatch(config: TeamsSourceConfig, cursor?: TeamsBa
     const allowedBot = !!application && (config.allowedBots?.some(value => value.toLowerCase() === actor.toLowerCase()) ?? false)
     const subscribed = config.subscribedThreads?.includes(`${scope}:${rootMessageId}`) ?? false
     if (!UUID.test(actor) || actor.toLowerCase() === config.accountId?.toLowerCase() || !TEAMS_ID.test(messageId) || ['.', '..'].includes(messageId)
-      || !TEAMS_ID.test(rootMessageId) || ['.', '..'].includes(rootMessageId) || !subscribed && !allowedActor && !allowedBot
+      || !TEAMS_ID.test(rootMessageId) || ['.', '..'].includes(rootMessageId) || !config.admit && !subscribed && !allowedActor && !allowedBot
       || message.deletedDateTime || message.messageType !== 'message' || !body || user?.tenantId !== undefined && text(user.tenantId).toLowerCase() !== config.tenantId.toLowerCase()) return
     if (!recent(message.lastModifiedDateTime ?? message.createdDateTime, config.since)) return
     const content = teamsText(body)
@@ -574,8 +580,10 @@ export async function pollTeamsBatch(config: TeamsSourceConfig, cursor?: TeamsBa
       ...(text(message.createdDateTime) ? { createdAt: text(message.createdDateTime) } : {}),
       ...(text(message.lastModifiedDateTime) ? { updatedAt: text(message.lastModifiedDateTime) } : {}),
       ...(text(message.lastEditedDateTime) ? { editedAt: text(message.lastEditedDateTime) } : {}) }
-    items.push({ id: `teams:${id(config.tenantId.toLowerCase(), scope, messageId, actor.toLowerCase(), content, text(message.lastEditedDateTime))}`,
-      source: 'teams', actor, text: content, thread: `${scope}:${rootMessageId}`, ...(url ? { url } : {}), context })
+    const candidate: InboxItem = { id: `teams:${id(config.tenantId.toLowerCase(), scope, messageId, actor.toLowerCase(), content, text(message.lastEditedDateTime))}`,
+      source: 'teams', actor, text: content, thread: `${scope}:${rootMessageId}`, ...(url ? { url } : {}), context }
+    if (!subscribed && config.admit && !config.admit(sourceTrigger(candidate))) return
+    items.push(candidate)
   }
   for (const chat of [...new Set(config.chatIds)]) {
     const messages = await teamsPages(`/v1.0/chats/${encodeURIComponent(chat)}/messages`, config.token, signal, transport, config.since) as RecordValue[]

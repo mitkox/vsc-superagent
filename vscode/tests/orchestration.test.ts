@@ -223,6 +223,56 @@ test('policy revocation and human stop cancel running authority', async () => {
   } finally { await f.clean() }
 })
 
+for (const family of ['github', 'teams'] as const) {
+  test(`${family} requester removal aborts a handed-back followup worker and rejects its tools`, async () => {
+    const f = fixture(async request => {
+      const ticket = f.runtime.get(request.ticketId)
+      if (ticket.origin.triggerId === 'original-request') {
+        if (request.prompt.includes('separate-request')) await request.tools.find(tool => tool.name === 'orchestrator_trigger_handback')!.invoke({ trigger_id: 'separate-request', reason: 'Different defect outside this mandate' })
+        await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'waiting', summary: 'Waiting for the original repair' })
+      } else await new Promise<void>(resolve => request.signal.addEventListener('abort', () => resolve(), { once: true }))
+    })
+    try {
+      f.service.saveSettings({ sources: { [family]: { enabled: true, allowedActors: ['owner'], allowUnaddressed: true } } }, f.service.settings.revision)
+      const item = (id: string, addressed: 'mention' | undefined) => trigger(id, { source: `${family}:scope`, actor: { source: `${family}:scope`, id: 'owner' },
+        threads: [{ source: `${family}:scope`, id: 'issue-1' }], addressed })
+      f.inbox.push(item('original-request', 'mention')); f.service.start(); await f.service.pollNow()
+      await eventually(() => f.runs.length === 1 && f.service.snapshot().health.workers === 0)
+      f.inbox.push(item('separate-request', undefined)); await f.service.pollNow()
+      await eventually(() => f.runtime.list().length === 2 && f.runs.some(run => f.runtime.get(run.ticketId).origin.triggerId === 'separate-request'))
+      const run = f.runs.find(run => f.runtime.get(run.ticketId).origin.triggerId === 'separate-request')!
+      const original = structuredClone(f.runtime.get(run.ticketId).mandate)
+      assert.equal(original.basis.via, 'followup')
+      assert.equal(original.strength, 'explicit')
+      f.service.saveSettings({ sources: { [family]: { allowedActors: [] } } }, f.service.settings.revision)
+      await assert.rejects(() => run.tools.find(tool => tool.name === 'orchestrator_read')!.invoke({ resource: 'ticket' }), /abort|revoked/i)
+      await eventually(() => run.signal.aborted && f.service.snapshot().health.workers === 0)
+      assert.equal(f.runtime.get(run.ticketId).assignments.at(-1)?.report?.state, 'blocked')
+      assert.deepEqual(f.runtime.get(run.ticketId).mandate, original)
+    } finally { await f.clean() }
+  })
+
+  test(`${family} disabling observation revokes a running unaddressed bot mandate`, async () => {
+    const f = fixture(async request => { await new Promise<void>(resolve => request.signal.addEventListener('abort', () => resolve(), { once: true })) })
+    try {
+      f.service.saveSettings({ acceptMode: 'auto', rules: [{ id: 'repair', name: 'Repair', instruction: 'Repair defects', enabled: true }],
+        sources: { [family]: { enabled: true, allowedBots: ['robot'], allowUnaddressed: true } } }, f.service.settings.revision)
+      f.backend.assess = async () => ({ kind: 'accept', title: 'Repair', scope: 'Repair defect', reason: 'Matched repair rule', rules: ['repair'] })
+      f.inbox.push(trigger('bot-request', { source: `${family}:scope`, actor: { source: `${family}:scope`, id: 'robot' }, human: false, addressed: undefined,
+        threads: [{ source: `${family}:scope`, id: 'issue-1' }] }))
+      f.service.start(); await f.service.pollNow(); await eventually(() => f.runs.length === 1)
+      const run = f.runs[0]!, original = structuredClone(f.runtime.get(run.ticketId).mandate)
+      assert.equal(original.basis.via, 'bot')
+      assert.equal(original.strength, 'inferred')
+      f.service.saveSettings({ sources: { [family]: { allowUnaddressed: false } } }, f.service.settings.revision)
+      await assert.rejects(() => run.tools.find(tool => tool.name === 'orchestrator_read')!.invoke({ resource: 'ticket' }), /abort|revoked/i)
+      await eventually(() => run.signal.aborted && f.service.snapshot().health.workers === 0)
+      assert.equal(f.runtime.get(run.ticketId).assignments.at(-1)?.report?.state, 'blocked')
+      assert.deepEqual(f.runtime.get(run.ticketId).mandate, original)
+    } finally { await f.clean() }
+  })
+}
+
 test('automated crash recovery preserves the session and replaces unfinished assignments without a manual retry', async () => {
   const f = fixture()
   let reopened: TicketRuntime | undefined, next: AutomationService | undefined

@@ -5,6 +5,7 @@ import { threadKey } from '../../src/core/index.ts'
 import type { OutboundMessage, ThreadRef, Ticket, Trigger } from '../../src/core/index.ts'
 import { CopilotBackend } from './copilot.ts'
 import { AutomationService } from './orchestration.ts'
+import { automationGate } from './settings.ts'
 import { SuperagentPanel } from './panel.ts'
 import { ticketPermission } from './permissions.ts'
 import type { TicketRuntime } from './runtime.ts'
@@ -89,6 +90,13 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
     return service!.settings.value.sources
   }
 
+  function sourceAdmission(family: 'github' | 'teams'): ((trigger: Trigger) => boolean) | undefined {
+    const settings = service!.settings.value, source = settings.sources[family], admission = source.admission
+    const receivable = source.allowedActors.length || source.allowedBots.length || admission?.unlistedAddressed === 'explicit'
+      || settings.acceptMode !== 'off' && (admission?.unlistedAddressed === 'inferred' || source.allowUnaddressed && admission?.unlistedUnaddressed === 'inferred')
+    return receivable ? trigger => automationGate(service!.settings.value, trigger).admissible : undefined
+  }
+
   async function poll(signal: AbortSignal): Promise<Trigger[]> {
     const h = owner!
     const sources = sourceSettings()
@@ -110,7 +118,8 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
           const provider = trigger.meta.provider as SourceContext | undefined
           return provider?.provider === 'github' && provider.isPullRequest && trigger.source === ref.source && subscribed.has(provider.number) ? [provider.number] : []
         }), ...h.runtime.list().flatMap(ticket => (ticket.follows ?? []).filter(follow => follow.thread.startsWith(`${ref.source}:`)).map(follow => Number(follow.thread.slice(ref.source.length + 1))))])]
-        const cfg = { ...base, allowedActors: sources.github.allowedActors, allowedBots: sources.github.allowedBots, since: previous?.since ?? new Date(Date.now() - 86400000).toISOString(), subscribedNumbers,
+        const cfg = { ...base, allowedActors: sources.github.allowedActors, allowedBots: sources.github.allowedBots,
+          admit: sourceAdmission('github'), since: previous?.since ?? new Date(Date.now() - 86400000).toISOString(), subscribedNumbers,
           observeIssues: sources.github.allowUnaddressed, observePullRequests: sources.github.allowUnaddressed,
           observeComments: sources.github.allowUnaddressed, observeReviews: sources.github.allowUnaddressed }
         const items = await pollGitHub(cfg, signal)
@@ -152,7 +161,8 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
           await syncMembers(false, base, signal)
         }
         const policy = service!.settings.value.sources.teams
-        base = { ...base, allowedActors: policy.allowedActors, allowedBots: policy.allowedBots }
+        base = { ...base, allowedActors: policy.allowedActors, allowedBots: policy.allowedBots,
+          admit: sourceAdmission('teams') }
         const scopes = [...base.chatIds.map(chat => ({ chatIds: [chat], channels: [] as TeamsSourceConfig['channels'] })),
           ...base.channels.map(channel => ({ chatIds: [] as string[], channels: [channel] }))]
         for (const scope of scopes) {

@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import { pollDefaultBranchChecks } from '../src/sources.ts'
 import { test } from 'node:test'
+import { automationGate, validateSettings } from '../src/settings.ts'
+import type { AutomationSettings } from '../src/settings.ts'
+import type { Trigger } from '../../src/core/index.ts'
 import { pollTeams, pollTeamsBatch, pollGitHub, pollGitHubReviewsBatch, readPullRequest, sourceTrigger, sourceSubscription,
   githubThreadRef, discoverOwnPullRequests, pollGitHubChecks, readGitHubThread, type GitHubSourceConfig } from '../src/sources.ts'
 
@@ -523,4 +526,67 @@ test('Graph messageReference attachments and quote chains preserve the subscribe
   assert.equal(context.provider === 'teams' && context.rootMessageId, '100')
   assert.deepEqual(context.provider === 'teams' && context.referencedMessageIds, ['101'])
   assert.deepEqual(sourceTrigger(result[0]!).threads.map(thread => thread.id), ['100', '101'])
+})
+
+test('automatic collectors delegate every unsubscribed candidate to the same human and bot admission gate', async () => {
+  type Case = { name: string; mode?: AutomationSettings['acceptMode']; human?: boolean; addressed?: boolean;
+    observed?: boolean; listedBot?: boolean; admission?: { unlistedAddressed?: 'explicit' | 'inferred' | 'ignore'; unlistedUnaddressed?: 'inferred' | 'ignore' }; accepted: boolean }
+  const cases: Case[] = [
+    { name: 'explicit unlisted mention while proactive mode is off', mode: 'off', addressed: true, admission: { unlistedAddressed: 'explicit' }, accepted: true },
+    { name: 'inferred unlisted mention in observe mode', addressed: true, admission: { unlistedAddressed: 'inferred' }, accepted: true },
+    { name: 'inferred unlisted mention in auto mode', mode: 'auto', addressed: true, admission: { unlistedAddressed: 'inferred' }, accepted: true },
+    { name: 'inferred unlisted mention while proactive mode is off', mode: 'off', addressed: true, admission: { unlistedAddressed: 'inferred' }, accepted: false },
+    { name: 'inferred unaddressed event with observation', observed: true, admission: { unlistedUnaddressed: 'inferred' }, accepted: true },
+    { name: 'inferred unaddressed event without observation', admission: { unlistedUnaddressed: 'inferred' }, accepted: false },
+    { name: 'inferred unaddressed event while proactive mode is off', mode: 'off', observed: true, admission: { unlistedUnaddressed: 'inferred' }, accepted: false },
+    { name: 'ignored unlisted mention', addressed: true, admission: { unlistedAddressed: 'ignore' }, accepted: false },
+    { name: 'default unlisted denial despite observation', addressed: true, observed: true, accepted: false },
+    { name: 'listed bot mention without observation', human: false, addressed: true, listedBot: true, accepted: true },
+    { name: 'listed unaddressed bot without observation', human: false, listedBot: true, accepted: false },
+    { name: 'listed unaddressed bot with observation', human: false, observed: true, listedBot: true, accepted: true },
+    { name: 'listed bot mention while proactive mode is off', human: false, addressed: true, listedBot: true, mode: 'off', accepted: false },
+    { name: 'unlisted bot cannot use human explicit admission', human: false, addressed: true, admission: { unlistedAddressed: 'explicit' }, accepted: false },
+  ]
+  for (const family of ['github', 'teams'] as const) for (const scenario of cases) {
+    const human = scenario.human !== false, identity = family === 'github' ? human ? 'outsider' : 'checks[bot]' : actor
+    const settings = validateSettings({ enabled: true, acceptMode: scenario.mode ?? 'observe', sources: {
+      [family]: { allowedActors: [], allowedBots: scenario.listedBot ? [identity] : [], allowUnaddressed: !!scenario.observed, admission: scenario.admission },
+    } })
+    const received: Trigger[] = []
+    const admit = (trigger: Trigger) => { received.push(trigger); return automationGate(settings, trigger).admissible }
+    const body = scenario.addressed ? '@agent fix this' : 'Fix this'
+    const items = family === 'github'
+      ? await pollGitHub({ ...config, allowedActors: [], allowedBots: settings.sources.github.allowedBots, admit }, undefined,
+        async input => json(new URL(String(input)).pathname.endsWith('/issues') ? [issue(body, { user: { login: identity, type: human ? 'User' : 'Bot' } })] : []))
+      : await pollTeams({ ...teams, allowedActors: [], allowedBots: settings.sources.teams.allowedBots, accountId: teamId, admit }, undefined, async () => json({ value: [message('100', {
+        from: human ? { user: { id: identity, tenantId: tenant } } : { application: { id: identity } },
+        ...(scenario.addressed ? { mentions: [{ mentioned: { user: { id: teamId } } }] } : {}),
+      })] }))
+    const label = `${family}: ${scenario.name}`
+    assert.equal(received.length, 1, label)
+    assert.equal(items.length, scenario.accepted ? 1 : 0, label)
+    assert.equal(received[0]?.human, human, label)
+    assert.equal(received[0]?.actor.id, identity, label)
+    assert.equal(received[0]?.addressed, scenario.addressed ? 'mention' : undefined, label)
+    assert.equal(received[0]?.actor.source, received[0]?.source, label)
+    assert.equal(received[0]?.threads[0]?.source, received[0]?.source, label)
+    assert.equal((received[0]?.meta.provider as { provider: string }).provider, family, label)
+  }
+})
+
+test('automatic admission callbacks retain subscribed and forced context reads', async () => {
+  const deny = (trigger: Trigger) => automationGate(validateSettings({}), trigger).admissible
+  assert.equal((await pollGitHub({ ...config, allowedActors: [], subscribedNumbers: [7], admit: deny }, undefined,
+    async input => json(new URL(String(input)).pathname.endsWith('/issues') ? [issue()] : []))).length, 1)
+  assert.equal((await pollTeams({ ...teams, allowedActors: [], subscribedThreads: ['chat:19:chat@thread.v2:100'], admit: deny }, undefined,
+    async () => json({ value: [message()] }))).length, 1)
+  const history = await readGitHubThread({ ...config, allowedActors: [], admit: () => { assert.fail('Forced history must bypass admission') } }, 7, undefined,
+    async input => json(new URL(String(input)).pathname.endsWith('/issues/7') ? issue('Unlisted context', { user: { login: 'outsider', type: 'User' } }) : []))
+  assert.equal(history.length, 1)
+})
+
+test('source admission callback configuration is validated before any request', async () => {
+  const fetcher: typeof fetch = async () => { assert.fail('Invalid callback must prevent network activity') }
+  await assert.rejects(pollGitHub({ ...config, admit: true as never }, undefined, fetcher), /Invalid source configuration/)
+  await assert.rejects(pollTeams({ ...teams, admit: true as never }, undefined, fetcher), /Invalid source configuration/)
 })

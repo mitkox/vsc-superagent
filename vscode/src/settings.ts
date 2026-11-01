@@ -132,29 +132,31 @@ export function automationScope(settings: AutomationSettings): SourceScope {
   } }
 }
 
+export function automationGate(settings: AutomationSettings, trigger: Trigger, participating = false): GateResult {
+  if (local(trigger.actor.source, trigger.actor.id) && trigger.source === 'vscode' && trigger.human) return { admissible: true, strength: 'explicit', basis: { via: 'addressed', addressed: 'direct', sender: trigger.actor.id, source: trigger.source } }
+  const family = sourceFamily(trigger.source), source = family && settings.sources[family]
+  if (!source?.enabled || trigger.actor.source !== trigger.source) return { admissible: false, reason: 'sourceDisabled' }
+  const listed = has(source.allowedActors, trigger.actor.id)
+  const recorded = { source: trigger.source, scope: trigger.meta, ...(listed ? { sender: trigger.actor.id } : {}) }
+  if (trigger.human && listed && trigger.addressed) return { admissible: true, strength: 'explicit', basis: { ...recorded, via: 'addressed', addressed: trigger.addressed } }
+  const cell: AdmissionCell = listed ? 'listedUnaddressed' : trigger.addressed ? 'unlistedAddressed' : 'unlistedUnaddressed'
+  const admission = source.admission?.[cell] ?? (cell === 'listedUnaddressed' ? 'inferred' : 'ignore')
+  const receivable = !!trigger.addressed || source.allowUnaddressed
+  const basis = { ...recorded, via: 'admission' as const, cell, ...(trigger.addressed ? { addressed: trigger.addressed } : {}) }
+  if (trigger.human && receivable && admission === 'explicit') return { admissible: true, strength: 'explicit', basis }
+  if (trigger.human && participating && (listed || settings.acceptMode !== 'off')) return { admissible: true, strength: listed ? 'explicit' : 'inferred', basis: { ...recorded, via: 'followup' } }
+  if (settings.acceptMode === 'off' || !receivable) return { admissible: false, reason: 'admissionIgnored' }
+  if (!trigger.human) return has(source.allowedBots, trigger.actor.id)
+    ? { admissible: true, strength: 'inferred', basis: { ...recorded, via: 'bot', ...(trigger.addressed ? { addressed: trigger.addressed } : {}), observation: { mode: settings.acceptMode } } }
+    : { admissible: false, reason: 'botNotListed' }
+  return admission === 'inferred'
+    ? { admissible: true, strength: 'inferred', basis: { ...basis, observation: { mode: settings.acceptMode } } }
+    : { admissible: false, reason: 'actorNotAllowed' }
+}
+
 export function automationPolicy(settings: AutomationSettings, paused = false): Policy {
   const inferred = (rules: readonly string[]) => settings.acceptMode === 'auto' && rules.length > 0 && rules.every(id => settings.rules.some(rule => rule.enabled && rule.id === id))
-  const gate = (trigger: Trigger, participating: boolean): GateResult => {
-    if (local(trigger.actor.source, trigger.actor.id) && trigger.source === 'vscode' && trigger.human) return { admissible: true, strength: 'explicit', basis: { via: 'addressed', addressed: 'direct', sender: trigger.actor.id, source: trigger.source } }
-    const family = sourceFamily(trigger.source), source = family && settings.sources[family]
-    if (!source?.enabled || trigger.actor.source !== trigger.source) return { admissible: false, reason: 'sourceDisabled' }
-    const listed = has(source.allowedActors, trigger.actor.id)
-    const recorded = { source: trigger.source, scope: trigger.meta, ...(listed ? { sender: trigger.actor.id } : {}) }
-    if (trigger.human && listed && trigger.addressed) return { admissible: true, strength: 'explicit', basis: { ...recorded, via: 'addressed', addressed: trigger.addressed } }
-    const cell: AdmissionCell = listed ? 'listedUnaddressed' : trigger.addressed ? 'unlistedAddressed' : 'unlistedUnaddressed'
-    const admission = source.admission?.[cell] ?? (cell === 'listedUnaddressed' ? 'inferred' : 'ignore')
-    const receivable = !!trigger.addressed || source.allowUnaddressed
-    const basis = { ...recorded, via: 'admission' as const, cell, ...(trigger.addressed ? { addressed: trigger.addressed } : {}) }
-    if (trigger.human && receivable && admission === 'explicit') return { admissible: true, strength: 'explicit', basis }
-    if (trigger.human && participating && (listed || settings.acceptMode !== 'off')) return { admissible: true, strength: listed ? 'explicit' : 'inferred', basis: { ...recorded, via: 'followup' } }
-    if (settings.acceptMode === 'off' || !receivable) return { admissible: false, reason: 'admissionIgnored' }
-    if (!trigger.human) return has(source.allowedBots, trigger.actor.id)
-      ? { admissible: true, strength: 'inferred', basis: { ...recorded, via: 'bot', observation: { mode: settings.acceptMode } } }
-      : { admissible: false, reason: 'botNotListed' }
-    return admission === 'inferred'
-      ? { admissible: true, strength: 'inferred', basis: { ...basis, observation: { mode: settings.acceptMode } } }
-      : { admissible: false, reason: 'actorNotAllowed' }
-  }
+  const gate = (trigger: Trigger, participating: boolean) => automationGate(settings, trigger, participating)
   return {
     version: automationPolicyVersion(settings), paused: paused || !settings.enabled, evalTimeoutMs: settings.assessment.timeoutMs,
     gate: (trigger, thread, tickets) => gate(trigger, [...thread.subscriptions, ...tickets.map(ticket => ticket.id)].some(id => !thread.context?.includes(id))),
@@ -163,8 +165,11 @@ export function automationPolicy(settings: AutomationSettings, paused = false): 
       if (local(mandate.actor.source, mandate.actor.id)) return true
       const family = sourceFamily(mandate.actor.source), source = family && settings.sources[family]
       if (!source?.enabled || (mandate.strength === 'inferred' && !inferred(mandate.basis.rules ?? []))) return false
-      if (mandate.basis.via === 'followup') return mandate.strength === 'explicit' || inferred(mandate.basis.rules ?? [])
-      if (mandate.basis.via === 'bot') return has(source.allowedBots, mandate.actor.id)
+      if (mandate.basis.via === 'followup') return mandate.strength === 'explicit' ? has(source.allowedActors, mandate.actor.id) : inferred(mandate.basis.rules ?? [])
+      if (mandate.basis.via === 'bot') {
+        const result = gate({ id: '', source: mandate.actor.source, actor: mandate.actor, human: false, addressed: mandate.basis.addressed, threads: [], at: '', text: '', meta: mandate.basis.scope ?? {} }, false)
+        return mandate.strength === 'inferred' && result.admissible && result.strength === 'inferred'
+      }
       if (mandate.basis.via === 'admission') {
         const listed = has(source.allowedActors, mandate.actor.id)
         const addressed = mandate.basis.addressed
