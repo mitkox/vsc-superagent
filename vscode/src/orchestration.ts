@@ -12,7 +12,8 @@ export { DEFAULT_AUTOMATION_SETTINGS, validateSettings } from './settings.ts'
 export type { AutomationSettings } from './settings.ts'
 export interface AutomationDependencies {
   backend: AgentBackend
-  prepare(ticket: Ticket): Promise<string>
+  /** Create the first worktree, or validate the saved directory without recreating or moving it. */
+  prepare(ticket: Ticket, directory?: string): Promise<string>
   poll(signal: AbortSignal): Promise<Trigger[]>
   send(message: OutboundMessage, signal: AbortSignal): Promise<void>
   readSource?(ticketId: string, request: unknown, signal: AbortSignal): Promise<unknown>
@@ -401,9 +402,10 @@ export class AutomationService {
       session = { ticketId: ticket.id, sessionId: `superagent-${ticket.id}-${randomUUID()}`, status: 'idle', revisions: [], transcript: [] }
       this.runtime.repositories.mutateAutomation(data => { data.sessions.push(session!) })
     }
-    const directory = session.directory ?? await this.deps.prepare(ticket)
+    const directory = await this.deps.prepare(ticket, session.directory)
     signal.throwIfAborted()
     if (!isAbsolute(directory)) throw new Error('The prepared worktree must be an absolute directory')
+    if (session.directory !== undefined && directory !== session.directory) throw new Error('The validated worktree differs from the saved session directory; inspect it before continuing')
     this.authorized(ticket.id, effect.assignmentId!, signal)
     if (assignment.state === 'pending') this.runtime.engine.assignmentStarted(ticket.id, assignment.id)
     ticket = this.runtime.get(ticket.id)

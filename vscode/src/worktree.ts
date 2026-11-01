@@ -31,6 +31,8 @@ export function resolveGit(
 
 /** Only local Git plumbing is executed; no shell, hooks, filters, submodules or network. */
 export class Worktrees {
+  private boundCommonDirectory?: string;
+
   constructor(
     private readonly git: string,
     private readonly source: string,
@@ -91,13 +93,44 @@ export class Worktrees {
     );
   }
 
+  private async verifiedCommonDirectory(): Promise<string> {
+    const current = await this.commonDirectory();
+    if (this.boundCommonDirectory && current !== this.boundCommonDirectory)
+      throw new Error("Source repository changed; review it before continuing");
+    return current;
+  }
+
+  private async storageDirectory(): Promise<string> {
+    const stat = await lstat(this.storage);
+    if (!stat.isDirectory() || stat.isSymbolicLink())
+      throw new Error("Unsafe worktree storage path");
+    const root = await realpath(this.storage);
+    if (root !== resolve(this.storage)) throw new Error("Unsafe worktree storage path");
+    return root;
+  }
+
+  async validate(ticket: string, directory: string): Promise<string> {
+    if (typeof ticket !== "string" || !TICKET.test(ticket))
+      throw new Error("Invalid ticket identifier");
+    if (directory !== join(this.storage, ticket))
+      throw new Error("Saved worktree path does not match the ticket");
+    await this.storageDirectory();
+    const stat = await lstat(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || await realpath(directory) !== resolve(directory))
+      throw new Error("Unsafe saved worktree path");
+    if (await this.ticketAt(directory) !== ticket)
+      throw new Error("Saved worktree does not match the ticket");
+    return directory;
+  }
+
   async ticketAt(path: string): Promise<string | undefined> {
     const actual = await realpath(path);
     let root: string;
     try {
-      root = await realpath(this.storage);
-    } catch {
-      return undefined;
+      root = await this.storageDirectory();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
     }
     if (dirname(actual) !== root) return undefined;
     const ticket = actual.slice(root.length + 1);
@@ -115,7 +148,8 @@ export class Worktrees {
       ["rev-parse", "--path-format=absolute", "--git-common-dir"],
       actual,
     );
-    if ((await realpath(common)) !== (await this.commonDirectory()))
+    const expected = await this.verifiedCommonDirectory();
+    if ((await realpath(common)) !== expected)
       throw new Error("Worktree belongs to another repository");
     const branch = await this.command(
       ["symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -125,17 +159,17 @@ export class Worktrees {
       throw new Error(
         "Worktree branch changed or is detached; review it before continuing",
       );
+    this.boundCommonDirectory ??= expected;
+    await this.verifiedCommonDirectory();
     return ticket;
   }
 
   async prepare(ticket: string, signal?: AbortSignal): Promise<string> {
-    if (!TICKET.test(ticket)) throw new Error("Invalid ticket identifier");
+    if (typeof ticket !== "string" || !TICKET.test(ticket)) throw new Error("Invalid ticket identifier");
+    const common = await this.verifiedCommonDirectory();
+    this.boundCommonDirectory ??= common;
     await mkdir(this.storage, { recursive: true, mode: 0o700 });
-    if (
-      (await lstat(this.storage)).isSymbolicLink() ||
-      (await realpath(this.storage)) !== resolve(this.storage)
-    )
-      throw new Error("Unsafe worktree storage path");
+    await this.storageDirectory();
     const destination = join(this.storage, ticket);
     const branch = `superagent/${ticket}`;
     try {
@@ -148,7 +182,7 @@ export class Worktrees {
       );
       if (current !== branch)
         throw new Error("Worktree branch changed; review it before continuing");
-      return destination;
+      return this.validate(ticket, destination);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -224,6 +258,6 @@ export class Worktrees {
       mode: 0o600,
       flag: "wx",
     });
-    return destination;
+    return this.validate(ticket, destination);
   }
 }

@@ -271,7 +271,7 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
       } })
       const prompt = await readFile(vscode.Uri.joinPath(context.extensionUri, 'dist', 'prompts', 'worker.md').fsPath, 'utf8').catch(() => '')
       const promptParts: Record<string, string> = JSON.parse(await readFile(vscode.Uri.joinPath(context.extensionUri, 'dist', 'prompts', 'defaults.json').fsPath, 'utf8').catch(() => '{}'))
-      service = new AutomationService(h.runtime, { backend, prepare: ticket => h.trees.prepare(ticket.id), poll, send, changed: notify,
+      service = new AutomationService(h.runtime, { backend, prepare: (ticket, directory) => directory === undefined ? h.trees.prepare(ticket.id) : h.trees.validate(ticket.id, directory), poll, send, changed: notify,
         systemPrompt: prompt, promptParts, claimPullRequest,
         resolveThread: async (family, id, signal) => {
           if (family !== 'github' || !/^[1-9]\d*$/.test(id)) throw new Error('Use a complete scoped Teams thread identity')
