@@ -399,3 +399,29 @@ test('ending composition on a restore click keeps its connected target and origi
   assert.equal(f.editor(), editor); assert.equal(editor.value, actual)
   f.click('Save settings'); assert.equal(f.sent.at(-1)!.revision, 1); assert.deepEqual(f.sent.at(-1)!.value, JSON.parse(actual))
 })
+
+
+test('executed Settings keeps admission disclosures visible and preserves a declined sender-policy draft base', () => {
+  const f = webview(), warning = 'GitHub family fallback: people outside allowedActors who address the agent — explicit work in every proactive mode; current and future configured scopes',
+    row = 'github:' + 'a'.repeat(64) + ':issues'
+  const original = { ...value(['current-member']), acceptMode: 'off' }
+  f.receive({ type: 'state', value: { settings: { revision: 1, value: original }, history: [], admissionWarnings: [warning],
+    admissionScopes: [{ family: 'github', key: row, label: 'GitHub company/project / issues' }] } })
+  f.tab('Settings')
+  const settings = f.document.getElementById('settings-view')!
+  assert.match(settings.textContent, /unlisted/i); assert.match(settings.textContent, /explicit/i)
+  assert.match(settings.textContent, /every|all.*mode/i); assert.match(settings.textContent, /auto/i); assert.match(settings.textContent, /rule/i)
+  assert.ok(settings.textContent.includes(warning)); assert.ok(settings.textContent.includes(row))
+  assert.ok(f.elements().some(el => el.textContent === warning && !el.closest('details')), 'Persisted grants must be visible before opening any disclosure details')
+  const draft = JSON.stringify({ ...original, sources: { teams: { allowedActors: [], admission: { unlistedAddressed: 'explicit' } } } }, null, 2)
+  f.edit(draft); f.click('Save settings'); const pending = f.sent.at(-1)!
+  assert.equal(pending.revision, 1); assert.equal(f.editor().disabled, true)
+  f.receive({ type: 'state', value: { settings: { revision: 2, value: value([]) }, history: [], admissionWarnings: ['The current policy denies unlisted people'], admissionScopes: [] } })
+  f.receive({ type: 'notice', requestId: pending.requestId, action: pending.action, text: 'Sender policy authorization cancelled' })
+  assert.equal(f.editor().value, draft); assert.equal(f.editor().disabled, false)
+  assert.ok(settings.textContent.includes('The current policy denies unlisted people'))
+  f.tab('Overview'); f.tab('Settings'); assert.equal(f.editor().value, draft)
+  f.click('Save settings'); const retried = f.sent.at(-1)!
+  assert.equal(retried.revision, 1, 'A cancelled confirmation cannot adopt an unrelated committed revision')
+  assert.deepEqual(retried.value, JSON.parse(draft))
+})

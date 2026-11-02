@@ -17,7 +17,7 @@ const root = document.getElementById('content');
 const content = node('section', undefined, root); content.id = 'live-view';
 const settingsContent = node('section', undefined, root); settingsContent.id = 'settings-view'; settingsContent.hidden = true;
 const viewState = new Map();
-let editor, revisionLabel, saveButton, reloadButton, defaultsHint, historyContent, historyFingerprint;
+let editor, revisionLabel, saveButton, reloadButton, defaultsHint, historyContent, historyFingerprint, admissionHint, scopeHint;
 let restoreButtons = [];
 const send = (action, payload = {}) => api.postMessage({ action, ...payload });
 function node(tag, text, parent, cls) { const el = document.createElement(tag); if (text !== undefined)
@@ -64,6 +64,12 @@ function renderSettings() {
     if (!editor) {
         node('h2', 'Settings', settingsContent);
         node('p', 'Policy, worker concurrency, models, proactive rules and prompt sections. Saving creates a retained revision.', settingsContent);
+        node('p', 'Unlisted people are ignored by default. An unlistedAddressed explicit grant lets anyone in that receiving scope start work in every proactive mode. Family admission is a fallback for all current and future configured scopes; admissionByScope can narrow or replace it for a specific scope. Inferred work requires auto and enabled matching rules. Bots and unaddressed messages cannot receive explicit authority.', settingsContent);
+        node('strong', 'Committed sender admission', settingsContent);
+        admissionHint = node('pre', undefined, settingsContent);
+        const scopeDetails = node('details', undefined, settingsContent);
+        node('summary', 'Configured receiving scope keys', scopeDetails);
+        scopeHint = node('pre', undefined, scopeDetails);
         revisionLabel = node('label', undefined, settingsContent);
         editor = node('textarea', undefined, settingsContent); editor.id = 'settings'; editor.dataset.controlKey = 'settings:editor';
         editor.setAttribute('aria-label', 'Superagent settings JSON');
@@ -84,6 +90,10 @@ function renderSettings() {
         historyContent = node('div', undefined, settingsContent);
     }
     const current = currentDraft();
+    const admissionText = Array.isArray(snapshot.admissionWarnings) && snapshot.admissionWarnings.length ? snapshot.admissionWarnings.join('\\n\\n') : 'No unlisted admission grant is configured.';
+    const scopeText = json(snapshot.admissionScopes || []);
+    if (admissionHint.textContent !== admissionText) admissionHint.textContent = admissionText;
+    if (scopeHint.textContent !== scopeText) scopeHint.textContent = scopeText;
     revisionLabel.textContent = draftLabel();
     if (!composing && editor.value !== current.text) {
         const start = editor.selectionStart, end = editor.selectionEnd, direction = editor.selectionDirection, top = editor.scrollTop, left = editor.scrollLeft;

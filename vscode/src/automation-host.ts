@@ -5,7 +5,9 @@ import { threadKey } from '../../src/core/index.ts'
 import type { OutboundMessage, ThreadRef, Ticket, Trigger } from '../../src/core/index.ts'
 import { CopilotBackend } from './copilot.ts'
 import { AutomationService } from './orchestration.ts'
-import { automationGate } from './settings.ts'
+import { automationGate, sourceMayAdmit, DEFAULT_AUTOMATION_SETTINGS } from './settings.ts'
+import type { AutomationSettings } from './settings.ts'
+import { admissionDisclosure, admissionReceivingScopes, broadenedAdmission } from './admission-consent.ts'
 import { SuperagentPanel, type SettingsActionResult } from './panel.ts'
 import { ticketPermission } from './permissions.ts'
 import type { TicketRuntime } from './runtime.ts'
@@ -36,10 +38,31 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
   let service: AutomationService | undefined, backend: CopilotBackend | undefined, owner: AutomationHost | undefined
   let initializing: Promise<AutomationService> | undefined, closing = false
   let shutdownPromise: Promise<void> | undefined
-  const panel = new SuperagentPanel({ snapshot: () => service?.snapshot() ?? { tickets: [], settings: {}, health: { service: 'Start the service to load its configuration.' } }, action })
+  const panel = new SuperagentPanel({ snapshot: () => service ? { ...service.snapshot(), admissionWarnings: admissionDisclosure(service.settings.value, receivingConfig()), admissionScopes: admissionReceivingScopes(receivingConfig()) } : { tickets: [], settings: {}, health: { service: 'Start the service to load its configuration.' } }, action })
   const resources = new SourceResources()
   const notify = () => { hooks.changed(); panel.refresh() }
   const assertCurrent = () => { hooks.guard(); if (closing) throw new Error('Superagent is closing') }
+
+  function receivingConfig() {
+    const c = config()
+    return { github: { origin: c.get('github.origin', 'https://api.github.com'), repository: c.get<string>('github.repository', '') },
+      teams: { tenantId: c.get<string>('teams.tenantId', ''), chatIds: c.get<string[]>('teams.chatIds', []), channels: c.get<TeamsSourceConfig['channels']>('teams.channels', []) } }
+  }
+  async function confirmAdmission(s: AutomationService, next: AutomationSettings, baseRevision: number): Promise<void> {
+    if (s.settings.revision !== baseRevision) throw new Error('Settings revision conflict; reload before saving')
+    const receiving = receivingConfig(), mode = config().get('execution.permissionMode', 'ask')
+    const broadened = broadenedAdmission(s.settings.value, next, receiving)
+    if (!broadened.length) return
+    const expected = fingerprint({ receiving, mode, native: sourcePolicy() })
+    const answer = await vscode.window.showWarningMessage('Authorize broader source admission?', { modal: true,
+      detail: 'This policy broadens the following sender classes:\n\n' + broadened.join('\n\n')
+        + '\n\nAn explicit unlisted-addressed grant lets anyone in its scopes start work without individual native decisions, including in off and observe modes. Inferred grants execute only in auto with enabled matching rules; observe assesses without starting work. In Run within approved tickets mode, these workers can run commands as your OS user, including environment variables, files outside the worktree and network access. Native tool permission mode is currently ' + mode + '. Removing an identity from allowedActors does not deny new requests that another admission grant still permits.' },
+      'Authorize sender policy', 'Cancel')
+    assertCurrent()
+    if (s.settings.revision !== baseRevision) throw new Error('Settings revision conflict; reload before saving')
+    if (expected !== fingerprint({ receiving: receivingConfig(), mode: config().get('execution.permissionMode', 'ask'), native: sourcePolicy() })) throw new Error('Native receiving scope or permission mode changed during policy consent')
+    if (answer !== 'Authorize sender policy') throw new Error('Sender policy change cancelled')
+  }
 
   function sourcePolicy() {
     const c = config()
@@ -91,10 +114,7 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
   }
 
   function sourceAdmission(family: 'github' | 'teams'): ((trigger: Trigger) => boolean) | undefined {
-    const settings = service!.settings.value, source = settings.sources[family], admission = source.admission
-    const receivable = source.allowedActors.length || source.allowedBots.length || admission?.unlistedAddressed === 'explicit'
-      || settings.acceptMode !== 'off' && (admission?.unlistedAddressed === 'inferred' || source.allowUnaddressed && admission?.unlistedUnaddressed === 'inferred')
-    return receivable ? trigger => automationGate(service!.settings.value, trigger).admissible : undefined
+    return sourceMayAdmit(service!.settings.value, family) ? trigger => automationGate(service!.settings.value, trigger).admissible : undefined
   }
 
   async function poll(signal: AbortSignal): Promise<Trigger[]> {
@@ -108,7 +128,22 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
     const errors: string[] = []
     if (sources.github.enabled) {
       try {
-        const base = await github(), ref = githubThreadRef(base, 1), key = `source:github:${ref.source}`
+        const generation = () => fingerprint({ receiving: receivingConfig().github, native: sourcePolicy().github,
+          enabled: service!.settings.value.enabled, policy: service!.settings.value.sources.github, mode: service!.settings.value.acceptMode, rules: service!.settings.value.rules })
+        const expected = generation()
+        const assertGitHubCurrent = () => {
+          assertCurrent(); signal.throwIfAborted()
+          if (generation() !== expected) throw new Error('GitHub source changed during read; poll again with the current configuration')
+        }
+        const transport: typeof fetch = async (input, init) => {
+          assertGitHubCurrent()
+          const response = await fetch(input, init)
+          assertGitHubCurrent()
+          return response
+        }
+        const base = await github()
+        assertGitHubCurrent()
+        const ref = githubThreadRef(base, 1), key = `source:github:${ref.source}`
         h.runtime.reconcileGitHubBindings(base)
         const previous = h.runtime.readData<{ since: string; reviews?: GitHubReviewCursor }>(key)
         const started = new Date(Date.now() - 2000).toISOString()
@@ -124,22 +159,29 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
           observeIssues: sources.github.allowUnaddressed, observePullRequests: sources.github.allowUnaddressed,
           observeComments: sources.github.allowUnaddressed, observeReviews: sources.github.allowUnaddressed }
         try {
-          const items = await pollGitHub(cfg, signal)
+          const items = await pollGitHub(cfg, signal, transport)
+          assertGitHubCurrent()
           commit(key, items.map(sourceTrigger), { ...previous, since: started })
-        } catch { signal.throwIfAborted(); errors.push('GitHub intake could not be read; check permissions and pagination.') }
+        } catch { assertGitHubCurrent(); errors.push('GitHub intake could not be read; check permissions and pagination.') }
         try {
-          const reviews = await pollGitHubReviewsBatch(cfg, previous?.reviews, signal)
+          const reviews = await pollGitHubReviewsBatch(cfg, previous?.reviews, signal, transport)
+          assertGitHubCurrent()
           const since = h.runtime.readData<{ since: string }>(key)?.since ?? cfg.since
           commit(key, reviews.items.map(sourceTrigger), { since, ...(reviews.next ? { reviews: reviews.next } : {}) })
         } catch (error) {
-          signal.throwIfAborted()
+          assertGitHubCurrent()
           const reset = restartChangedScan(error, h.runtime.readData<{ since: string; reviews?: GitHubReviewCursor }>(key), 'reviews')
           if (reset) h.runtime.writeData(key, reset)
           errors.push('GitHub reviews could not be read; check permissions and pagination.')
         }
         if (cfg.observeIssues) {
-          try { h.runtime.engine.receive(await pollDefaultBranchChecks(cfg, signal)) }
-          catch { signal.throwIfAborted(); errors.push('Default-branch CI could not be read.') }
+          try {
+            const event = await pollDefaultBranchChecks(cfg, signal, transport)
+            assertGitHubCurrent()
+            const provider = event.meta.provider as { branch: string; head: string }
+            h.runtime.receiveVerifiedDefaultStatus(event, { ...base, branch: provider.branch, head: provider.head })
+          }
+          catch { assertGitHubCurrent(); errors.push('Default-branch CI could not be read.') }
         }
         const discoveryKey = `source:github-discovery:${ref.source}`
         const missing = h.runtime.list().filter(ticket => !ticket.ended && !(ticket.follows ?? []).some(follow => follow.own && !follow.closed && follow.thread.startsWith(`${ref.source}:`)))
@@ -148,7 +190,10 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
         const rotated = offset < 0 ? missing : [...missing.slice(offset), ...missing.slice(0, offset)]
         for (const ticket of rotated.slice(0, 5)) {
           try {
-            for (const pull of await discoverOwnPullRequests(base, `superagent/${ticket.id}`, signal)) {
+            const pulls = await discoverOwnPullRequests(base, `superagent/${ticket.id}`, signal, transport)
+            assertGitHubCurrent()
+            for (const pull of pulls) {
+              assertGitHubCurrent()
               const current = h.runtime.get(ticket.id)
               if (current.ended) break
               const thread = githubThreadRef(base, pull.number)
@@ -156,18 +201,21 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
               if (pull.state === 'open' || !current.follows?.some(follow => follow.thread === threadKey(thread))) h.runtime.engine.bindThread(ticket.id, thread, true)
               if (!prNumbers.includes(pull.number)) prNumbers.push(pull.number)
             }
-          } catch { signal.throwIfAborted(); errors.push(`PR discovery for ticket ${ticket.id} could not be read.`) }
+          } catch { assertGitHubCurrent(); errors.push(`PR discovery for ticket ${ticket.id} could not be read.`) }
+          assertGitHubCurrent()
           h.runtime.writeData(discoveryKey, ticket.id)
         }
         for (const number of prNumbers) {
           try {
-            const checks = await pollGitHubChecks(cfg, [number], signal)
+            const checks = await pollGitHubChecks(cfg, [number], signal, transport)
+            assertGitHubCurrent()
             h.runtime.repositories.atomic(() => checks.map(sourceTrigger).forEach(event => h.runtime.receiveVerifiedStatus(event, base)))
-          } catch { signal.throwIfAborted(); errors.push(`PR #${number} CI could not be read.`) }
+          } catch { assertGitHubCurrent(); errors.push(`PR #${number} CI could not be read.`) }
           try {
-            const pr = await readPullRequest(base, number, signal)
+            const pr = await readPullRequest(base, number, signal, transport)
+            assertGitHubCurrent()
             if (pr.state === 'closed') h.runtime.engine.threadClosed(githubThreadRef(base, number), pr.merged ? 'merged' : 'closed', pr.mergedAt ?? pr.closedAt ?? new Date().toISOString())
-          } catch { signal.throwIfAborted(); errors.push(`PR #${number} lifecycle could not be read.`) }
+          } catch { assertGitHubCurrent(); errors.push(`PR #${number} lifecycle could not be read.`) }
         }
       } catch { signal.throwIfAborted(); errors.push('GitHub source failed; check source scope, permissions and pagination.') }
     }
@@ -327,17 +375,27 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
 
   async function start(): Promise<void> {
     assertCurrent()
+    const s = await get()
+    sourceSettings()
+    const policyRevision = s.settings.revision, receiving = fingerprint({ receiving: receivingConfig(), native: sourcePolicy() })
+    const grants = admissionDisclosure(s.settings.value, receivingConfig())
     const answer = await vscode.window.showWarningMessage('Start continuous Superagent work for this repository?', { modal: true,
-      detail: 'Configured sources will be polled and authorized requests will start persistent Copilot workers in separate worktrees. Run within approved tickets permits commands without per-command confirmation as your OS user. Those commands can read environment variables and files outside the worktree and use the network. Worktrees do not sandbox commands. The source reply setting does not restrict CLI commands. Managed approvals and sandbox bypasses still require confirmation.' }, 'Confirm each tool', 'Run within approved tickets')
+      detail: 'Configured sources will be polled and authorized requests will start persistent Copilot workers in separate worktrees. Run within approved tickets permits commands without per-command confirmation as your OS user. Those commands can read environment variables and files outside the worktree and use the network. Worktrees do not sandbox commands. The source reply setting does not restrict CLI commands. Managed approvals and sandbox bypasses still require confirmation.'
+        + '\n\nCurrent sender admission:\n' + (grants.length ? grants.join('\n\n') : 'Unlisted senders are ignored by default; no unlisted grant is configured.') }, 'Confirm each tool', 'Run within approved tickets')
     if (!answer) return
-    await config().update('execution.permissionMode', answer === 'Run within approved tickets' ? 'ticket' : 'ask', vscode.ConfigurationTarget.Global)
+    assertCurrent()
+    if (s.settings.revision !== policyRevision || fingerprint({ receiving: receivingConfig(), native: sourcePolicy() }) !== receiving) throw new Error('Sender policy or source scope changed during Start consent')
+    const permission = answer === 'Run within approved tickets' ? 'ticket' : 'ask'
+    await config().update('execution.permissionMode', permission, vscode.ConfigurationTarget.Global)
     const writes = await vscode.window.showWarningMessage('Enable replies to the configured source conversations?', { modal: true,
       detail: 'The service can acknowledge requests, ask questions and deliver results to their original GitHub or Teams conversation. This requires write scopes for those sources.' }, 'Enable replies', 'Keep replies local')
     await config().update('delivery.enabled', writes === 'Enable replies', vscode.ConfigurationTarget.Global)
     if (sourcePolicy().teams.enabled) await teams(writes === 'Enable replies', true)
-    const s = await get()
     const health = await backend!.check()
     if (!health.authenticated) throw new Error('Sign in to the configured Copilot CLI before starting Superagent')
+    assertCurrent()
+    if (s.settings.revision !== policyRevision || fingerprint({ receiving: receivingConfig(), native: sourcePolicy() }) !== receiving
+      || config().get('execution.permissionMode', 'ask') !== permission) throw new Error('Sender policy or native scope changed while starting Superagent')
     sourceSettings()
     s.saveSettings({ enabled: true }, s.settings.revision)
     await config().update('service.enabled', true, vscode.ConfigurationTarget.Global)
@@ -377,16 +435,32 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
         const doc = await vscode.workspace.openTextDocument({ language: 'json', content: JSON.stringify(h.runtime.context(ticket.id), null, 2) })
         await vscode.window.showTextDocument(doc); break
       }
-      case 'saveSettings':
+      case 'saveSettings': {
         if (!Number.isSafeInteger(message.revision)) throw new Error('Invalid settings revision')
-        s.saveSettings(message.value, message.revision as number)
+        const baseRevision = message.revision as number
+        if (baseRevision !== s.settings.revision) throw new Error('Settings revision conflict; reload before saving')
+        const candidate = structuredClone(s.previewSettings(message.value, baseRevision))
+        await confirmAdmission(s, candidate, baseRevision)
+        assertCurrent()
+        s.saveSettings(candidate, baseRevision)
         result = { type: 'settings', action: 'saveSettings', settings: s.settings }
         s.kick(); break
-      case 'restoreSettings':
+      }
+      case 'restoreSettings': {
         if (!Number.isSafeInteger(message.revision) || !Number.isSafeInteger(message.baseRevision)) throw new Error('Invalid settings revision')
-        s.restoreSettings(message.revision as number, message.baseRevision as number)
+        const baseRevision = message.baseRevision as number, revision = message.revision as number
+        if (baseRevision !== s.settings.revision) throw new Error('Settings revision conflict; reload before restoring')
+        const original = revision === 0 ? DEFAULT_AUTOMATION_SETTINGS : s.snapshot().history.find(version => version.revision === revision)?.value
+        if (!original) throw new Error('Unknown settings revision')
+        const candidate = structuredClone(s.previewSettings(original, baseRevision, 'restore'))
+        await confirmAdmission(s, candidate, baseRevision)
+        assertCurrent()
+        const current = revision === 0 ? DEFAULT_AUTOMATION_SETTINGS : s.snapshot().history.find(version => version.revision === revision)?.value
+        if (fingerprint(candidate) !== fingerprint(s.previewSettings(current, baseRevision, 'restore'))) throw new Error('Settings history changed during consent')
+        s.restoreSettings(revision, baseRevision)
         result = { type: 'settings', action: 'restoreSettings', settings: s.settings }
         break
+      }
       case 'previewWorker': case 'previewAssessor': {
         const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content: s.previewPrompt(action === 'previewWorker' ? 'worker' : 'assessor') })
         await vscode.window.showTextDocument(doc); break

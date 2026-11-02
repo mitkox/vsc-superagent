@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { Engine, latestAssignment, runningAssignment, threadKey, isoTime } from '../../src/core/index.ts'
-import type { Follow, Policy, ReportState, SourceScope, Ticket, Trigger } from '../../src/core/index.ts'
+import type { Follow, Mandate, Policy, ReportState, SourceScope, Ticket, Trigger } from '../../src/core/index.ts'
 import { DurableRepositories } from './state.ts'
 import type { GitHubRepositoryScope, SourceContext } from './sources.ts'
-import { githubRepositoryRef, sourceTrigger } from './sources.ts'
+import { githubBase, githubRepositoryRef, sourceTrigger } from './sources.ts'
 
 export interface ExternalOrigin { source: string; id: string; actor: string; context?: SourceContext; url?: string; thread?: string }
 
@@ -128,6 +128,50 @@ export class TicketRuntime {
     })
   }
 
+  /** Native host boundary: authenticate the default branch and exact head before recording this event. */
+  receiveVerifiedDefaultStatus(received: Trigger, scope: GitHubRepositoryScope & { branch: string; head: string }): void {
+    const trigger = { ...received, at: isoTime(received.at) }
+    const provider = trigger.meta.provider as Record<string, unknown> | undefined
+    const source = githubRepositoryRef(scope, 1).source
+    if (!scope.branch || scope.branch.length > 256 || /[\x00-\x20\x7f]/.test(scope.branch) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(scope.head)
+      || provider?.provider !== 'github' || provider.kind !== 'branch-checks' || typeof provider.origin !== 'string' || typeof provider.repository !== 'string'
+      || githubBase(provider.origin).href !== githubBase(scope.origin).href || provider.repository.toLowerCase() !== scope.repository.toLowerCase()
+      || provider.branch !== scope.branch || typeof provider.head !== 'string' || provider.head.toLowerCase() !== scope.head.toLowerCase()
+      || trigger.human || trigger.addressed || trigger.actor.id !== 'github-actions[bot]' || trigger.actor.source !== source || trigger.source !== source
+      || trigger.threads.length !== 1 || trigger.threads[0]?.source !== source || trigger.threads[0]?.id !== `branch:${scope.branch}` || trigger.channel) throw new Error('Invalid verified default-branch status')
+    this.repo.atomic(() => {
+      const bindings = this.list().filter(ticket => !ticket.ended && this.verifiedDefaultStatus(ticket.mandate)
+        && this.automatedPolicy?.().revalidate(ticket.mandate) && this.sourceBinding(ticket, trigger)).map(ticket => ({ ticketId: ticket.id, mandate: this.digest(ticket.mandate) }))
+      this.writeData(`verified-default-ci:${trigger.id}`, { event: this.digest(trigger), source, branch: scope.branch, head: scope.head.toLowerCase(), bindings })
+      this.engine.receive(trigger)
+    })
+  }
+  /** Exact event proof for intake, or its immutable source reference for later mandate revalidation. */
+  verifiedDefaultStatus(input: Trigger | Mandate): boolean {
+    const mandate = 'basis' in input ? input : undefined
+    const id = mandate?.basis.scope?.defaultStatusEventId
+    const trigger = mandate ? typeof id === 'string' ? this.repo.triggers.get(id) : undefined : input as Trigger
+    if (!trigger || trigger.human || trigger.addressed || trigger.actor.id !== 'github-actions[bot]' || trigger.actor.source !== trigger.source) return false
+    const provider = trigger.meta.provider as Record<string, unknown> | undefined
+    const receipt = this.readData<{ event: string; source: string; branch: string; head: string }>(`verified-default-ci:${trigger.id}`)
+    let at: string
+    try { at = isoTime(trigger.at) } catch { return false }
+    if (!receipt || provider?.kind !== 'branch-checks' || provider.provider !== 'github' || receipt.source !== trigger.source
+      || receipt.branch !== provider.branch || typeof provider.head !== 'string' || receipt.head !== provider.head.toLowerCase()
+      || receipt.event !== this.digest({ ...trigger, at })) return false
+    if (mandate && (!mandate.basis.scope?.provider || typeof mandate.basis.scope.provider !== 'object')) return false
+    return !mandate || mandate.actor.source === trigger.source && mandate.actor.id === trigger.actor.id
+      && this.digest(mandate.basis.scope?.provider) === this.digest(provider)
+  }
+
+  /** A new authenticated default-branch fact may update only its existing, still-rule-authorized CI ticket. */
+  verifiedDefaultInput(trigger: Trigger, ticket: Ticket): boolean {
+    if (ticket.ended || !this.verifiedDefaultStatus(trigger) || !this.verifiedDefaultStatus(ticket.mandate)
+      || !this.automatedPolicy?.().revalidate(ticket.mandate) || !this.sourceBinding(ticket, trigger)) return false
+    const receipt = this.readData<{ bindings?: { ticketId: string; mandate: string }[] }>(`verified-default-ci:${trigger.id}`)
+    return receipt?.bindings?.some(binding => binding.ticketId === ticket.id && binding.mandate === this.digest(ticket.mandate)) ?? false
+  }
+
   /** Host-only result of a successful configured-bot assessment; no new mandate is granted. */
   approveBotInput(trigger: Trigger, ticketIds: string[], rules: string[], policyVersion: string): void {
     if (trigger.human || !rules.length || !['github', 'teams'].some(family => trigger.source.startsWith(`${family}:`))) throw new Error('Invalid approved bot context')
@@ -160,6 +204,14 @@ export class TicketRuntime {
   }
   private digest(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex') }
 
+  /** Exact persisted contributors to an accepted mandate; missing source records fail current authority closed. */
+  mandateOrigins(mandate: Mandate): (Trigger | undefined)[] | undefined {
+    const identity = this.digest(mandate)
+    const tickets = this.list().filter(ticket => this.digest(ticket.mandate) === identity)
+    if (!tickets.length) return undefined
+    const ids = [...new Set(tickets.flatMap(ticket => [ticket.origin.triggerId, ...ticket.origin.triggerIds ?? []]))]
+    return ids.map(id => this.repo.triggers.get(id))
+  }
   list(): Ticket[] { this.repo.assertOpen(); return this.repo.tickets.list() }
   get(id: string): Ticket {
     this.repo.assertOpen()

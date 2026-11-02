@@ -13,6 +13,7 @@ import type { SourceContext } from '../src/sources.ts'
 import type { AutomationSettings } from '../src/settings.ts'
 import type { PanelHost } from '../src/panel.ts'
 import type { AgentRun } from '../src/agent-backend.ts'
+import type { AssessmentOutcome } from '../../src/core/index.ts'
 
 const requireModule = createRequire(import.meta.url)
 const code = buildSync({
@@ -26,6 +27,7 @@ const bot = '44444444-4444-4444-4444-444444444444'
 const account = '55555555-5555-5555-5555-555555555555'
 const chat = '19:approved@thread.v2'
 const channel = { teamId: '66666666-6666-6666-6666-666666666666', channelId: '19:channel@thread.tacv2' }
+interface HostWarning { message: string; detail: string; choices: string[]; permissionMode: unknown }
 const head = 'a'.repeat(40)
 const githubIssue = (id: number, login: string, type = 'User', body = 'Repair the defect') => ({ id, number: id, title: 'Bug', body,
   user: { login, type }, updated_at: new Date().toISOString() })
@@ -40,7 +42,9 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
   const commands = new Map<string, () => Promise<unknown>>()
   const requests: { url: URL; authorization: string | null; method: string; body?: string }[] = [], signins: string[][] = []
   const errors: string[] = [], warningChoices: (string | undefined)[] = []
-  const warnings: { message: string; detail: string; choices: string[]; permissionMode: unknown }[] = []
+  const warnings: HostWarning[] = []
+  let warning: ((entry: HostWarning) => string | undefined | Promise<string | undefined>) | undefined
+  let assessor: ((prompt: string) => AssessmentOutcome | Promise<AssessmentOutcome>) | undefined
   let panel!: PanelHost, signIn: (() => void | Promise<void>) | undefined, githubCredential: (() => void | Promise<void>) | undefined, response: (url: URL, init?: RequestInit) => unknown = () => []
   let credentials = 0, worker: ((request: AgentRun) => Promise<void>) | undefined
   const runs: AgentRun[] = []
@@ -56,8 +60,9 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
     commands: { registerCommand: (name: string, callback: () => Promise<unknown>) => { commands.set(name, callback); return disposable } },
     window: { showErrorMessage: async (error: string) => { errors.push(error) },
       showWarningMessage: async (message: string, options: unknown, first: string, ...others: string[]) => {
-        warnings.push({ message, detail: (options as { detail?: string })?.detail ?? '', choices: [first, ...others], permissionMode: values['execution.permissionMode'] })
-        return warningChoices.shift() ?? first
+        const entry = { message, detail: (options as { detail?: string })?.detail ?? '', choices: [first, ...others], permissionMode: values['execution.permissionMode'] }
+        warnings.push(entry)
+        return warning ? warning(entry) : warningChoices.length ? warningChoices.shift() : first
       } },
     lm: { registerTool: () => disposable },
     Uri: { joinPath: (_uri: unknown, ...parts: string[]) => ({ fsPath: join(directory, ...parts) }) },
@@ -66,7 +71,7 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
   const module = { exports: {} as { activateAutomation(context: unknown, hooks: unknown): { shutdown(): Promise<void> } } }
   runInNewContext(code, {
     module, exports: module.exports, require: (name: string) => name === 'vscode' ? api : name === './copilot.ts' ? {
-      CopilotBackend: class { async check() { return { authenticated: true } } async abort() {} async dispose() {} async assess() { return { kind: 'ignore', reason: 'No stop or new task' } }
+      CopilotBackend: class { async check() { return { authenticated: true } } async abort() {} async dispose() {} async assess(prompt: string) { return assessor ? assessor(prompt) : { kind: 'ignore', reason: 'No stop or new task' } }
         async run(request: AgentRun) { runs.push(request); if (worker) await worker(request); else await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'waiting', summary: 'Waiting for a native input' }) } },
     } : name === './panel.ts' ? { SuperagentPanel: class {
       constructor(host: PanelHost) { panel = host }
@@ -95,6 +100,8 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
   const snapshot = () => panel.snapshot() as { settings: { revision: number; value: AutomationSettings } }
   return { directory, runtime, values, requests, signins, errors, warnings, runs, snapshot,
     chooseWarnings: (...choices: (string | undefined)[]) => { warningChoices.push(...choices) },
+    onWarning: (handler?: (entry: HostWarning) => string | undefined | Promise<string | undefined>) => { warning = handler },
+    onAssessment: (handler: (prompt: string) => AssessmentOutcome | Promise<AssessmentOutcome>) => { assessor = handler },
     onWorker: (handler: (request: AgentRun) => Promise<void>) => { worker = handler }, get credentials() { return credentials },
     initialize: () => commands.get('superagent.dashboard')!(),
     start: () => commands.get('superagent.startService')!(),
@@ -884,7 +891,7 @@ for (const choice of ['Confirm each tool', 'Run within approved tickets'] as con
   test(`native start discloses operator command privileges before selecting ${choice}`, async () => {
     const f = fixture({ 'execution.permissionMode': 'ask' })
     try {
-      f.chooseWarnings(choice === 'Confirm each tool' ? undefined : choice, 'Keep replies local')
+      f.chooseWarnings(choice, 'Keep replies local')
       await f.start()
       assert.deepEqual(f.errors, [])
       const start = f.warnings.find(warning => warning.message.startsWith('Start continuous Superagent work'))!
@@ -1071,3 +1078,427 @@ for (const change of ['native source', 'saved policy', 'accept mode', 'cancellat
     } finally { release(); await f.close() }
   })
 }
+
+
+const admissionConfiguration = { 'github.repository': 'company/project', 'github.allowedActors': [],
+  'teams.tenantId': tenant, 'teams.chatIds': [chat], 'teams.allowedActors': [], 'execution.permissionMode': 'ticket' }
+const admissionState = (f: ReturnType<typeof fixture>) => structuredClone({ settings: f.snapshot().settings, history: f.runtime.repositories.automation().history })
+function assertAdmissionDisclosure(entry: HostWarning, scope: string) {
+  assert.ok(entry.detail.includes(scope), `Consent must identify its configured scope: ${scope}`)
+  assert.match(entry.detail, /unlisted|not (?:on|in).*allowlist|outside.*(?:allowlist|allowedActors)/i)
+  assert.match(entry.detail, /operator|your (?:os |operating.system )?(?:user|account)|as you/i)
+  assert.match(entry.detail, /command|tool/i)
+}
+
+for (const family of ['github', 'teams'] as const) {
+  test(`${family} native unlisted admission consent can be dismissed without any settings commit and approved explicitly`, async () => {
+    const f = fixture(admissionConfiguration)
+    try {
+      await f.initialize()
+      const before = admissionState(f), warnings = f.warnings.length, scope = family === 'github' ? 'company/project' : chat
+      const value = { enabled: true, acceptMode: 'off', sources: { [family]: { admission: { unlistedAddressed: 'explicit' } } } }
+      let offered: HostWarning | undefined
+      f.onWarning(entry => { offered = entry; assert.deepEqual(admissionState(f), before); return undefined })
+      const declined = await f.save(value).catch(() => undefined)
+      assert.equal(f.warnings.length, warnings + 1, 'A wildcard grant requires native informed consent before its save')
+      assert.ok(offered); assertAdmissionDisclosure(offered, scope); assert.match(offered.detail, /explicit|addressed|mention/i)
+      assert.match(offered.detail, /future|fallback/i, 'The inherited family grant must disclose its future configured scopes')
+      assert.deepEqual(admissionState(f), before); assert.equal(declined, undefined)
+      f.onWarning(entry => {
+        assertAdmissionDisclosure(entry, scope)
+        if (family === 'github') value.sources[family]!.admission.unlistedAddressed = 'ignore'
+        return entry.choices[0]
+      })
+      const accepted = await f.save(value)
+      assert.ok(accepted); assert.equal(accepted.settings.revision, before.settings.revision + 1)
+      assert.equal(f.snapshot().settings.value.sources[family].admission!.unlistedAddressed, 'explicit')
+      assert.equal(f.runtime.repositories.automation().history.length, before.history.length + 1)
+      const committed = admissionState(f)
+      value.sources[family]!.admission.unlistedAddressed = 'inferred'
+      assert.deepEqual(admissionState(f), committed, 'Mutating the raw draft after save cannot change settings, revision or retained history')
+    } finally { await f.close() }
+  })
+}
+
+test('native unlisted consent covers activation of dormant inferred unaddressed policy', async () => {
+  const f = fixture(admissionConfiguration)
+  try {
+    await f.initialize(); const initialWarnings = f.warnings.length
+    await f.save({ enabled: true, acceptMode: 'off', sources: { teams: { enabled: false, allowUnaddressed: false, admission: { unlistedUnaddressed: 'inferred' } } } })
+    assert.equal(f.warnings.length, initialWarnings + 1, 'Saving a new dormant grant still requires informed consent')
+    assert.match(f.warnings.at(-1)!.detail, /dormant|disabled|off/i)
+    const before = admissionState(f), activate = { acceptMode: 'auto', sources: { teams: { enabled: true, allowUnaddressed: true } },
+      rules: [{ id: 'approved-repair', name: 'Approved repair', instruction: 'Repair the specifically observed defect', enabled: true }] }
+    f.onWarning(() => undefined); await f.save(activate).catch(() => undefined)
+    assert.equal(f.warnings.length, initialWarnings + 2); assert.deepEqual(admissionState(f), before)
+    const disclosure = f.warnings.at(-1)!; assertAdmissionDisclosure(disclosure, chat); assert.match(disclosure.detail, /inferred|unaddressed|observation/i)
+    f.onWarning(undefined); await f.save(activate)
+    assert.equal(f.snapshot().settings.value.acceptMode, 'auto'); assert.equal(f.snapshot().settings.value.sources.teams.allowUnaddressed, true)
+  } finally { await f.close() }
+})
+
+test('native unlisted consent also protects restoring a historically broader policy', async () => {
+  const f = fixture(admissionConfiguration)
+  try {
+    await f.initialize(); await f.save({ enabled: true, acceptMode: 'off', sources: { github: { admission: { unlistedAddressed: 'explicit' } } } })
+    const historical = f.snapshot().settings.revision
+    await f.save({ sources: { github: { admission: { unlistedAddressed: 'ignore' } } } })
+    const before = admissionState(f), count = f.warnings.length
+    f.chooseWarnings('Cancel'); const declined = await f.restore(historical).catch(() => undefined)
+    assert.equal(f.warnings.length, count + 1); assert.equal(declined, undefined); assert.deepEqual(admissionState(f), before)
+    assertAdmissionDisclosure(f.warnings.at(-1)!, 'company/project')
+    const restored = await f.restore(historical)
+    assert.ok(restored); assert.equal(restored.action, 'restoreSettings'); assert.equal(restored.settings.revision, before.settings.revision + 1)
+    assert.equal(f.snapshot().settings.value.sources.github.admission!.unlistedAddressed, 'explicit')
+  } finally { await f.close() }
+})
+
+test('native unlisted consent is absent for unchanged, narrowed and invalid policy saves', async () => {
+  const f = fixture(admissionConfiguration)
+  try {
+    await f.initialize(); await f.save({ enabled: true, sources: { github: { admission: { unlistedAddressed: 'explicit' } } } })
+    const count = f.warnings.length
+    await f.save(structuredClone(f.snapshot().settings.value))
+    await f.save({ sources: { github: { admission: { unlistedAddressed: 'ignore' } } } })
+    const beforeInvalid = admissionState(f)
+    await assert.rejects(f.save({ sources: { github: { admission: { unlistedUnaddressed: 'explicit' } } } }), /Invalid admission/)
+    await assert.rejects(f.save({ sources: { github: { admission: { unlistedAddressed: 'explicit' } } },
+      prompts: { overrides: { 'unknown/prompt-part': { text: 'Invalid draft cannot request policy consent' } } } }), /Unknown prompt part/)
+    assert.equal(f.warnings.length, count); assert.deepEqual(admissionState(f), beforeInvalid)
+  } finally { await f.close() }
+})
+
+for (const change of ['revision', 'native scope', 'permission mode'] as const) {
+  test(`native unlisted consent refuses a reviewed candidate after a concurrent ${change} change`, async () => {
+    const f = fixture(admissionConfiguration)
+    let release!: () => void, offered: HostWarning | undefined, done = false
+    const decision = new Promise<void>(resolve => { release = resolve })
+    try {
+      await f.initialize(); const before = admissionState(f)
+      f.onWarning(async entry => { offered = entry; await decision; return entry.choices[0] })
+      const save = f.save({ enabled: true, sources: { github: { admission: { unlistedAddressed: 'explicit' } } } })
+        .then(value => { done = true; return { value } }, error => { done = true; return { error } })
+      await ancestryWait(() => !!offered || done)
+      assert.ok(offered, 'The widened policy must wait in a native confirmation before it can commit')
+      assert.deepEqual(admissionState(f), before)
+      if (change === 'revision') {
+        await f.save({ prompts: { communication: 'A concurrently committed setting' } })
+      } else if (change === 'native scope') f.values['github.repository'] = 'company/replacement'
+      else f.values['execution.permissionMode'] = 'ask'
+      const concurrent = admissionState(f); release()
+      const result = await save
+      assert.ok('error' in result, 'The stale approval must fail rather than save under a different settings or native execution boundary')
+      assert.deepEqual(admissionState(f), concurrent)
+      assert.equal(f.snapshot().settings.value.sources.github.admission?.unlistedAddressed, undefined)
+    } finally { release(); await f.close() }
+  })
+}
+
+test('persisted unlisted grants are disclosed on native Start while reopen and polling do not add consent prompts', async () => {
+  const configuration = { 'github.repository': 'company/project', 'github.allowedActors': [], 'execution.permissionMode': 'ticket' }
+  let current: ReturnType<typeof fixture> | undefined = fixture(configuration)
+  const directory = current.directory
+  try {
+    await current.initialize(); await current.save({ enabled: true, acceptMode: 'off', sources: { github: { admission: { unlistedAddressed: 'explicit' } } } })
+    await current.close(true); current = undefined
+    current = fixture({ ...configuration, 'service.enabled': true }, directory); const reopened = current
+    reopened.respond(() => []); await reopened.initialize(); await reopened.poll(); await new Promise(resolve => setTimeout(resolve, 15))
+    assert.equal(reopened.warnings.length, 0, 'Reopening and ordinary unattended polling retain the existing consent without per-request modals')
+    reopened.onWarning(entry => entry.message.startsWith('Enable replies') ? 'Keep replies local' : entry.choices[0])
+    await reopened.start()
+    const start = reopened.warnings.find(entry => entry.message.startsWith('Start continuous Superagent work'))!
+    assert.ok(start); assertAdmissionDisclosure(start, 'company/project'); assert.match(start.detail, /explicit|addressed|mention/i)
+    assert.equal(reopened.warnings.length, 2)
+    await reopened.poll(); assert.equal(reopened.warnings.length, 2)
+  } finally { if (current) await current.close(); else rmSync(directory, { recursive: true, force: true }) }
+})
+
+test('an unlisted explicit wildcard request starts actual work only after native admission consent is accepted', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': [], 'execution.permissionMode': 'ticket' })
+  try {
+    await f.initialize(); await f.save({ enabled: true, acceptMode: 'off', pollIntervalMs: 3_600_000 })
+    f.respond(url => url.pathname === '/repos/company/project/issues' ? [githubIssue(42, 'outsider', 'User', '@agent repair the approved wildcard request')] : [])
+    f.onAssessment(() => ({ kind: 'accept', title: 'Explicitly granted source repair', scope: 'Repair the approved source defect', reason: 'Addressed human request under approved wildcard policy' }))
+    f.chooseWarnings('Run within approved tickets', 'Keep replies local'); await f.start(); await f.poll()
+    assert.equal(f.runs.length, 0)
+    const grant = { sources: { github: { admission: { unlistedAddressed: 'explicit' } } } }
+    f.chooseWarnings(undefined); const before = admissionState(f); await f.save(grant).catch(() => undefined)
+    assert.deepEqual(admissionState(f), before); await f.poll(); assert.equal(f.runs.length, 0)
+    await f.save(grant); await f.poll()
+    await ancestryWait(() => f.runs.length === 1 && ancestryIdle(f))
+    assert.equal(f.runtime.list().length, 1); assert.equal(f.runtime.list()[0]!.mandate.strength, 'explicit')
+    assert.equal(f.runtime.list()[0]!.mandate.actor.id, 'outsider'); assert.match(f.runs[0]!.prompt, /approved wildcard request/)
+  } finally { await f.close() }
+})
+
+for (const family of ['github', 'teams'] as const) {
+  test(`${family} native scoped admission authorizes only row A and revokes its running worker when that grant is removed`, async () => {
+    const otherChat = '19:unapproved@thread.v2'
+    const f = fixture({ ...admissionConfiguration, 'teams.chatIds': [chat, otherChat] })
+    try {
+      await f.initialize(); await f.save({ enabled: true, acceptMode: 'off', pollIntervalMs: 3_600_000 })
+      const scope = family === 'github' ? `${githubThreadRef(repositoryConfig, 42).source}:issues` : `tenant:${tenant}:chat:${chat}`
+      f.onAssessment(() => ({ kind: 'accept', title: 'Scoped source repair', scope: 'Only the explicitly approved row A request', reason: 'Approved exact source row' }))
+      f.onWorker(async turn => { await new Promise<void>(resolve => { if (turn.signal.aborted) resolve(); else turn.signal.addEventListener('abort', () => resolve(), { once: true }) }) })
+      f.respond(url => {
+        if (url.origin === 'https://graph.microsoft.com') return { value: url.pathname.includes('/messages') ? [{ ...teamsMessage(url.pathname.includes(encodeURIComponent(otherChat)) ? '201' : '101', savedActor),
+          mentions: [{ mentioned: { user: { id: account } } }], body: { contentType: 'text', content: url.pathname.includes(encodeURIComponent(otherChat)) ? 'ROW B MUST NOT EXECUTE' : 'ROW A approved work' } }] : [] }
+        if (url.pathname === '/repos/company/project/issues') return [githubIssue(42, 'outsider', 'User', '@agent ROW A approved work')]
+        if (url.pathname === '/repos/company/project/issues/comments') return [{ id: 201, user: { login: 'outsider', type: 'User' }, body: '@agent ROW B MUST NOT EXECUTE', updated_at: new Date().toISOString(), issue_url: 'https://api.github.com/repos/company/project/issues/43' }]
+        return []
+      })
+      await f.save({ sources: { [family]: { admissionByScope: { [scope]: { unlistedAddressed: 'explicit' } } } } })
+      const approval = f.warnings.at(-1)!; assertAdmissionDisclosure(approval, family === 'github' ? 'company/project' : chat)
+      f.chooseWarnings('Run within approved tickets', 'Keep replies local'); await f.start(); await f.poll()
+      await ancestryWait(() => f.runs.length === 1)
+      const turn = f.runs[0]!, ticket = f.runtime.get(turn.ticketId)
+      assert.match(turn.prompt, /ROW A approved work/); assert.doesNotMatch(turn.prompt, /ROW B MUST NOT EXECUTE/)
+      assert.equal(f.runtime.list().length, 1); assert.equal(ticket.mandate.strength, 'explicit')
+      assert.equal(f.runtime.repositories.snapshot().triggers.some(trigger => trigger.text.includes('ROW B MUST NOT EXECUTE')), false)
+      await f.save({ sources: { [family]: { admissionByScope: {} } } })
+      await ancestryWait(() => turn.signal.aborted)
+      await assert.rejects(turn.tools.find(tool => tool.name === 'orchestrator_read')!.invoke({ resource: 'ticket' }), /authoriz|cancel|abort|stopp|policy|active/i)
+      assert.equal(f.runs.length, 1); assert.equal(f.runtime.list().length, 1)
+    } finally { await f.close() }
+  })
+}
+
+test('native scoped admission consent catches a narrowing-row removal that reveals the broader family fallback', async () => {
+  const f = fixture(admissionConfiguration)
+  try {
+    await f.initialize()
+    const scope = `${githubThreadRef(repositoryConfig, 42).source}:issues`
+    await f.save({ enabled: true, acceptMode: 'off', sources: { github: { admission: { unlistedAddressed: 'explicit' }, admissionByScope: { [scope]: { unlistedAddressed: 'ignore' } } } } })
+    const before = admissionState(f), count = f.warnings.length
+    f.chooseWarnings(undefined); await f.save({ sources: { github: { admissionByScope: {} } } }).catch(() => undefined)
+    assert.equal(f.warnings.length, count + 1); assert.deepEqual(admissionState(f), before)
+    assertAdmissionDisclosure(f.warnings.at(-1)!, 'company/project'); assert.match(f.warnings.at(-1)!.detail, /issues/i)
+    await f.save({ sources: { github: { admissionByScope: {} } } })
+    assert.equal(f.snapshot().settings.revision, before.settings.revision + 1)
+  } finally { await f.close() }
+})
+
+
+test('native scoped CI-only admission starts rule-authorized work without scanning human source candidates', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': [], 'github.allowedBots': [], 'github.observe': true })
+  try {
+    await f.initialize()
+    const source = githubThreadRef(repositoryConfig, 1).source, row = `${source}:ci`
+    await f.save({ enabled: true, acceptMode: 'auto', pollIntervalMs: 3_600_000,
+      rules: [{ id: 'default-ci', name: 'Default branch CI repair', instruction: 'Repair the verified failing default branch check', enabled: true }],
+      sources: { github: { admissionByScope: { [row]: { unlistedUnaddressed: 'inferred' } } } } })
+    f.onAssessment(prompt => {
+      assert.match(prompt, /Default branch main CI/); assert.match(prompt, /ci\/required: failure/)
+      return { kind: 'accept', title: 'Repair authenticated default branch CI', scope: 'Repair only the verified failing main check', reason: 'Matched enabled CI rule', rules: ['default-ci'] }
+    })
+    f.onWorker(async turn => { await turn.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'ready', summary: 'Verified default branch CI repair reported' }) })
+    const statusAt = new Date().toISOString()
+    f.respond(url => url.pathname === `/repos/company/project/commits/${head}/statuses`
+      ? [{ id: 701, context: 'ci/required', state: 'failure', updated_at: statusAt }] : [])
+    f.chooseWarnings('Confirm each tool', 'Keep replies local'); await f.start(); await f.poll()
+    await ancestryWait(() => f.runs.length === 1 && ancestryIdle(f), 'Verified native CI did not start its rule-authorized worker').catch(error => {
+      throw new Error(`${error.message}: ${JSON.stringify({ errors: f.errors, health: f.runtime.repositories.automation().health, decisions: f.runtime.repositories.snapshot().decisions,
+        effects: f.runtime.repositories.automation().effects.map(effect => ({ kind: effect.kind, status: effect.status, error: effect.error })), triggers: f.runtime.repositories.snapshot().triggers })}`)
+    })
+    const trigger = f.runtime.repositories.snapshot().triggers.find(trigger => (trigger.meta.provider as { kind?: string } | undefined)?.kind === 'branch-checks')!
+    assert.ok(trigger); assert.equal(trigger.source, source); assert.equal(trigger.actor.id, 'github-actions[bot]'); assert.equal(trigger.human, false)
+    assert.deepEqual(trigger.threads, [{ source, id: 'branch:main' }]); assert.equal(trigger.channel, undefined)
+    const proof = f.runtime.readData<{ source: string; branch: string; head: string; event: string }>(`verified-default-ci:${trigger.id}`)!
+    assert.ok(proof); assert.equal(proof.source, source); assert.equal(proof.branch, 'main'); assert.equal(proof.head, head); assert.match(proof.event, /^[a-f0-9]{64}$/)
+    const ticket = f.runtime.get(f.runs[0]!.ticketId)
+    assert.equal(ticket.origin.triggerId, trigger.id); assert.equal(ticket.mandate.strength, 'inferred'); assert.deepEqual(ticket.mandate.basis.rules, ['default-ci'])
+    assert.equal(ticket.assignments.at(-1)!.report!.summary, 'Verified default branch CI repair reported'); assert.equal(ticket.ended?.outcome, 'completed')
+    assert.ok(f.requests.some(({ url }) => url.pathname === `/repos/company/project/commits/${head}/statuses`))
+    const candidates = f.requests.filter(({ url }) => /\/issues(?:\/comments)?$|\/pulls(?:\/comments|\/\d+\/reviews)?$/.test(url.pathname) && !url.searchParams.has('head'))
+    assert.equal(candidates.length, 0, 'A CI-only admission row must not enable issue/comment/review candidate scans')
+    assert.equal(f.runtime.repositories.automation().health.some(problem => problem.component === 'poll'), false)
+    assert.deepEqual(f.errors, []); assert.ok(f.requests.every(({ url, authorization }) => url.origin === 'https://api.github.com' && authorization?.startsWith('Bearer github-credential-')))
+  } finally { await f.close() }
+})
+
+
+test('native scoped CI status read cannot publish authority after the configured repository changes during its await', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': [], 'github.allowedBots': [], 'github.observe': true })
+  let release!: () => void, started = false, finished = false
+  const pending = new Promise<void>(resolve => { release = resolve })
+  try {
+    await f.initialize()
+    const row = `${githubThreadRef(repositoryConfig, 1).source}:ci`
+    await f.save({ enabled: true, acceptMode: 'auto', pollIntervalMs: 3_600_000,
+      rules: [{ id: 'default-ci', name: 'Default branch CI repair', instruction: 'Repair the verified default branch failure', enabled: true }],
+      sources: { github: { admissionByScope: { [row]: { unlistedUnaddressed: 'inferred' } } } } })
+    f.onAssessment(() => ({ kind: 'accept', title: 'Repair authenticated default branch CI', scope: 'Repair the verified main check', reason: 'Matched enabled CI rule', rules: ['default-ci'] }))
+    f.onWorker(async turn => { await turn.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'ready', summary: 'This stale work must never start' }) })
+    const statusAt = new Date().toISOString()
+    f.respond(async url => {
+      if (url.pathname !== `/repos/company/project/commits/${head}/statuses`) return []
+      started = true; await pending
+      return [{ id: 702, context: 'ci/required', state: 'failure', updated_at: statusAt }]
+    })
+    f.chooseWarnings('Confirm each tool', 'Keep replies local'); await f.start()
+    const poll = f.poll().then(() => { finished = true; return undefined }, error => { finished = true; return error })
+    await ancestryWait(() => started || finished, 'The CI integration did not reach its authenticated deferred status GET')
+    assert.equal(started, true)
+    f.values['github.repository'] = 'company/replacement'
+    release(); const error = await poll
+    assert.ok(error); assert.match(String(error), /Default-branch CI|GitHub|source/i)
+    await new Promise(resolve => setTimeout(resolve, 15))
+    assert.equal(f.runtime.repositories.snapshot().triggers.some(trigger => (trigger.meta.provider as { kind?: string } | undefined)?.kind === 'branch-checks'), false)
+    assert.equal(Object.keys(f.runtime.repositories.automation().metadata).some(key => key.startsWith('verified-default-ci:')), false)
+    assert.equal(f.runtime.list().length, 0); assert.equal(f.runs.length, 0)
+  } finally { release(); await f.close() }
+})
+
+
+const githubGenerationKey = (repository = 'company/project') => `source:github:${githubThreadRef({ ...repositoryConfig, repository }, 1).source}`
+async function githubGenerationFixture(f: ReturnType<typeof fixture>, running = false) {
+  await f.initialize(); await f.save({ enabled: true, acceptMode: 'off', pollIntervalMs: 3_600_000 })
+  f.respond(url => url.origin === 'https://graph.microsoft.com' ? { value: [] } : [])
+  if (running) { f.chooseWarnings('Confirm each tool', 'Keep replies local'); await f.start() }
+  await f.poll()
+}
+
+for (const change of ['repository', 'requesters', 'accept mode', 'saved policy'] as const) {
+  test(`GitHub native generation rejects an ordinary issue batch after a deferred ${change} change and retries current scope`, async () => {
+    const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': ['owner'],
+      'teams.tenantId': tenant, 'teams.chatIds': [chat], 'teams.allowedActors': [nativeActor] })
+    let release!: () => void, started = false, finished = false
+    const waiting = new Promise<void>(resolve => { release = resolve })
+    try {
+      await githubGenerationFixture(f, true)
+      const before = f.runtime.readData(githubGenerationKey())
+      f.onAssessment(prompt => prompt.includes('FRESH_SCOPE_INPUT')
+        ? { kind: 'accept', title: 'Current source repair', scope: 'Repair only the fresh current-scope request', reason: 'Explicit current sender' }
+        : { kind: 'ignore', reason: 'Only recording independent source progress' })
+      const stale = githubIssue(501, 'owner', 'User', '@agent OLD_SCOPE_INPUT')
+      f.respond(async url => {
+        if (url.origin === 'https://graph.microsoft.com') return { value: [{ ...teamsMessage('601', nativeActor), mentions: [{ mentioned: { user: { id: account } } }], body: { contentType: 'text', content: 'Independent Teams scope progressed' } }] }
+        if (url.pathname === '/repos/company/project/issues') { started = true; await waiting; return [stale] }
+        return []
+      })
+      const poll = f.poll().then(() => { finished = true; return undefined }, error => { finished = true; return error })
+      await ancestryWait(() => started || finished, 'The ordinary GitHub issue read did not reach its deferred response'); assert.equal(started, true)
+      if (change === 'repository') f.values['github.repository'] = 'company/replacement'
+      else if (change === 'requesters') f.values['github.allowedActors'] = ['new-owner']
+      else if (change === 'accept mode') await f.save({ acceptMode: 'observe' })
+      else await f.save({ sources: { github: { allowedActors: ['new-owner'] } } })
+      release(); const error = await poll
+      assert.deepEqual(f.runtime.readData(githubGenerationKey()), before)
+      assert.equal(f.runtime.repositories.snapshot().triggers.some(trigger => trigger.text.includes('OLD_SCOPE_INPUT')), false)
+      assert.ok(error, 'The stale issue batch must fail before publishing its events or cursor')
+      assert.ok(f.runtime.repositories.snapshot().triggers.some(trigger => trigger.text === 'Independent Teams scope progressed'), 'A stale GitHub source must not prevent independent Teams progress')
+      assert.equal(f.runs.length, 0)
+      const repository = change === 'repository' ? 'company/replacement' : 'company/project', actor = ['requesters', 'saved policy'].includes(change) ? 'new-owner' : 'owner'
+      f.respond(url => url.origin === 'https://graph.microsoft.com' ? { value: [] }
+        : url.pathname === `/repos/${repository}/issues` ? [githubIssue(502, actor, 'User', '@agent FRESH_SCOPE_INPUT')] : [])
+      await f.poll(); await ancestryWait(() => f.runs.some(run => run.prompt.includes('FRESH_SCOPE_INPUT')) && ancestryIdle(f))
+      const fresh = f.runtime.repositories.snapshot().triggers.find(trigger => trigger.text.includes('FRESH_SCOPE_INPUT'))!
+      assert.equal((fresh.meta.provider as { repository: string }).repository, repository); assert.equal(fresh.actor.id, actor)
+      assert.ok(f.runtime.readData(githubGenerationKey(repository)))
+    } finally { release(); await f.close() }
+  })
+}
+
+test('GitHub native generation is captured before credentials and prevents stale legacy-binding migration', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': ['owner'] })
+  let release!: () => void, started = false, finished = false
+  const waiting = new Promise<void>(resolve => { release = resolve })
+  try {
+    await githubGenerationFixture(f)
+    const ticket = f.runtime.create('Preserve the approved legacy PR binding'), legacy = oldPullRef(42), canonical = githubThreadRef(repositoryConfig, 42)
+    f.runtime.engine.bindThread(ticket.id, legacy, true)
+    const follows = structuredClone(f.runtime.get(ticket.id).follows), before = f.runtime.readData(githubGenerationKey()), requests = f.requests.length
+    f.onGitHubCredential(async () => { started = true; await waiting })
+    const poll = f.poll().then(() => { finished = true; return undefined }, error => { finished = true; return error })
+    await ancestryWait(() => started || finished, 'Credential retrieval was not deferred'); assert.equal(started, true)
+    f.values['github.allowedActors'] = []; release()
+    const error = await poll
+    assert.deepEqual(f.runtime.get(ticket.id).follows, follows); assert.equal(f.runtime.repositories.threads.get(`${canonical.source}:42`), undefined)
+    assert.deepEqual(f.runtime.readData(githubGenerationKey()), before); assert.equal(f.requests.length, requests)
+    assert.ok(error, 'A policy change during credentials must reject before legacy reconciliation or provider reads')
+    f.values['github.allowedActors'] = ['owner']; f.onGitHubCredential(async () => {})
+    f.respond(url => url.pathname.endsWith('/pulls/42') ? pull(42) : [])
+    await f.poll()
+    assert.ok(f.runtime.get(ticket.id).follows?.some(follow => follow.thread === `${canonical.source}:42`))
+    assert.equal(f.runtime.get(ticket.id).follows?.some(follow => follow.thread === `${legacy.source}:${legacy.id}`), false)
+  } finally { release(); await f.close() }
+})
+
+test('GitHub native generation preserves the review checkpoint after a repository change during review read', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': ['owner'] })
+  let release!: () => void, started = false, finished = false
+  const waiting = new Promise<void>(resolve => { release = resolve })
+  try {
+    await githubGenerationFixture(f)
+    const row = (id: number, text: string) => ({ id, user: { login: 'owner', type: 'User' }, body: `@agent ${text}`, submitted_at: new Date().toISOString(), state: 'COMMENTED', commit_id: head })
+    f.respond(async url => {
+      if (url.pathname === '/repos/company/project/pulls') return [{ number: 7 }]
+      if (url.pathname === '/repos/company/project/pulls/7/reviews') { started = true; await waiting; return [row(701, 'OLD_REVIEW_INPUT')] }
+      return []
+    })
+    const poll = f.poll().then(() => { finished = true; return undefined }, error => { finished = true; return error })
+    await ancestryWait(() => started || finished, 'The review scan did not reach its deferred page'); assert.equal(started, true)
+    const before = structuredClone(f.runtime.readData(githubGenerationKey()))
+    f.values['github.repository'] = 'company/replacement'; release()
+    const error = await poll; assert.deepEqual(f.runtime.readData(githubGenerationKey()), before)
+    assert.equal(f.runtime.repositories.snapshot().triggers.some(trigger => trigger.text.includes('OLD_REVIEW_INPUT')), false); assert.ok(error)
+    f.respond(url => url.pathname === '/repos/company/replacement/pulls' ? [{ number: 7 }]
+      : url.pathname === '/repos/company/replacement/pulls/7/reviews' ? [row(702, 'FRESH_REVIEW_INPUT')] : [])
+    await f.poll()
+    const fresh = f.runtime.repositories.snapshot().triggers.find(trigger => trigger.text.includes('FRESH_REVIEW_INPUT'))!
+    assert.ok(fresh); assert.equal((fresh.meta.provider as { repository: string }).repository, 'company/replacement')
+    assert.ok(f.runtime.readData(githubGenerationKey('company/replacement')))
+  } finally { release(); await f.close() }
+})
+
+test('GitHub native generation prevents stale PR discovery bindings and discovery cursor advancement', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': ['owner'] })
+  let release!: () => void, started = false, finished = false
+  const waiting = new Promise<void>(resolve => { release = resolve })
+  try {
+    await githubGenerationFixture(f)
+    const ticket = f.runtime.create('Discover only a current repository PR'), source = githubThreadRef(repositoryConfig, 42).source, key = `source:github-discovery:${source}`
+    const candidate = (repository: string) => ({ ...pull(42), user: { login: 'agent' }, head: { sha: head, ref: `superagent/${ticket.id}`, repo: { full_name: repository } } })
+    const before = f.runtime.readData(key)
+    f.respond(async url => {
+      if (url.searchParams.has('head')) { started = true; await waiting; return [candidate('company/project')] }
+      return []
+    })
+    const poll = f.poll().then(() => { finished = true; return undefined }, error => { finished = true; return error })
+    await ancestryWait(() => started || finished, 'PR discovery did not reach its deferred lookup'); assert.equal(started, true)
+    f.values['github.repository'] = 'company/replacement'; release(); const error = await poll
+    assert.deepEqual(f.runtime.readData(key), before); assert.equal(f.runtime.get(ticket.id).follows?.length ?? 0, 0)
+    assert.equal(f.runtime.repositories.threads.get(`${source}:42`), undefined); assert.ok(error)
+    f.respond(url => url.searchParams.has('head') ? [candidate('company/replacement')] : url.pathname.endsWith('/pulls/42') ? pull(42) : [])
+    await f.poll()
+    const current = githubThreadRef({ ...repositoryConfig, repository: 'company/replacement' }, 42)
+    assert.ok(f.runtime.get(ticket.id).follows?.some(follow => follow.thread === `${current.source}:42` && follow.own))
+    assert.equal(f.runtime.readData(`source:github-discovery:${current.source}`), ticket.id)
+  } finally { release(); await f.close() }
+})
+
+test('GitHub native generation cannot close a known PR from a lifecycle response after its repository changes', async () => {
+  const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': [] })
+  let release!: () => void, started = false, finished = false, reads = 0
+  const waiting = new Promise<void>(resolve => { release = resolve })
+  try {
+    await githubGenerationFixture(f)
+    const ticket = followPull(f.runtime, 42), ref = githubThreadRef(repositoryConfig, 42)
+    f.runtime.begin(ticket.id); f.runtime.report(ticket.id, 'ready', 'Ready pending verified merge')
+    f.respond(async url => {
+      if (url.pathname === '/repos/company/project/pulls/42') {
+        if (++reads === 1) return pull(42)
+        started = true; await waiting; return pull(42, true, true)
+      }
+      return []
+    })
+    const poll = f.poll().then(() => { finished = true; return undefined }, error => { finished = true; return error })
+    await ancestryWait(() => started || finished, 'Known PR lifecycle did not reach its deferred read'); assert.equal(started, true)
+    f.values['github.repository'] = 'company/replacement'; release(); const error = await poll
+    assert.equal(f.runtime.get(ticket.id).follows!.find(follow => follow.thread === `${ref.source}:42`)!.closed, undefined)
+    assert.equal(f.runtime.get(ticket.id).ended, undefined); assert.ok(error)
+    f.values['github.repository'] = 'company/project'; f.respond(url => url.pathname.endsWith('/pulls/42') ? pull(42, true, true) : [])
+    await f.poll()
+    assert.equal(f.runtime.get(ticket.id).follows!.find(follow => follow.thread === `${ref.source}:42`)!.closed?.outcome, 'merged')
+  } finally { release(); await f.close() }
+})

@@ -1,5 +1,6 @@
 /** Evals: the Thread-level assessments of queued Triggers, and the Decisions they end with. */
 import { key } from './ids.ts'
+import { assessmentCohort } from './authority.ts'
 import { UserError } from './errors.ts'
 import { liveTicket, threadKey } from './model.ts'
 import type { Decision, DecisionKind, Evaluation, Mandate, MandateBasis, Strength, Thread, Trigger } from './model.ts'
@@ -106,11 +107,11 @@ export class Evals extends EnginePart {
       this.repo.threads.save(thread)
       return
     }
-    // An inferred candidate must never borrow an explicit request's execution authority.
+    // Keep other admitted grants queued rather than lending them the strongest request's mandate.
+    const cohort = assessmentCohort(strongest.trigger, strongest.strength, strongest.basis)
     const selected = policy.admitsInput ? triggers.filter(trigger => {
       const gate = policy.gate(trigger, thread, tickets)
-      return gate.admissible && gate.strength === strongest!.strength && (gate.strength === 'explicit'
-        || (trigger.human === strongest!.trigger.human && trigger.actor.source === strongest!.trigger.actor.source && trigger.actor.id === strongest!.trigger.actor.id))
+      return gate.admissible && assessmentCohort(trigger, gate.strength, gate.basis) === cohort
     }).map(trigger => trigger.id) : [...thread.pending]
     const evalId = key('eval', thread.key, policy.version, at, ...selected)
     const deadline = new Date(Date.parse(at) + policy.evalTimeoutMs).toISOString()
@@ -261,13 +262,15 @@ export class Evals extends EnginePart {
         const gates = evaluation.triggerIds.map(id => ({ id, gate: admitted(id) }))
         const valid = gates.filter(item => item.gate?.admissible)
         const primary = gates.find(item => item.id === evaluation.primary)
+        const origin = this.repo.triggers.get(evaluation.primary ?? '')
+        const cohort = origin && assessmentCohort(origin, evaluation.strength, evaluation.basis)
         const stale = valid.length !== gates.length || !primary?.gate?.admissible
           || (primary.gate.admissible && JSON.stringify(primary.gate.basis) !== JSON.stringify(evaluation.basis))
-          || valid.some(item => item.gate?.admissible && item.gate.strength !== evaluation.strength)
-          || (evaluation.strength === 'inferred' && evaluation.triggerIds.some(id => {
-            const trigger = this.repo.triggers.get(id), origin = this.repo.triggers.get(evaluation.primary ?? '')
-            return !trigger || !origin || trigger.human !== origin.human || trigger.actor.source !== origin.actor.source || trigger.actor.id !== origin.actor.id
-          }))
+          || !origin || origin.actor.source !== evaluation.actor.source || origin.actor.id !== evaluation.actor.id
+          || valid.some(item => {
+            const trigger = this.repo.triggers.get(item.id)
+            return !trigger || !item.gate?.admissible || assessmentCohort(trigger, item.gate.strength, item.gate.basis) !== cohort
+          })
         if (stale) {
           delete thread.evaluating
           thread.pending = [...valid.map(item => item.id), ...thread.pending.filter(id => !valid.some(item => item.id === id))]

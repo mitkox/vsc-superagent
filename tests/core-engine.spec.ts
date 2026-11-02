@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Engine, MemoryRepositories, UserError, followupOwners, key, runningAssignment, ticketOutcome, ticketStage,
   waitsForPerson } from '../src/core/index.ts'
-import type { Assessor, Assignment, Candidate, EngineOptions, Executor, OutboundMessage, Outcome, Policy, Ticket, Trigger } from '../src/core/index.ts'
+import type { Assessor, Assignment, Candidate, GateResult, MandateBasis, EngineOptions, Executor, OutboundMessage, Outcome, Policy, Ticket, Trigger } from '../src/core/index.ts'
 
 const member = { source: 'chat', id: 'alice' }
 const guest = { source: 'chat', id: 'guest' }
@@ -1873,5 +1873,100 @@ describe('durable explicit thread unsubscribe', () => {
     h.engine.attach(first, '3', 'Native positive routing decision')
     expect(h.repo.threads.get('gh:pr-7')).toMatchObject({ subscriptions: [first], unsubscribed: [second] })
     expect(h.repo.tickets.get(first)?.inputs.at(-1)).toMatchObject({ triggerId: '3', note: 'Native positive routing decision' })
+  })
+})
+
+
+describe('assessment authority cohorts', () => {
+  function scoped(guarded = true) {
+    const revokedActors = new Set<string>(), revokedRows = new Set<string>()
+    const gate = (input: Trigger): GateResult => {
+      const row = String(input.meta.row ?? 'comments')
+      if (revokedActors.has(input.actor.id) || revokedRows.has(row)) return { admissible: false, reason: 'revoked' }
+      const basis: MandateBasis = input.meta.grant === 'followup' ? { source: input.source, row, via: 'followup' }
+        : { source: input.source, row, via: 'admission', cell: 'unlistedAddressed', addressed: input.addressed ?? 'mention' }
+      return { admissible: true, strength: input.meta.inferred ? 'inferred' : 'explicit', basis }
+    }
+    const h = harness({ gate, revalidate: mandate => !revokedActors.has(mandate.actor.id) && !revokedRows.has(mandate.basis.row ?? ''),
+      ...guarded ? { admitsInput: () => true } : {} })
+    return { ...h, revokedActors, revokedRows }
+  }
+  function acceptCurrent(h: ReturnType<typeof scoped>) {
+    const candidate = h.requests.at(-1)!
+    return h.decide(candidate, { kind: 'accept', title: 'One authority cohort', scope: candidate.triggers.map(trigger => trigger.text).join('\n'), reason: 'Assessed this cohort', rules: ['repair'] })
+  }
+  it('separates explicit actors and retains the other admitted sender for an independent mandate', () => {
+    const h = scoped()
+    h.engine.receive(trigger('1', { text: 'Alice-only request' }))
+    h.engine.receive(trigger('2', { actor: { source: 'chat', id: 'bob' }, text: 'Bob-only request' })); h.pump()
+    expect(h.requests[0]!.triggers.map(trigger => trigger.id)).toEqual(['2'])
+    expect(h.repo.threads.get('chat:t1')?.pending).toEqual(['1'])
+    const bob = h.repo.tickets.get(acceptCurrent(h).ticketId!)!
+    expect(bob.origin.triggerIds).toEqual(['2']); expect(bob.mandate.scope).toBe('Bob-only request')
+    h.pump(); expect(h.requests.at(-1)!.triggers.map(trigger => trigger.id)).toEqual(['1'])
+    const alice = h.repo.tickets.get(acceptCurrent(h).ticketId!)!
+    h.settle(); h.engine.report(bob.id, { state: 'ready', summary: 'Bob work completed' }); h.engine.report(alice.id, { state: 'ready', summary: 'Alice work completed' })
+    h.revokedActors.add('alice')
+    h.engine.receive(trigger('3', { actor: { source: 'chat', id: 'bob' }, text: 'A new authorized Bob follow-up' })); h.settle()
+    expect(h.repo.tickets.get(alice.id)?.ended?.outcome).toBe('completed')
+    expect(h.repo.tickets.get(alice.id)?.assignments).toHaveLength(1)
+    expect(h.repo.tickets.get(bob.id)?.ended).toBeUndefined(); expect(h.repo.tickets.get(bob.id)?.assignments).toHaveLength(2)
+  })
+  for (const inferred of [false, true]) it(`separates the same sender's ${inferred ? 'inferred' : 'explicit'} receiving rows before acceptance`, () => {
+    const h = scoped()
+    h.engine.receive(trigger('1', { text: 'Issue-row-only request', meta: { row: 'issues', inferred } }))
+    h.engine.receive(trigger('2', { text: 'Comment-row-only request', meta: { row: 'comments', inferred } })); h.pump()
+    expect(h.requests[0]!.triggers.map(trigger => trigger.id)).toEqual(['2'])
+    expect(h.repo.threads.get('chat:t1')?.pending).toEqual(['1'])
+    const comment = h.repo.tickets.get(acceptCurrent(h).ticketId!)!
+    h.pump(); expect(h.requests.at(-1)!.triggers.map(trigger => trigger.id)).toEqual(['1'])
+    const issue = h.repo.tickets.get(acceptCurrent(h).ticketId!)!
+    h.settle(); h.engine.report(comment.id, { state: 'ready', summary: 'Comment work completed' }); h.engine.report(issue.id, { state: 'ready', summary: 'Issue work completed' })
+    h.revokedRows.add('issues')
+    expect(comment.origin.triggerIds).toEqual(['2']); expect(comment.mandate.scope).toBe('Comment-row-only request')
+    expect(issue.origin.triggerIds).toEqual(['1']); expect(issue.mandate.scope).toBe('Issue-row-only request')
+    h.engine.receive(trigger('3', { meta: { row: 'comments' }, text: 'New allowed comment request' })); h.settle()
+    expect(h.repo.tickets.get(issue.id)?.ended?.outcome).toBe('completed'); expect(h.repo.tickets.get(issue.id)?.assignments).toHaveLength(1)
+    expect(h.repo.tickets.get(comment.id)?.ended).toBeUndefined(); expect(h.repo.tickets.get(comment.id)?.assignments).toHaveLength(2)
+  })
+  it('isolates distinct grant bases even for one explicit sender and receiving row', () => {
+    const h = scoped()
+    h.engine.receive(trigger('1', { meta: { row: 'comments' } }))
+    h.engine.receive(trigger('2', { meta: { row: 'comments', grant: 'followup' } })); h.pump()
+    expect(h.requests[0]!.triggers.map(trigger => trigger.id)).toEqual(['2'])
+    h.decide(h.requests[0]!, { kind: 'ignore', reason: 'First grant assessed' }); h.pump()
+    expect(h.requests.at(-1)!.triggers.map(trigger => trigger.id)).toEqual(['1'])
+  })
+  it('still debounces multiple messages carrying the same actor row and grant', () => {
+    const h = scoped()
+    h.engine.receive(trigger('1')); h.engine.receive(trigger('2')); h.pump()
+    expect(h.requests[0]!.triggers.map(trigger => trigger.id)).toEqual(['1', '2'])
+    const ticket = h.repo.tickets.get(acceptCurrent(h).ticketId!)!
+    expect(ticket.origin.triggerIds).toEqual(['1', '2']); expect(ticket.origin.triggerId).toBe('2')
+  })
+  it('retains generic mixed batching when the optional input policy hook is absent', () => {
+    const h = scoped(false)
+    h.engine.receive(trigger('1', { meta: { row: 'issues' } }))
+    h.engine.receive(trigger('2', { actor: { source: 'chat', id: 'bob' }, meta: { row: 'comments' } })); h.pump()
+    expect(h.requests[0]!.triggers.map(trigger => trigger.id)).toEqual(['1', '2'])
+  })
+  for (const mixed of ['actor', 'row'] as const) it(`rebuilds a same-version held mixed-${mixed} assessment after serialized reopen`, () => {
+    const old = scoped(false)
+    old.engine.receive(trigger('1', { meta: { row: mixed === 'row' ? 'issues' : 'comments' } }))
+    old.engine.receive(trigger('2', { ...(mixed === 'actor' ? { actor: { source: 'chat', id: 'bob' } } : {}), meta: { row: 'comments' } })); old.pump()
+    const stale = old.requests[0]!
+    expect(stale.triggers.map(trigger => trigger.id)).toEqual(['1', '2'])
+    const snapshot = JSON.parse(JSON.stringify({ triggers: ['1', '2'].map(id => ({ trigger: old.repo.triggers.get(id), disposition: old.repo.triggers.disposition(id) })), threads: old.repo.threads.list() }))
+    const current = scoped()
+    for (const row of snapshot.triggers) { current.repo.triggers.save(row.trigger); current.repo.triggers.saveDisposition(row.trigger.id, row.disposition) }
+    for (const thread of snapshot.threads) current.repo.threads.save(thread)
+    expect(current.engine.candidate('2')).toBeUndefined()
+    expect(current.assessor.release).toHaveBeenCalledWith(stale.evalId)
+    expect(() => current.decide(stale, { kind: 'accept', title: 'Stale combined mandate', scope: 'Both grants', reason: 'unsafe' })).toThrow('has finished or a later eval replaced it')
+    expect(current.repo.threads.get('chat:t1')?.pending).toEqual(['1', '2'])
+    current.pump(); expect(current.requests[0]!.triggers.map(trigger => trigger.id)).toEqual(['2'])
+    expect(current.repo.threads.get('chat:t1')?.pending).toEqual(['1'])
+    current.decide(current.requests[0]!, { kind: 'ignore', reason: 'First cohort finished' }); current.pump()
+    expect(current.requests.at(-1)!.triggers.map(trigger => trigger.id)).toEqual(['1'])
   })
 })

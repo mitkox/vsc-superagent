@@ -4,7 +4,7 @@ import { followupOwners, key, latestAssignment, latestReport, reached, runningAs
 import type { AssessmentOutcome, Candidate, ChannelRef, Decision, OutboundMessage, PolicyEffect, Thread, ThreadRef, Ticket, Trigger, WorkerReport } from '../../src/core/index.ts'
 import type { AgentBackend, AgentEvent, AgentTool } from './agent-backend.ts'
 import { TicketRuntime } from './runtime.ts'
-import { automationPolicy, automationPolicyVersion, automationScope, DEFAULT_AUTOMATION_SETTINGS, sourceFamily, validateSettings } from './settings.ts'
+import { automationPolicy, automationPolicyVersion, automationScope, DEFAULT_AUTOMATION_SETTINGS, sourceFamily, automationGate, validateSettings } from './settings.ts'
 import type { AutomationSettings, SettingsVersion } from './settings.ts'
 import type { PendingEffect, SessionRecord } from './state.ts'
 
@@ -207,10 +207,10 @@ export class AutomationService {
     return sections.filter(Boolean).join('\n\n')
   }
 
-  private save(value: unknown, baseRevision: number, origin: 'panel' | 'restore'): void {
+  previewSettings(value: unknown, baseRevision: number, origin: 'panel' | 'restore' = 'panel'): AutomationSettings {
     const before = this.settings
     if (!Number.isSafeInteger(baseRevision) || baseRevision !== before.revision) throw new Error('Settings revision conflict; reload before saving')
-    const next = validateSettings(value, origin === 'restore' ? DEFAULT_AUTOMATION_SETTINGS : before.value), from = automationPolicyVersion(before.value), to = automationPolicyVersion(next)
+    const next = validateSettings(value, origin === 'restore' ? DEFAULT_AUTOMATION_SETTINGS : before.value)
     for (const [part, override] of Object.entries(next.prompts.overrides ?? {})) {
       const builtin = this.deps.promptParts?.[part]
       if (builtin === undefined) {
@@ -221,7 +221,13 @@ export class AutomationService {
       override.base ??= before.value.prompts.overrides?.[part]?.base ?? builtin
     }
     validateSettings(next)
-    const oldPolicy = automationPolicy(before.value), newPolicy = automationPolicy(next), effects = new Map<string, PolicyEffect>()
+    return next
+  }
+
+  private save(value: unknown, baseRevision: number, origin: 'panel' | 'restore'): void {
+    const before = this.settings, next = this.previewSettings(value, baseRevision, origin)
+    const from = automationPolicyVersion(before.value), to = automationPolicyVersion(next)
+    const oldPolicy = this.policy(before.value), newPolicy = this.policy(next), effects = new Map<string, PolicyEffect>()
     for (const ticket of this.runtime.repositories.tickets.open()) {
       const effect: PolicyEffect = {}
       const rules = (ticket.mandate.basis.rules ?? []).flatMap(id => {
@@ -255,14 +261,13 @@ export class AutomationService {
     if (!operation || this.runtime.repositories.automation().sessions.find(session => session.ticketId === ticketId)?.sessionId !== sessionId) return false
     try { this.authorized(ticketId, operation.effect.assignmentId!, operation.controller.signal, operation.inputIds); return true } catch { return false }
   }
-  private policy() {
-    const settings = this.settings.value
+  private policy(settings = this.settings.value) {
     return automationPolicy(settings, this.runtime.paused, (trigger, ticket) => {
-      if (this.runtime.verifiedStatus(trigger, ticket)) return true
+      if (this.runtime.verifiedStatus(trigger, ticket) || this.runtime.verifiedDefaultInput(trigger, ticket)) return true
       const family = sourceFamily(trigger.source), source = family && settings.sources[family]
       return !!source && settings.acceptMode === 'auto' && source.allowedBots.some(actor => actor.toLowerCase() === trigger.actor.id.toLowerCase())
-        && (!!trigger.addressed || source.allowUnaddressed) && this.runtime.approvedBotInput(trigger, ticket, settings.rules.filter(rule => rule.enabled).map(rule => rule.id), automationPolicyVersion(settings))
-    })
+        && automationGate(settings, trigger).admissible && this.runtime.approvedBotInput(trigger, ticket, settings.rules.filter(rule => rule.enabled).map(rule => rule.id), automationPolicyVersion(settings))
+    }, input => this.runtime.verifiedDefaultStatus(input), mandate => this.runtime.mandateOrigins(mandate))
   }
   private inputAllowed(ticket: Ticket, id: string): boolean {
     const input = ticket.inputs.find(input => input.id === id)
@@ -321,7 +326,7 @@ export class AutomationService {
     for (const operation of this.active.values()) {
       const effect = operation.effect
       const ticket = effect.ticketId ? this.runtime.repositories.tickets.get(effect.ticketId) : undefined
-      const invalid = (['start', 'deliver'].includes(effect.kind) && (!ticket || !!ticket.ended || latestAssignment(ticket)?.id !== effect.assignmentId || !automationPolicy(settings).revalidate(ticket.mandate) || operation.inputIds?.some(id => !this.inputAllowed(ticket, id))))
+      const invalid = (['start', 'deliver'].includes(effect.kind) && (!ticket || !!ticket.ended || latestAssignment(ticket)?.id !== effect.assignmentId || !this.policy(settings).revalidate(ticket.mandate) || operation.inputIds?.some(id => !this.inputAllowed(ticket, id))))
         || (effect.kind === 'outbound' && this.outboundState(effect.message!) !== 'allowed')
       const staleEval = effect.kind === 'assessment' && !(effect.followup ? this.currentFollowup(effect) : this.currentCandidate(effect))
       const withdrawn = this.runtime.repositories.automation().effects.find(row => row.id === effect.id)?.status === 'cancelled'
@@ -420,7 +425,7 @@ export class AutomationService {
   private explicitFollowup(trigger: Trigger, tickets: Ticket[]): boolean {
     const thread = this.runtime.repositories.threads.get(threadKey(trigger.threads[0]!))
     if (!thread) return false
-    const gate = automationPolicy(this.settings.value).gate(trigger, thread, tickets)
+    const gate = this.policy().gate(trigger, thread, tickets)
     return gate.admissible && gate.strength === 'explicit'
   }
   private async assessFollowup(effect: PendingEffect, signal: AbortSignal): Promise<void> {
@@ -480,7 +485,7 @@ export class AutomationService {
     let ticket = this.runtime.get(effect.ticketId!)
     const assignment = latestAssignment(ticket)
     if (ticket.ended || !assignment || assignment.id !== effect.assignmentId || assignment.state === 'ended') { this.cancel(effect.id); return }
-    if (!automationPolicy(this.settings.value).revalidate(ticket.mandate)) {
+    if (!this.policy().revalidate(ticket.mandate)) {
       this.runtime.repositories.atomic(() => {
         this.cancel(effect.id)
         if (latestReport(ticket)?.state !== 'blocked') this.runtime.engine.report(ticket.id, { state: 'blocked', summary: 'The current policy no longer authorizes this mandate. Restore authorization before retrying.' })
@@ -549,7 +554,7 @@ export class AutomationService {
   private authorized(ticketId: string, assignmentId: string, signal: AbortSignal, inputIds: string[] = []): Ticket {
     signal.throwIfAborted()
     const ticket = this.runtime.get(ticketId)
-    if (!this.running || this.runtime.paused || !this.settings.value.enabled || ticket.ended || latestAssignment(ticket)?.id !== assignmentId || !automationPolicy(this.settings.value).revalidate(ticket.mandate) || inputIds.some(id => !this.inputAllowed(ticket, id))) throw new Error('Ticket authority is paused, revoked, or ended')
+    if (!this.running || this.runtime.paused || !this.settings.value.enabled || ticket.ended || latestAssignment(ticket)?.id !== assignmentId || !this.policy().revalidate(ticket.mandate) || inputIds.some(id => !this.inputAllowed(ticket, id))) throw new Error('Ticket authority is paused, revoked, or ended')
     return ticket
   }
 
@@ -731,7 +736,7 @@ export class AutomationService {
     const ticket = effect.ticketId ? this.runtime.repositories.tickets.get(effect.ticketId) : undefined
     if (signal.aborted) {
       this.runtime.repositories.atomic(() => {
-        const revoked = ticket && !automationPolicy(this.settings.value).revalidate(ticket.mandate)
+        const revoked = ticket && !this.policy().revalidate(ticket.mandate)
         const pendingPreparation = ticket && !ticket.ended && !revoked && effect.kind === 'start'
           && latestAssignment(ticket)?.id === effect.assignmentId && latestAssignment(ticket)?.state === 'pending'
         if (ticket && !ticket.ended && latestAssignment(ticket)?.id === effect.assignmentId && ['start', 'deliver'].includes(effect.kind)) {
