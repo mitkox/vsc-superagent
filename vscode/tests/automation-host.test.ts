@@ -157,7 +157,7 @@ test('dashboard GitHub policy controls real polling before the first poll and na
     await f.poll()
     assert.equal(f.runtime.repositories.snapshot().triggers.some(trigger => trigger.text.includes('@agent repair')), false)
     assert.deepEqual(f.snapshot().settings.value.sources.github.allowedActors, [])
-    assert.equal(f.snapshot().settings.value.sources.github.allowUnaddressed, false)
+    assert.equal(f.snapshot().settings.value.sources.github.allowUnaddressed, true, 'Unchanged native observation must retain the dashboard override')
     assert.equal(f.credentials, 2)
 
     await f.save({ sources: { github: { enabled: false } } })
@@ -180,7 +180,7 @@ test('explicit service restart keeps saved policy while reconciling native sourc
     f.values['github.allowedActors'] = []
     await f.start()
     assert.deepEqual(f.snapshot().settings.value.sources.github.allowedActors, [])
-    assert.equal(f.snapshot().settings.value.sources.github.allowUnaddressed, false)
+    assert.equal(f.snapshot().settings.value.sources.github.allowUnaddressed, true, 'Unchanged native observation must retain the dashboard override')
   } finally { await f.close() }
 })
 
@@ -221,13 +221,19 @@ test('Teams membership synchronization updates the current poll and preserves ot
     f.respond(url => ({ value: url.pathname.endsWith('/members')
       ? [{ '@odata.type': '#microsoft.graph.aadUserConversationMember', userId: savedActor, tenantId: tenant }]
       : [teamsMessage('1', savedActor), teamsMessage('2', bot, true)] }))
+    const beforeMembership = admissionState(f)
     await f.poll()
+    assert.equal(f.snapshot().settings.revision, beforeMembership.settings.revision + 1, 'The membership event and continuation must share one actors-only settings revision')
+    assert.equal(f.runtime.repositories.automation().history.length, beforeMembership.history.length + 1)
     assert.deepEqual(Array.from(f.values['teams.allowedActors'] as string[]), [savedActor])
     assert.deepEqual(f.snapshot().settings.value.sources.teams.allowedActors, [savedActor])
     assert.deepEqual(f.snapshot().settings.value.sources.teams.allowedBots, [bot])
     assert.equal(f.runtime.repositories.snapshot().triggers.filter(trigger => trigger.actor.id === savedActor).length, 1)
     assert.equal(f.runtime.repositories.snapshot().triggers.filter(trigger => trigger.actor.id === bot).length, 1)
     assert.ok(f.signins[0]!.includes('https://graph.microsoft.com/ChatMember.Read'))
+    const afterMembership = admissionState(f)
+    f.fireConfiguration('teams.allowedActors'); await f.poll()
+    assert.deepEqual(admissionState(f), afterMembership, 'Repeated membership snapshots and identical config events must not create settings revisions')
   } finally { await f.close() }
 })
 
@@ -1731,4 +1737,236 @@ test('live native deferred reply revocation preserves an already-attempted journ
     assert.equal(f.requests.filter(request => request.method === 'POST').length, 0)
     assert.equal((await f.permission(run, liveShell)).kind, 'approve-once')
   } finally { release(); await f.close() }
+})
+
+
+for (const target of ['github', 'chat'] as const) {
+  test(`native field ${target} requester removal rejects current permission and tools before reconciliation, then aborts on its event`, async () => {
+    const f = fixture(liveConfiguration(target))
+    try {
+      const original = await liveStart(f, target), run = f.runs[0]!
+      await f.poll(); const before = admissionState(f), key = target === 'github' ? 'github.allowedActors' : 'teams.allowedActors', family = target === 'github' ? 'github' : 'teams'
+      assert.equal((await f.permission(run, liveShell)).kind, 'approve-once')
+      f.values[key] = []
+      assert.equal((await f.permission(run, liveShell)).kind, 'reject', 'A native requester edit must affect the live policy without waiting for a config event')
+      await assert.rejects(run.tools.find(tool => tool.name === 'orchestrator_read')!.invoke({ resource: 'ticket' }), /authoriz|revok|ended|abort/i)
+      assert.deepEqual(admissionState(f), before, 'The live policy projection must not rewrite settings while checking a tool')
+      f.fireConfiguration(key)
+      await ancestryWait(() => run.signal.aborted && f.aborts.includes(original.ticketId))
+      assert.deepEqual(f.snapshot().settings.value.sources[family].allowedActors, [])
+      assert.equal(f.snapshot().settings.revision, before.settings.revision + 1)
+    } finally { await f.close() }
+  })
+}
+
+test('native field requester withdrawal is checked again after held interactive tool approval', async () => {
+  const f = fixture(liveConfiguration('github'))
+  let release!: () => void, offered = false, done = false
+  const approval = new Promise<void>(resolve => { release = resolve })
+  try {
+    await liveStart(f, 'github'); const run = f.runs[0]!
+    f.onWarning(async entry => { if (entry.message.startsWith('Allow shell')) { offered = true; await approval } return entry.choices[0] })
+    const decision = Promise.resolve(f.permission(run, { ...liveShell, managedApprovalRequired: true })).then(value => { done = true; return value })
+    await ancestryWait(() => offered || done); assert.equal(offered, true)
+    f.values['github.allowedActors'] = []; release()
+    assert.equal((await decision).kind, 'reject')
+    f.fireConfiguration('github.allowedActors'); await ancestryWait(() => run.signal.aborted)
+  } finally { release(); await f.close() }
+})
+
+async function nativeFieldBot(family: 'github' | 'teams') {
+  const target = family === 'github' ? 'github' : 'chat', identity = family === 'github' ? 'checks[bot]' : bot
+  const f = fixture({ ...liveConfiguration(target), [`${family}.allowedActors`]: [], [`${family}.allowedBots`]: [identity], ...(family === 'github' ? { 'github.observe': true } : {}) })
+  await f.initialize(); await f.save({ enabled: true, acceptMode: 'auto', pollIntervalMs: 3_600_000,
+    rules: [{ id: 'ordinary-bot', name: 'Approved ordinary bot repair', instruction: 'Repair only the assessed bot request', enabled: true }] })
+  f.respond(url => url.origin === 'https://graph.microsoft.com' ? { value: [] } : [])
+  f.onAssessment(prompt => prompt.includes('ORDINARY_RULED_BOT')
+    ? { kind: 'accept', title: 'Rule-authorized bot repair', scope: 'Only the ordinary assessed bot request', reason: 'Matched enabled bot rule', rules: ['ordinary-bot'] }
+    : { kind: 'ignore', reason: 'No ordinary bot work' })
+  f.onWorker(async request => { await new Promise<void>(resolve => { if (request.signal.aborted) resolve(); else request.signal.addEventListener('abort', () => resolve(), { once: true }) }) })
+  const original = liveTrigger(f, target), context = { ...original.meta.provider as SourceContext, human: false, bot: true, allowedActor: false, addressed: undefined }
+  const trigger = sourceTrigger({ id: `native-field-bot-${family}`, source: family, actor: identity, text: 'ORDINARY_RULED_BOT', thread: context.nativeThreadId, context })
+  f.runtime.engine.receive(trigger); f.chooseWarnings('Run within approved tickets', 'Keep replies local'); await f.start()
+  await ancestryWait(() => f.runs.length === 1); return { f, run: f.runs[0]!, trigger }
+}
+for (const family of ['github', 'teams'] as const) {
+  test(`native field ${family} bot removal revokes its already assessed inferred worker immediately`, async () => {
+    const { f, run } = await nativeFieldBot(family)
+    try {
+      const ticket = f.runtime.get(run.ticketId)
+      assert.equal(ticket.mandate.strength, 'inferred'); assert.deepEqual(ticket.mandate.basis.rules, ['ordinary-bot'])
+      assert.equal((await f.permission(run, liveShell)).kind, 'approve-once')
+      f.values[`${family}.allowedBots`] = []
+      assert.equal((await f.permission(run, liveShell)).kind, 'reject')
+      await assert.rejects(run.tools.find(tool => tool.name === 'orchestrator_read')!.invoke({ resource: 'ticket' }), /authoriz|revok|ended|abort/i)
+      f.fireConfiguration(`${family}.allowedBots`); await ancestryWait(() => run.signal.aborted)
+      assert.deepEqual(f.snapshot().settings.value.sources[family].allowedBots, [])
+    } finally { await f.close() }
+  })
+}
+
+test('native field observation withdrawal revokes an ordinary unaddressed inferred bot mandate', async () => {
+  const { f, run } = await nativeFieldBot('github')
+  try {
+    assert.equal((await f.permission(run, liveShell)).kind, 'approve-once')
+    f.values['github.observe'] = false
+    assert.equal((await f.permission(run, liveShell)).kind, 'reject')
+    f.fireConfiguration('github.observe'); await ancestryWait(() => run.signal.aborted)
+    assert.equal(f.snapshot().settings.value.sources.github.allowUnaddressed, false)
+    assert.deepEqual(f.snapshot().settings.value.sources.github.allowedBots, ['checks[bot]'])
+  } finally { await f.close() }
+})
+
+for (const target of ['github', 'chat'] as const) {
+  test(`native field ${target} additions admit the newly listed request through the ordinary explicit gate`, async () => {
+    const family = target === 'github' ? 'github' : 'teams', added = target === 'github' ? 'new-requester' : nativeActor, saved = target === 'github' ? 'saved-requester' : savedActor
+    const f = fixture({ ...liveConfiguration(target), [`${family}.allowedActors`]: [] })
+    try {
+      await f.initialize(); await f.save({ enabled: true, acceptMode: 'off', pollIntervalMs: 3_600_000, sources: { [family]: { allowedActors: [saved] } } })
+      f.onAssessment(() => ({ kind: 'accept', title: 'New listed requester repair', scope: 'The newly authorized explicit request', reason: 'Current native allowlist' }))
+      f.values[`${family}.allowedActors`] = [added]; f.fireConfiguration(`${family}.allowedActors`)
+      f.respond(url => target === 'github' ? url.pathname.endsWith('/issues') ? [githubIssue(901, added, 'User', '@agent NEW_NATIVE_REQUEST'), githubIssue(902, saved, 'User', '@agent OLD_DASHBOARD_REQUEST'), githubIssue(903, 'outsider', 'User', '@agent UNLISTED_REQUEST')] : []
+        : { value: [{ ...teamsMessage('901', added), mentions: [{ mentioned: { user: { id: account } } }], body: { contentType: 'text', content: 'NEW_NATIVE_REQUEST' } },
+          { ...teamsMessage('902', saved), mentions: [{ mentioned: { user: { id: account } } }], body: { contentType: 'text', content: 'OLD_DASHBOARD_REQUEST' } }] })
+      f.chooseWarnings('Run within approved tickets', 'Keep replies local'); await f.start(); await f.poll()
+      await ancestryWait(() => f.runs.length === 1 && ancestryIdle(f))
+      const ticket = f.runtime.get(f.runs[0]!.ticketId)
+      assert.equal(ticket.mandate.actor.id, added); assert.equal(ticket.mandate.strength, 'explicit')
+      assert.match(f.runs[0]!.prompt, /NEW_NATIVE_REQUEST/); assert.doesNotMatch(f.runs[0]!.prompt, /OLD_DASHBOARD_REQUEST|UNLISTED_REQUEST/)
+      assert.deepEqual(f.snapshot().settings.value.sources[family].allowedActors, [added])
+    } finally { await f.close() }
+  })
+}
+
+test('native field removal retains an operator explicit-unlisted grant for fresh addressed requests', async () => {
+  const f = fixture(liveConfiguration('github'))
+  try {
+    await f.initialize(); await f.save({ enabled: true, acceptMode: 'off', pollIntervalMs: 3_600_000, sources: { github: { admission: { unlistedAddressed: 'explicit' } } } })
+    f.values['github.allowedActors'] = []; f.fireConfiguration('github.allowedActors')
+    f.onAssessment(() => ({ kind: 'accept', title: 'Explicit wildcard request', scope: 'Only the fresh addressed wildcard request', reason: 'Operator-authorized unlisted explicit admission' }))
+    f.respond(url => url.pathname.endsWith('/issues') ? [githubIssue(904, 'owner', 'User', '@agent FRESH_EXPLICIT_OVERRIDE')] : [])
+    f.chooseWarnings('Run within approved tickets', 'Keep replies local'); await f.start(); await f.poll()
+    await ancestryWait(() => f.runs.length === 1 && ancestryIdle(f))
+    assert.equal(f.runtime.get(f.runs[0]!.ticketId).mandate.strength, 'explicit'); assert.match(f.runs[0]!.prompt, /FRESH_EXPLICIT_OVERRIDE/)
+    assert.equal(f.snapshot().settings.value.sources.github.admission!.unlistedAddressed, 'explicit')
+  } finally { await f.close() }
+})
+
+test('native field static empty native lists retain deliberately saved dashboard requester authority', async () => {
+  const f = fixture({ ...liveConfiguration('github'), 'github.allowedActors': [] })
+  try {
+    await f.initialize(); await f.save({ sources: { github: { allowedActors: ['owner'], allowedBots: ['dashboard-bot[bot]'], allowUnaddressed: true } } })
+    await liveStart(f, 'github'); const run = f.runs[0]!, before = admissionState(f)
+    assert.equal((await f.permission(run, liveShell)).kind, 'approve-once')
+    f.fireConfiguration('github.allowedActors'); await f.poll()
+    assert.equal((await f.permission(run, liveShell)).kind, 'approve-once'); assert.equal(run.signal.aborted, false)
+    assert.deepEqual(admissionState(f), before)
+  } finally { await f.close() }
+})
+
+const nativeFieldConfiguration = { 'github.repository': 'company/project', 'github.allowedActors': ['native-old'], 'github.allowedBots': ['native-bot[bot]'], 'github.observe': false,
+  'teams.tenantId': tenant, 'teams.chatIds': [chat], 'teams.allowedActors': [nativeActor], 'teams.allowedBots': [bot] }
+const nativeFieldOverrides = () => ({ enabled: true, acceptMode: 'observe', pollIntervalMs: 3_600_000,
+  sources: { github: { allowedActors: ['dashboard-saved'], allowedBots: ['dashboard-bot[bot]'], allowUnaddressed: true, admission: { unlistedAddressed: 'explicit' } },
+    teams: { allowedActors: [savedActor], allowedBots: [account], allowUnaddressed: false, admission: { unlistedAddressed: 'inferred' } } },
+  rules: [{ id: 'retained-rule', name: 'Retained operator rule', instruction: 'Preserve this rule through native projection changes', enabled: true }] })
+const nativeFieldEmpty = (url: URL) => url.origin === 'https://graph.microsoft.com' ? { value: [] } : []
+function rawNativeFields(values: Record<string, unknown>) {
+  const list = (key: string) => [...(values[key] as string[] | undefined ?? [])]
+  return { github: { enabled: !!values['github.repository'], allowedActors: list('github.allowedActors'), allowedBots: list('github.allowedBots'), allowUnaddressed: values['github.observe'] ?? false },
+    teams: { enabled: !!values['teams.tenantId'], allowedActors: list('teams.allowedActors'), allowedBots: list('teams.allowedBots'), allowUnaddressed: true } }
+}
+function seedLegacyNative(f: ReturnType<typeof fixture>, hash: string) {
+  f.runtime.repositories.mutateAutomation(data => { delete data.metadata['source-authorization-projection-v2']; data.metadata['source-configuration-fingerprint'] = hash })
+}
+const rawNativeHash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
+
+test('native field actor-only reconciliation preserves dashboard bots, observation, admission, rules and the other family without churn', async () => {
+  let current: ReturnType<typeof fixture> | undefined = fixture(nativeFieldConfiguration)
+  const directory = current.directory
+  try {
+    await current.initialize(); await current.save(nativeFieldOverrides()); const f = current, before = admissionState(f)
+    f.values['github.allowedActors'] = []; f.fireConfiguration('github.allowedActors')
+    await Promise.resolve()
+    const after = admissionState(f)
+    assert.deepEqual(after.settings.value.sources.github.allowedActors, []); assert.equal(after.settings.revision, before.settings.revision + 1)
+    assert.deepEqual(after.settings.value.sources.github.allowedBots, before.settings.value.sources.github.allowedBots)
+    assert.equal(after.settings.value.sources.github.allowUnaddressed, true)
+    assert.deepEqual(after.settings.value.sources.github.admission, before.settings.value.sources.github.admission)
+    assert.deepEqual(after.settings.value.sources.teams, before.settings.value.sources.teams); assert.deepEqual(after.settings.value.rules, before.settings.value.rules)
+    assert.equal(after.history.length, before.history.length + 1)
+    f.respond(nativeFieldEmpty); f.fireConfiguration('github.allowedActors'); await f.poll(); assert.deepEqual(admissionState(f), after)
+    await f.close(true); current = undefined
+    current = fixture({ ...nativeFieldConfiguration, 'github.allowedActors': [] }, directory)
+    await current.initialize(); current.respond(nativeFieldEmpty); await current.poll(); assert.deepEqual(admissionState(current), after)
+  } finally { if (current) await current.close(); else rmSync(directory, { recursive: true, force: true }) }
+})
+
+test('native field stale draft save reconciles a raw native actor edit before checking the submitted base revision', async () => {
+  const f = fixture(liveConfiguration('github'))
+  try {
+    await f.initialize(); await f.save({ enabled: true })
+    const before = admissionState(f), draft = structuredClone(before.settings.value)
+    draft.prompts.communication = 'This stale draft must not be committed'
+    f.values['github.allowedActors'] = []
+    await assert.rejects(f.save(draft), /revision|conflict|reload/i)
+    assert.deepEqual(f.snapshot().settings.value.sources.github.allowedActors, [])
+    assert.equal(f.snapshot().settings.value.prompts.communication, before.settings.value.prompts.communication)
+    assert.equal(f.snapshot().settings.revision, before.settings.revision + 1)
+    assert.equal(f.runtime.repositories.automation().history.length, before.history.length + 1)
+  } finally { await f.close() }
+})
+
+test('native field legacy matching raw fingerprint seeds v2 without rewriting saved settings or retained history', async () => {
+  let current: ReturnType<typeof fixture> | undefined = fixture(nativeFieldConfiguration)
+  const directory = current.directory
+  try {
+    await current.initialize(); await current.save(nativeFieldOverrides()); const before = admissionState(current)
+    seedLegacyNative(current, rawNativeHash(rawNativeFields(current.values)))
+    await current.close(true); current = undefined
+    current = fixture(nativeFieldConfiguration, directory); await current.initialize()
+    assert.deepEqual(admissionState(current), before)
+    assert.ok(current.runtime.readData('source-authorization-projection-v2'), 'The matching historical fingerprint must seed the new per-field baseline')
+    current.respond(nativeFieldEmpty); current.fireConfiguration('github.allowedActors'); await current.poll(); assert.deepEqual(admissionState(current), before)
+  } finally { if (current) await current.close(); else rmSync(directory, { recursive: true, force: true }) }
+})
+
+test('native field legacy hash-proved history patches only the changed actor field on reopen', async () => {
+  let current: ReturnType<typeof fixture> | undefined = fixture(nativeFieldConfiguration)
+  const directory = current.directory
+  try {
+    await current.initialize(); const oldNative = rawNativeFields(current.values)
+    await current.save(nativeFieldOverrides()); const before = admissionState(current)
+    seedLegacyNative(current, rawNativeHash(oldNative)); await current.close(true); current = undefined
+    current = fixture({ ...nativeFieldConfiguration, 'github.allowedActors': [] }, directory); await current.initialize()
+    const after = admissionState(current)
+    assert.deepEqual(after.settings.value.sources.github.allowedActors, [])
+    assert.deepEqual(after.settings.value.sources.github.allowedBots, before.settings.value.sources.github.allowedBots)
+    assert.equal(after.settings.value.sources.github.allowUnaddressed, true); assert.deepEqual(after.settings.value.sources.teams, before.settings.value.sources.teams)
+    assert.deepEqual(after.settings.value.sources.github.admission, before.settings.value.sources.github.admission); assert.deepEqual(after.settings.value.rules, before.settings.value.rules)
+    assert.equal(after.settings.revision, before.settings.revision + 1); assert.equal(after.history.length, before.history.length + 1)
+    assert.ok(current.runtime.readData('source-authorization-projection-v2'))
+    current.respond(nativeFieldEmpty); current.fireConfiguration('github.allowedActors'); await current.poll(); assert.deepEqual(admissionState(current), after)
+  } finally { if (current) await current.close(); else rmSync(directory, { recursive: true, force: true }) }
+})
+
+test('native field unknown nonfresh legacy baseline narrows once without adding new native identities or erasing admission', async () => {
+  const configuration = { ...nativeFieldConfiguration, 'github.allowedActors': ['native-retained', 'native-new'], 'github.allowedBots': ['native-shared[bot]', 'native-new-bot[bot]'] }
+  let current: ReturnType<typeof fixture> | undefined = fixture(configuration)
+  const directory = current.directory
+  try {
+    await current.initialize(); await current.save({ ...nativeFieldOverrides(), sources: {
+      github: { allowedActors: ['dashboard-only', 'native-retained'], allowedBots: ['dashboard-bot[bot]', 'native-shared[bot]'], allowUnaddressed: true, admission: { unlistedAddressed: 'explicit' } },
+      teams: { allowedActors: [savedActor, nativeActor], allowedBots: [account, bot], allowUnaddressed: false } } })
+    const before = admissionState(current); seedLegacyNative(current, 'f'.repeat(64)); await current.close(true); current = undefined
+    current = fixture(configuration, directory); await current.initialize(); const after = admissionState(current)
+    assert.deepEqual(after.settings.value.sources.github.allowedActors, ['native-retained'])
+    assert.deepEqual(after.settings.value.sources.github.allowedBots, ['native-shared[bot]']); assert.equal(after.settings.value.sources.github.allowUnaddressed, false)
+    assert.deepEqual(after.settings.value.sources.teams.allowedActors, [nativeActor]); assert.deepEqual(after.settings.value.sources.teams.allowedBots, [bot]); assert.equal(after.settings.value.sources.teams.allowUnaddressed, false)
+    assert.deepEqual(after.settings.value.sources.github.admission, before.settings.value.sources.github.admission); assert.deepEqual(after.settings.value.rules, before.settings.value.rules)
+    assert.equal(after.settings.revision, before.settings.revision + 1); assert.equal(after.history.length, before.history.length + 1)
+    current.respond(nativeFieldEmpty); current.fireConfiguration('github.allowedActors'); await current.poll(); assert.deepEqual(admissionState(current), after)
+    await current.save({ sources: { github: { allowedActors: ['dashboard-after-migration'] } } }); const deliberate = admissionState(current)
+    current.fireConfiguration('github.allowedActors'); await current.poll(); assert.deepEqual(admissionState(current), deliberate, 'Conservative legacy narrowing must not replace later deliberate dashboard saves when native fields are unchanged')
+  } finally { if (current) await current.close(); else rmSync(directory, { recursive: true, force: true }) }
 })

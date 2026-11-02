@@ -6,7 +6,9 @@ import type { OutboundMessage, ThreadRef, Ticket, Trigger } from '../../src/core
 import { CopilotBackend } from './copilot.ts'
 import { AutomationService } from './orchestration.ts'
 import { automationGate, sourceMayAdmit, DEFAULT_AUTOMATION_SETTINGS } from './settings.ts'
-import type { AutomationSettings } from './settings.ts'
+import type { AutomationSettings, SettingsVersion } from './settings.ts'
+import { projectNativePolicy } from './native-policy.ts'
+import type { NativePatch, NativeSources } from './native-policy.ts'
 import { admissionDisclosure, admissionReceivingScopes, broadenedAdmission } from './admission-consent.ts'
 import { SuperagentPanel, type SettingsActionResult } from './panel.ts'
 import { ticketPermission } from './permissions.ts'
@@ -39,6 +41,8 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
   let service: AutomationService | undefined, backend: CopilotBackend | undefined, owner: AutomationHost | undefined
   let initializing: Promise<AutomationService> | undefined, closing = false
   let shutdownPromise: Promise<void> | undefined
+  const nativeProjectionKey = 'source-authorization-projection-v2', legacyProjectionKey = 'source-configuration-fingerprint'
+  let appliedNative: unknown, legacyNative: unknown, nativeHistory: SettingsVersion[] = [], nativeFresh = true
   const panel = new SuperagentPanel({ snapshot: () => service ? { ...service.snapshot(), admissionWarnings: admissionDisclosure(service.settings.value, receivingConfig()), admissionScopes: admissionReceivingScopes(receivingConfig()) } : { tickets: [], settings: {}, health: { service: 'Start the service to load its configuration.' } }, action })
   const resources = new SourceResources()
   const notify = () => { hooks.changed(); panel.refresh() }
@@ -65,7 +69,7 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
     if (answer !== 'Authorize sender policy') throw new Error('Sender policy change cancelled')
   }
 
-  function sourcePolicy() {
+  function sourcePolicy(): NativeSources {
     const c = config()
     return { github: { enabled: !!c.get<string>('github.repository'), allowedActors: c.get<string[]>('github.allowedActors', []),
       allowedBots: c.get<string[]>('github.allowedBots', []), allowUnaddressed: c.get('github.observe', false) },
@@ -105,17 +109,40 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
       scopes: writing ? ['issues:write', 'pull_requests:write'] : [] }
   }
 
-  function sourceSettings() {
-    const native = sourcePolicy(), policyKey = 'source-configuration-fingerprint', policyFingerprint = fingerprint(native)
-    if (owner!.runtime.readData<string>(policyKey) !== policyFingerprint) {
-      service!.saveSettings({ sources: native }, service!.settings.revision)
-      owner!.runtime.writeData(policyKey, policyFingerprint)
+  function projectedSettings(settings: AutomationSettings): AutomationSettings {
+    return projectNativePolicy(settings, sourcePolicy(), appliedNative, legacyNative, nativeHistory, nativeFresh).value
+  }
+  function sourceSettings(members?: string[]) {
+    const saved = service!.settings
+    const plan = projectNativePolicy(saved.value, sourcePolicy(), appliedNative, legacyNative, nativeHistory, nativeFresh)
+    const patch: NativePatch = { ...plan.patch }
+    const identity = (values: string[]) => fingerprint([...new Set(values.map(value => value.toLowerCase()))].sort())
+    if (members && identity(saved.value.sources.teams.allowedActors) !== identity(members))
+      patch.teams = { ...patch.teams, allowedActors: members }
+    const changed = Object.keys(patch).length > 0
+    const record = JSON.stringify(appliedNative) !== JSON.stringify(plan.metadata) || legacyNative !== undefined
+    if (!changed && !record) return saved.value.sources
+    const previous = { appliedNative, legacyNative, nativeHistory, nativeFresh }
+    // Commit observers and policy effects must see the same applied baseline as the settings being saved.
+    appliedNative = plan.metadata; legacyNative = undefined; nativeHistory = []; nativeFresh = false
+    try {
+      owner!.runtime.repositories.atomic(() => {
+        if (changed) service!.saveSettings({ sources: patch }, saved.revision)
+        if (record) owner!.runtime.writeData(nativeProjectionKey, plan.metadata)
+        if (previous.legacyNative !== undefined) owner!.runtime.writeData(legacyProjectionKey, undefined)
+        if (plan.migration) owner!.runtime.writeData('source-authorization-projection-migration', plan.migration)
+      })
+    } catch (error) {
+      appliedNative = previous.appliedNative; legacyNative = previous.legacyNative
+      nativeHistory = previous.nativeHistory; nativeFresh = previous.nativeFresh
+      throw error
     }
     return service!.settings.value.sources
   }
 
   function sourceAdmission(family: 'github' | 'teams'): ((trigger: Trigger) => boolean) | undefined {
-    return sourceMayAdmit(service!.settings.value, family) ? trigger => automationGate(service!.settings.value, trigger).admissible : undefined
+    return sourceMayAdmit(projectedSettings(service!.settings.value), family)
+      ? trigger => automationGate(projectedSettings(service!.settings.value), trigger).admissible : undefined
   }
 
   async function poll(signal: AbortSignal): Promise<Trigger[]> {
@@ -130,7 +157,7 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
     if (sources.github.enabled) {
       try {
         const generation = () => fingerprint({ receiving: receivingConfig().github, native: sourcePolicy().github,
-          enabled: service!.settings.value.enabled, policy: service!.settings.value.sources.github, mode: service!.settings.value.acceptMode, rules: service!.settings.value.rules })
+          enabled: service!.settings.value.enabled, policy: projectedSettings(service!.settings.value).sources.github, mode: service!.settings.value.acceptMode, rules: service!.settings.value.rules })
         const expected = generation()
         const assertGitHubCurrent = () => {
           assertCurrent(); signal.throwIfAborted()
@@ -226,10 +253,10 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
         if (config().get('teams.syncMembership', false)) {
           await syncMembers(false, base, signal)
         }
-        const policy = service!.settings.value.sources.teams
+        const policy = projectedSettings(service!.settings.value).sources.teams
         base = { ...base, allowedActors: policy.allowedActors, allowedBots: policy.allowedBots,
           admit: sourceAdmission('teams') }
-        const generation = () => fingerprint({ enabled: service!.settings.value.enabled, acceptMode: service!.settings.value.acceptMode, policy: service!.settings.value.sources.teams,
+        const generation = () => fingerprint({ enabled: service!.settings.value.enabled, acceptMode: service!.settings.value.acceptMode, policy: projectedSettings(service!.settings.value).sources.teams,
           tenantId: config().get('teams.tenantId', ''), chatIds: config().get('teams.chatIds', []), channels: config().get('teams.channels', []),
           actors: config().get('teams.allowedActors', []), bots: config().get('teams.allowedBots', []) })
         const expected = generation()
@@ -292,10 +319,9 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
     const next = members.map(member => member.id)
     if (fingerprint(config().get<string[]>('teams.allowedActors', []).slice().sort()) !== fingerprint(next))
       await config().update('teams.allowedActors', next, vscode.ConfigurationTarget.Global)
-    if (service && fingerprint(service.settings.value.sources.teams.allowedActors.slice().sort()) !== fingerprint(next)) {
-      service.saveSettings({ sources: { teams: { allowedActors: next } } }, service.settings.revision)
-      owner!.runtime.writeData('source-configuration-fingerprint', fingerprint(sourcePolicy()))
-    }
+    unchanged()
+    if (fingerprint(config().get<string[]>('teams.allowedActors', []).slice().sort()) !== fingerprint(next)) throw new Error('Membership requester list changed during update')
+    if (service) sourceSettings(next)
   }
 
   async function send(message: OutboundMessage, signal: AbortSignal): Promise<void> {
@@ -326,10 +352,13 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
 
   async function get(): Promise<AutomationService> {
     assertCurrent()
-    if (service) return service
+    if (service) { sourceSettings(); return service }
     if (initializing) return initializing
     initializing = (async () => {
       const h = owner = await hooks.host()
+      const persistedNative = h.runtime.repositories.automation()
+      appliedNative = persistedNative.metadata[nativeProjectionKey]; legacyNative = persistedNative.metadata[legacyProjectionKey]
+      nativeHistory = persistedNative.history; nativeFresh = persistedNative.settings === undefined
       backend = new CopilotBackend({ cliPath: config().get<string>('copilot.cliPath', 'copilot'), onPermissionRequest: async (request, invocation) => {
         assertCurrent()
         const ticket = h.runtime.get(invocation.ticketId)
@@ -345,6 +374,7 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
       const promptParts: Record<string, string> = JSON.parse(await readFile(vscode.Uri.joinPath(context.extensionUri, 'dist', 'prompts', 'defaults.json').fsPath, 'utf8').catch(() => '{}'))
       service = new AutomationService(h.runtime, { backend, prepare: (ticket, directory) => directory === undefined ? h.trees.prepare(ticket.id) : h.trees.validate(ticket.id, directory), poll, send, changed: notify,
         systemPrompt: prompt, promptParts, claimPullRequest, canSend: () => config().get('delivery.enabled', false),
+        policySettings: projectedSettings,
         receivesSource: input => receivesNativeSource(input, receivingConfig()),
         receivesChannel: channel => receivesNativeChannel(channel, receivingConfig()),
         resolveThread: async (family, id, signal) => {
@@ -476,8 +506,9 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
 
   context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
     if (!service || closing || !['superagent.github', 'superagent.teams', 'superagent.delivery.enabled'].some(key => event.affectsConfiguration(key))) return
-    // Receiving checks read native configuration live; preserve normal partial policy/membership saves.
-    service.kick()
+    try { sourceSettings() }
+    catch { void service.stop().catch(() => {}) }
+    finally { service.kick() }
   }))
 
   const register = (name: string, callback: () => Promise<unknown>) => context.subscriptions.push(vscode.commands.registerCommand(`superagent.${name}`, () =>
