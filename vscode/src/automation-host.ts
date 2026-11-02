@@ -11,7 +11,7 @@ import { ticketPermission } from './permissions.ts'
 import type { TicketRuntime } from './runtime.ts'
 import type { Worktrees } from './worktree.ts'
 import type { GitHubSourceConfig, GitHubReviewCursor, SourceContext, TeamsBatchCursor, TeamsSourceConfig } from './sources.ts'
-import { discoverOwnPullRequests, githubThreadRef, pollDefaultBranchChecks, pollGitHub, pollGitHubChecks, pollGitHubReviewsBatch, pollTeamsBatch, readPullRequest, sourceRequest, sourceSubscription, sourceTrigger } from './sources.ts'
+import { discoverOwnPullRequests, githubThreadRef, pollDefaultBranchChecks, pollGitHub, pollGitHubChecks, pollGitHubReviewsBatch, pollTeamsBatch, readPullRequest, sourceRequest, sourceSubscription, sourceTrigger, TeamsAncestryError } from './sources.ts'
 import { resolveGitHubReviewThread } from './delivery.ts'
 import type { GitHubDeliveryCredential, TeamsDeliveryCredential } from './delivery.ts'
 import { readTeamsMembers } from './membership.ts'
@@ -180,6 +180,20 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
         const policy = service!.settings.value.sources.teams
         base = { ...base, allowedActors: policy.allowedActors, allowedBots: policy.allowedBots,
           admit: sourceAdmission('teams') }
+        const generation = () => fingerprint({ enabled: service!.settings.value.enabled, acceptMode: service!.settings.value.acceptMode, policy: service!.settings.value.sources.teams,
+          tenantId: config().get('teams.tenantId', ''), chatIds: config().get('teams.chatIds', []), channels: config().get('teams.channels', []),
+          actors: config().get('teams.allowedActors', []), bots: config().get('teams.allowedBots', []) })
+        const expected = generation()
+        const assertTeamsCurrent = () => {
+          assertCurrent(); signal.throwIfAborted()
+          if (generation() !== expected) throw new Error('Teams source changed during read; poll again with the current configuration')
+        }
+        const transport: typeof fetch = async (input, init) => {
+          assertTeamsCurrent()
+          const response = await fetch(input, init)
+          assertTeamsCurrent()
+          return response
+        }
         const scopes = [...base.chatIds.map(chat => ({ chatIds: [chat], channels: [] as TeamsSourceConfig['channels'] })),
           ...base.channels.map(channel => ({ chatIds: [] as string[], channels: [channel] }))]
         for (const scope of scopes) {
@@ -193,13 +207,14 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
               const provider = trigger.meta.provider as SourceContext | undefined
               return provider?.provider === 'teams' && trigger.threads.some(ref => activeThreads.has(threadKey(ref))) ? [String(sourceSubscription(provider))] : []
             }))]
-            const batch = await pollTeamsBatch({ ...base, ...scope, since, subscribedThreads }, previous?.cursor, signal)
+            const batch = await pollTeamsBatch({ ...base, ...scope, since, subscribedThreads }, previous?.cursor, signal, transport)
+            assertTeamsCurrent()
             commit(key, batch.items.map(sourceTrigger), { since: batch.next ? since : started, started, ...(batch.next ? { cursor: batch.next } : {}) })
           } catch (error) {
             signal.throwIfAborted()
             const reset = restartChangedScan(error, previous, 'cursor')
             if (reset) h.runtime.writeData(key, reset)
-            errors.push('A Teams scope failed; check sign-in, scope and pagination.')
+            errors.push(error instanceof TeamsAncestryError ? error.message : 'A Teams scope failed; check sign-in, scope and pagination.')
           }
         }
       } catch { signal.throwIfAborted(); errors.push('Teams source failed; sign in or check tenant consent.') }

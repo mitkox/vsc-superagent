@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import type { ThreadRef, Trigger } from '../../src/core/model.ts'
 
 interface ProviderContext {
@@ -112,6 +113,7 @@ type RecordValue = Record<string, unknown>
 export class SourceError extends Error {
   constructor(message: string, readonly status?: number) { super(message) }
 }
+export class TeamsAncestryError extends SourceError {}
 function fail(message: string): never { throw new SourceError(message) }
 const object = (value: unknown): RecordValue | undefined =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as RecordValue : undefined
@@ -591,23 +593,78 @@ export async function pollTeamsBatch(config: TeamsSourceConfig, cursor?: TeamsBa
     if (!subscribed && config.admit && !config.admit(sourceTrigger(candidate))) return
     items.push(candidate)
   }
+  let ancestorReads = 0
   for (const chat of [...new Set(config.chatIds)]) {
-    const messages = await teamsPages(`/v1.0/chats/${encodeURIComponent(chat)}/messages`, config.token, signal, transport, config.since) as RecordValue[]
-    const byId = new Map(messages.map(message => [text(message.id), message]))
-    const rootOf = (message: RecordValue): string | undefined => {
-      let root = text(message.replyToId) || teamsReferences(message, chat)[0]
-      if (!root) return
-      const seen = new Set([text(message.id)])
-      for (let depth = 0; depth < 20; depth++) {
-        if (seen.has(root)) return // Cyclic remote references cannot define an original thread.
-        seen.add(root)
-        const previous = byId.get(root), next = previous && (text(previous.replyToId) || teamsReferences(previous, chat)[0])
-        if (!next) return root
-        root = next
+    const path = `/v1.0/chats/${encodeURIComponent(chat)}/messages`
+    const rows = await teamsPages(path, config.token, signal, transport, config.since) as RecordValue[]
+    const ancestryError = (messageId: string, reason: string) => new TeamsAncestryError(`Teams chat ${chat} message ${messageId}: ${reason}. Source progress retained; restore ancestor access or inspect the quote chain before retrying.`)
+    const byId = new Map<string, RecordValue>(), roots = new Map<string, string>(), conflicting = new Set<string>()
+    for (const message of rows) {
+      const messageId = text(message.id), previous = byId.get(messageId)
+      if (!validNativeTeamsId(messageId)) continue
+      if (previous && !isDeepStrictEqual(previous, message)) {
+        const version = (row: RecordValue) => Date.parse(text(row.lastModifiedDateTime ?? row.lastEditedDateTime ?? row.createdDateTime))
+        const before = version(previous), after = version(message)
+        if (!Number.isFinite(before) || !Number.isFinite(after) || before === after) { conflicting.add(messageId); continue }
+        if (before > after) continue
       }
-      return
+      byId.set(messageId, message)
     }
-    for (const message of messages) add(message, { chatId: chat }, rootOf(message))
+    // Freeze emission before lookups add older, read-only ancestry nodes to the cache.
+    const messages = [...byId.values()]
+    const rootOf = async (message: RecordValue): Promise<string> => {
+      const originalId = text(message.id), seen = new Set<string>(), chain: string[] = []
+      let current = message
+      for (let depth = 0; depth <= 20; depth++) {
+        const currentId = text(current.id), from = object(current.from)
+        if (!validNativeTeamsId(currentId) || current.tenantId !== undefined && text(current.tenantId).toLowerCase() !== config.tenantId.toLowerCase()
+          || current.chatId !== undefined && current.chatId !== chat || current.channelIdentity != null
+          || [object(from?.user), object(from?.application)].some(actor => actor?.tenantId !== undefined && text(actor.tenantId).toLowerCase() !== config.tenantId.toLowerCase())) {
+          throw ancestryError(originalId, `ancestor ${currentId || '(invalid ID)'} does not match the configured chat and tenant`)
+        }
+        if (conflicting.has(currentId)) throw ancestryError(originalId, `conflicting versions of ${currentId} cannot be ordered; retry a stable scan`)
+        if (seen.has(currentId)) throw ancestryError(originalId, 'quote ancestry is cyclic')
+        seen.add(currentId); chain.push(currentId)
+        const known = roots.get(currentId)
+        if (known) { for (const entry of chain) roots.set(entry, known); return known }
+        if (current.replyToId != null && current.replyToId !== '' && !validNativeTeamsId(text(current.replyToId))) throw ancestryError(originalId, 'invalid replyToId')
+        const parentId = text(current.replyToId) || teamsReferences(current, chat)[0]
+        if (!parentId) {
+          if (current.deletedDateTime) throw ancestryError(originalId, `ancestor ${currentId} was deleted and its root cannot be proved`)
+          for (const entry of chain) roots.set(entry, currentId)
+          return currentId
+        }
+        if (depth === 20) throw ancestryError(originalId, 'quote ancestry exceeds the 20-level limit')
+        let parent = byId.get(parentId)
+        if (!parent) {
+          if (ancestorReads >= 50) throw ancestryError(originalId, 'quote ancestry exceeds the 50-lookup batch limit')
+          ancestorReads++
+          let value: unknown
+          try { value = (await request(new URL(`https://graph.microsoft.com${path}/${encodeURIComponent(parentId)}`), config.token, signal, transport)).value }
+          catch (error) {
+            if (signal?.aborted || !(error instanceof SourceError)) throw error
+            throw ancestryError(originalId, `ancestor ${parentId} could not be read${error.status ? ` (HTTP ${error.status})` : ''}`)
+          }
+          parent = object(value)
+          if (!parent || parent.id !== parentId) throw ancestryError(originalId, `ancestor ${parentId} returned an invalid identity`)
+          byId.set(parentId, parent)
+        }
+        current = parent
+      }
+      throw ancestryError(originalId, 'quote ancestry could not be resolved')
+    }
+    for (const message of messages) {
+      const from = object(message.from), user = object(from?.user), application = object(from?.application)
+      const actor = text(application?.id ?? user?.id), body = object(message.body)
+      const human = !!user && !application, senderAllowed = human ? allowed.has(actor.toLowerCase()) : config.allowedBots?.some(value => value.toLowerCase() === actor.toLowerCase())
+      // Ignored events need no ancestry reads; they may still prove an eligible message's parent.
+      if (!config.admit && !senderAllowed && !config.subscribedThreads?.some(thread => thread.startsWith(`chat:${chat}:`))) continue
+      if (!validNativeTeamsId(text(message.id)) || !UUID.test(actor) || actor.toLowerCase() === config.accountId?.toLowerCase()
+        || message.deletedDateTime || message.messageType !== 'message' || !body
+        || user?.tenantId !== undefined && text(user.tenantId).toLowerCase() !== config.tenantId.toLowerCase()
+        || !recent(message.lastModifiedDateTime ?? message.createdDateTime, config.since) || !teamsText(body).trim()) continue
+      add(message, { chatId: chat }, await rootOf(message))
+    }
   }
   for (const channel of config.channels) {
     const path = `/v1.0/teams/${encodeURIComponent(channel.teamId)}/channels/${encodeURIComponent(channel.channelId)}/messages`

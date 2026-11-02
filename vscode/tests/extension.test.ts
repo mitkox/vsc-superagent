@@ -885,3 +885,63 @@ test("native PR reports use collector identity and merged readback closes them a
     await assert.rejects(f.invoke("superagent_snapshot"), /ended/i);
   } finally { f.close(); }
 });
+
+
+test("native Teams import retries unresolved ancestry without advancing its cursor and preserves the proven original root", async () => {
+  const f = fixture(), tenant = "11111111-1111-1111-1111-111111111111", actor = "22222222-2222-2222-2222-222222222222";
+  const chat = "19:intake@thread.v2", path = `/v1.0/chats/${encodeURIComponent(chat)}/messages`;
+  const quote = (id: string) => [{ contentType: "messageReference", content: JSON.stringify({ messageId: id }) }];
+  const originalUrl = `https://teams.microsoft.com/l/message/${encodeURIComponent(chat)}/102`;
+  const row = (id: string, parent?: string) => ({ id, messageType: "message", from: { user: { id: actor, tenantId: tenant } },
+    lastModifiedDateTime: id === "102" ? new Date().toISOString() : "2020-01-01T00:00:00Z",
+    body: { contentType: "text", content: id === "102" ? "Approved missing-parent follow-up" : "Historical read-only ancestry" },
+    ...(parent ? { attachments: quote(parent) } : {}), ...(id === "102" ? { webUrl: originalUrl } : {}) });
+  let broken = true;
+  try {
+    f.values["superagent.teams.tenantId"] = tenant;
+    f.values["superagent.teams.chatIds"] = [chat];
+    f.values["superagent.teams.allowedActors"] = [actor];
+    f.response((url: URL) => url.pathname === path ? { value: [row("102", "101")] }
+      : url.pathname === `${path}/101` ? (broken ? row("wrong-id") : row("101", "100")) : row("100"));
+    await f.command("poll");
+    assert.equal(f.errors.length, 1); assert.match(f.errors[0]!, /ancestr|identity/i);
+    assert.equal(f.state.size, 0);
+    assert.deepEqual(f.requests.map(url => url.pathname), [path, `${path}/101`]);
+    broken = false; f.errors.length = 0; f.reload();
+    f.choices.push("Approve new ticket"); await f.command("poll");
+    assert.deepEqual(f.errors, []); assert.equal(f.state.size, 2);
+    f.choices.push("first", "Open isolated worktree"); await f.command("open"); f.reload();
+    let snapshot = JSON.parse((await f.invoke("superagent_snapshot")).content[0]!.value);
+    assert.equal(snapshot.messages.length, 1);
+    assert.equal(snapshot.messages[0].text, "Approved missing-parent follow-up");
+    assert.equal(snapshot.messages[0].meta.provider.rootMessageId, "100");
+    assert.deepEqual(snapshot.messages[0].meta.provider.referencedMessageIds, ["101"]);
+    assert.equal(snapshot.messages[0].url, originalUrl);
+    assert.equal(snapshot.messages[0].meta.externalOrigin.thread, `chat:${chat}:100`);
+    await f.command("poll");
+    snapshot = JSON.parse((await f.invoke("superagent_snapshot")).content[0]!.value);
+    assert.equal(snapshot.messages.length, 1); assert.equal(f.state.size, 2);
+    assert.ok(f.requests.every(url => url.origin === "https://graph.microsoft.com" && (url.pathname === path || url.pathname === `${path}/101` || url.pathname === `${path}/100`)));
+  } finally { f.close(); }
+});
+
+test("native Teams ancestry reads revalidate source scope before continuing or importing", async () => {
+  const f = fixture(), tenant = "11111111-1111-1111-1111-111111111111", actor = "22222222-2222-2222-2222-222222222222";
+  const chat = "19:intake@thread.v2", path = `/v1.0/chats/${encodeURIComponent(chat)}/messages`;
+  const row = (id: string, replyToId?: string) => ({ id, messageType: "message", from: { user: { id: actor, tenantId: tenant } },
+    lastModifiedDateTime: new Date().toISOString(), body: { contentType: "text", content: "Authorized only in unchanged native scope" }, ...(replyToId ? { replyToId } : {}) });
+  let revoke = true;
+  try {
+    f.values["superagent.teams.tenantId"] = tenant; f.values["superagent.teams.chatIds"] = [chat]; f.values["superagent.teams.allowedActors"] = [actor];
+    f.response((url: URL) => {
+      if (url.pathname === path) return { value: [row("102", "101")] };
+      if (url.pathname === `${path}/101`) { if (revoke) f.values["superagent.teams.allowedActors"] = []; return row("101", "100"); }
+      assert.equal(url.pathname, `${path}/100`); return row("100");
+    });
+    f.choices.push("Approve new ticket"); await f.command("poll");
+    assert.match(f.errors.at(-1)!, /configuration changed/);
+    assert.equal(f.state.size, 0); assert.deepEqual(f.requests.map(url => url.pathname), [path, `${path}/101`]);
+    revoke = false; f.errors.length = 0; f.values["superagent.teams.allowedActors"] = [actor]; await f.command("poll");
+    assert.deepEqual(f.errors, []); assert.equal(f.state.size, 2);
+  } finally { f.close(); }
+});

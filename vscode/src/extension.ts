@@ -591,6 +591,14 @@ export function activate(context: vscode.ExtensionContext): void {
           },
           cursor,
           abort.signal,
+          async (input, init) => {
+            verifySources(fingerprint);
+            abort.signal.throwIfAborted();
+            const response = await fetch(input, init);
+            verifySources(fingerprint);
+            abort.signal.throwIfAborted();
+            return response;
+          },
         );
       };
       for (const chat of [...new Set(chatIds)])

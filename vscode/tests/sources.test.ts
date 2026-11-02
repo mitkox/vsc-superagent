@@ -5,7 +5,7 @@ import { automationGate, validateSettings } from '../src/settings.ts'
 import type { AutomationSettings } from '../src/settings.ts'
 import type { Trigger } from '../../src/core/index.ts'
 import { pollTeams, pollTeamsBatch, pollGitHub, pollGitHubReviewsBatch, readPullRequest, sourceTrigger, sourceSubscription,
-  githubThreadRef, discoverOwnPullRequests, pollGitHubChecks, readGitHubThread, type GitHubSourceConfig } from '../src/sources.ts'
+  githubThreadRef, discoverOwnPullRequests, pollGitHubChecks, readGitHubThread, SourceError, type GitHubSourceConfig } from '../src/sources.ts'
 
 const config: GitHubSourceConfig = {
   origin: 'https://api.github.com', repository: 'company/project', account: 'agent', allowedActors: ['Alice'], token: 'secret-token',
@@ -520,7 +520,7 @@ test('subscribed Teams roots receive other humans and bot replies and exclude na
 test('Teams quoted chat followups bind the original subscribed root and reject cross-chat quote links', async () => {
   const quoted = (chat: string) => `<blockquote itemid="https://teams.microsoft.com/l/message/${encodeURIComponent(chat)}/100">original</blockquote><p>Followup</p>`
   const input = { ...teams, allowedActors: [], subscribedThreads: ['chat:19:chat@thread.v2:100'] }
-  const result = await pollTeams(input, undefined, async () => json({ value: [
+  const result = await pollTeams(input, undefined, async request => json(new URL(String(request)).pathname.endsWith('/messages/100') ? message('100') : { value: [
     message('101', { from: { user: { id: teamId } }, body: { contentType: 'html', content: quoted(teams.chatIds[0]!) } }),
     message('102', { from: { user: { id: teamId } }, body: { contentType: 'html', content: quoted('other-chat') } }),
   ] }))
@@ -662,4 +662,195 @@ test('source admission callback configuration is validated before any request', 
   const fetcher: typeof fetch = async () => { assert.fail('Invalid callback must prevent network activity') }
   await assert.rejects(pollGitHub({ ...config, admit: true as never }, undefined, fetcher), /Invalid source configuration/)
   await assert.rejects(pollTeams({ ...teams, admit: true as never }, undefined, fetcher), /Invalid source configuration/)
+})
+
+
+const quoteReference = (messageId: string) => [{ contentType: 'messageReference', content: JSON.stringify({ messageId, messagePreview: 'Untrusted quote preview' }) }]
+const chatPath = (chat = teams.chatIds[0]!) => `/v1.0/chats/${encodeURIComponent(chat)}/messages`
+const ancestryError = (error: unknown): boolean => {
+  assert.ok(error instanceof SourceError)
+  assert.equal(error.constructor.name, 'TeamsAncestryError')
+  assert.match(error.message, /Source progress retained/)
+  assert.doesNotMatch(error.message, /teams-secret|private-graph-token/)
+  return true
+}
+
+test('Teams missing quote ancestry resolves the subscribed root with scoped cached reads and never emits fetched context', async () => {
+  const paths: string[] = [], originalUrl = `https://teams.microsoft.com/l/message/${encodeURIComponent(teams.chatIds[0]!)}/102`
+  const leaf = message('102', { from: { user: { id: teamId, tenantId: tenant } }, attachments: quoteReference('101'),
+    lastModifiedDateTime: '2026-11-02T00:00:00Z', webUrl: originalUrl })
+  const input = { ...teams, allowedActors: [], accountId: actor, since: '2026-11-01T00:00:00Z', subscribedThreads: [`chat:${teams.chatIds[0]}:100`] }
+  const items = await pollTeams(input, undefined, async (request, init) => {
+    const url = new URL(String(request)); paths.push(url.pathname)
+    assert.equal(url.origin, 'https://graph.microsoft.com'); assert.equal(init?.method, 'GET'); assert.equal(init?.redirect, 'error')
+    assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer teams-secret')
+    if (url.pathname === chatPath()) return json({ value: [leaf, { ...leaf, id: '103' }] })
+    assert.equal(url.search, '')
+    if (url.pathname === `${chatPath()}/101`) return json(message('101', { attachments: quoteReference('100'), lastModifiedDateTime: '2020-01-01T00:00:00Z', webUrl: 'https://evil.example/never-fetch' }))
+    assert.equal(url.pathname, `${chatPath()}/100`)
+    return json(message('100', { lastModifiedDateTime: '2020-01-01T00:00:00Z' }))
+  })
+  assert.deepEqual(paths, [chatPath(), `${chatPath()}/101`, `${chatPath()}/100`])
+  assert.equal(items.length, 2)
+  assert.ok(items.every(item => item.thread === `chat:${teams.chatIds[0]}:100`))
+  assert.deepEqual(items.map(item => item.context?.provider === 'teams' && item.context.messageId), ['102', '103'])
+  const context = items[0]!.context!
+  assert.equal(context.provider === 'teams' && context.rootMessageId, '100')
+  assert.deepEqual(context.provider === 'teams' && context.referencedMessageIds, ['101'])
+  assert.equal(items[0]!.url, originalUrl)
+  assert.deepEqual(sourceTrigger(items[0]!).threads.map(thread => thread.id), ['100', '101'])
+})
+
+test('Teams ancestry caches native IDs separately in each configured chat', async () => {
+  const chats = [teams.chatIds[0]!, '19:second@thread.v2'], paths: string[] = []
+  const items = await pollTeams({ ...teams, chatIds: chats }, undefined, async request => {
+    const url = new URL(String(request)); paths.push(url.pathname)
+    const chat = chats.find(chat => url.pathname.startsWith(`${chatPath(chat)}/`) || url.pathname === chatPath(chat))!
+    const root = chat === chats[0] ? '100' : '200'
+    if (url.pathname === chatPath(chat)) return json({ value: [message('102', { replyToId: '101' })] })
+    if (url.pathname.endsWith('/101')) return json(message('101', { replyToId: root }))
+    return json(message(root))
+  })
+  assert.deepEqual(items.map(item => item.thread), [`chat:${chats[0]}:100`, `chat:${chats[1]}:200`])
+  assert.equal(paths.length, 6)
+  assert.ok(chats.every(chat => paths.filter(path => path === `${chatPath(chat)}/101`).length === 1))
+})
+
+test('Teams cyclic ancestry fails the batch rather than inventing a new root', async () => {
+  for (const parentsInList of [true, false]) {
+    let lookups = 0
+    await assert.rejects(pollTeams(teams, undefined, async request => {
+      const url = new URL(String(request))
+      if (url.pathname === chatPath()) return json({ value: [message('102', { replyToId: '101' }),
+        ...parentsInList ? [message('101', { replyToId: '102' })] : []] })
+      lookups++; assert.equal(url.pathname, `${chatPath()}/101`)
+      return json(message('101', { replyToId: '102' }))
+    }), ancestryError)
+    assert.equal(lookups, parentsInList ? 0 : 1)
+  }
+})
+
+test('Teams ancestry obeys its depth bound and never fetches a twenty-first missing node', async () => {
+  for (const withinLimit of [true, false]) {
+    let lookups = 0
+    const read = pollTeams(teams, undefined, async request => {
+      const url = new URL(String(request))
+      if (url.pathname === chatPath()) return json({ value: [message('leaf', { replyToId: 'p0' })] })
+      const current = Number(url.pathname.split('/').at(-1)!.slice(1)); lookups++
+      assert.ok(current < 20)
+      return json(message(`p${current}`, current === 19 && withinLimit ? {} : { replyToId: `p${current + 1}` }))
+    })
+    if (withinLimit) assert.equal((await read)[0]?.thread, `chat:${teams.chatIds[0]}:p19`)
+    else await assert.rejects(read, ancestryError)
+    assert.equal(lookups, 20)
+  }
+})
+
+test('Teams missing-node lookup budget is shared across chats and fails before a fifty-first read', async () => {
+  const chats = [teams.chatIds[0]!, '19:second@thread.v2']
+  let lookups = 0, lists = 0
+  await assert.rejects(pollTeamsBatch({ ...teams, chatIds: chats }, undefined, undefined, async request => {
+    const url = new URL(String(request))
+    if (chats.some(chat => url.pathname === chatPath(chat))) {
+      lists++
+      return json({ value: Array.from({ length: 26 }, (_, index) => message(`child-${index}`, { replyToId: `parent-${index}` })) })
+    }
+    lookups++
+    assert.ok(lookups <= 50)
+    return json(message(decodeURIComponent(url.pathname.split('/').at(-1)!)))
+  }), ancestryError)
+  assert.equal(lists, 2); assert.equal(lookups, 50)
+})
+
+test('Teams rejects malformed direct reply IDs before constructing a lookup URL', async () => {
+  for (const replyToId of ['../me', 'https://evil.example/token', 'bad/id', 101]) {
+    let requests = 0
+    await assert.rejects(pollTeams(teams, undefined, async () => {
+      requests++; assert.equal(requests, 1)
+      return json({ value: [message('102', { replyToId })] })
+    }), ancestryError)
+    assert.equal(requests, 1)
+  }
+})
+
+test('Teams ancestry rejects missing deleted and mismatched native parent records before returning a batch', async () => {
+  const bad = [new Response('{}', { status: 404 }), message('wrong-id'), message('101', { deletedDateTime: '2026-11-01T00:00:00Z' }),
+    message('101', { chatId: '19:unapproved@thread.v2' }), message('101', { tenantId: teamId }),
+    message('101', { from: { user: { id: actor, tenantId: teamId } } })]
+  for (const parent of bad) {
+    let requests = 0
+    await assert.rejects(pollTeamsBatch(teams, undefined, undefined, async request => {
+      requests++
+      if (new URL(String(request)).pathname === chatPath()) return json({ value: [message('102', { replyToId: '101' })] })
+      assert.equal(new URL(String(request)).pathname, `${chatPath()}/101`)
+      return parent instanceof Response ? parent : json(parent)
+    }), ancestryError)
+    assert.equal(requests, 2)
+  }
+})
+
+test('Teams ancestry lookup remains abortable and irrelevant old self deleted or empty children need no lookup', async () => {
+  const controller = new AbortController()
+  let requests = 0
+  await assert.rejects(pollTeams(teams, controller.signal, async request => {
+    requests++
+    if (new URL(String(request)).pathname === chatPath()) return json({ value: [message('102', { replyToId: '101' })] })
+    return new Response(new ReadableStream<Uint8Array>({ start() { setTimeout(() => controller.abort(), 10) } }))
+  }), /Source request cancelled/)
+  assert.equal(requests, 2)
+  requests = 0
+  const items = await pollTeams({ ...teams, accountId: actor, allowedActors: [teamId], since: '2026-11-01T00:00:00Z' }, undefined, async request => {
+    requests++; assert.equal(new URL(String(request)).pathname, chatPath())
+    const row = { from: { user: { id: teamId, tenantId: tenant } }, lastModifiedDateTime: '2026-11-02T00:00:00Z', replyToId: 'missing' }
+    return json({ value: [message('old', { ...row, lastModifiedDateTime: '2020-01-01T00:00:00Z' }),
+      message('self', { ...row, from: { user: { id: actor } } }), message('deleted', { ...row, deletedDateTime: '2026-11-02T00:00:00Z' }),
+      message('empty', { ...row, body: { contentType: 'text', content: '' } }), message('system', { ...row, messageType: 'systemEventMessage' }),
+      message('unlisted', { ...row, from: { user: { id: '44444444-4444-4444-4444-444444444444', tenantId: tenant } } }),
+      message('unlisted-bot', { ...row, from: { application: { id: '55555555-5555-5555-5555-555555555555' } } })] })
+  })
+  assert.equal(items.length, 0); assert.equal(requests, 1)
+})
+
+
+test('Teams coalesces an edited quoted parent before caching roots and emits only its latest version', async () => {
+  const old = message('101', { attachments: quoteReference('100'), lastModifiedDateTime: '2026-11-01T00:00:00Z', body: { contentType: 'text', content: 'Old quote' } })
+  const edited = message('101', { attachments: quoteReference('200'), lastModifiedDateTime: '2026-11-02T00:00:00Z', body: { contentType: 'text', content: 'Edited quote' } })
+  const paths: string[] = []
+  const items = await pollTeams(teams, undefined, async request => {
+    const path = new URL(String(request)).pathname; paths.push(path)
+    if (path === chatPath()) return json({ value: [old, edited, message('102', { attachments: quoteReference('101') })] })
+    assert.equal(path, `${chatPath()}/200`)
+    return json(message('200'))
+  })
+  assert.equal(items.length, 2)
+  assert.deepEqual(items.map(item => item.text), ['Edited quote', 'Fix & test\nplease'])
+  assert.ok(items.every(item => item.thread === `chat:${teams.chatIds[0]}:200`))
+  assert.deepEqual(paths, [chatPath(), `${chatPath()}/200`])
+})
+
+test('Teams conflicting duplicate native IDs without a provably newer version fail before ancestry reads', async () => {
+  let requests = 0
+  await assert.rejects(pollTeams(teams, undefined, async () => {
+    requests++; assert.equal(requests, 1)
+    return json({ value: [message('101', { attachments: quoteReference('100') }), message('101', { attachments: quoteReference('200') })] })
+  }), ancestryError)
+  assert.equal(requests, 1)
+})
+
+
+test('Teams duplicate batch and ancestor rows with recursively reordered object keys resolve once without a false conflict', async () => {
+  const reorder = (value: unknown): unknown => Array.isArray(value) ? value.map(reorder)
+    : value !== null && typeof value === 'object' ? Object.fromEntries(Object.entries(value).reverse().map(([key, entry]) => [key, reorder(entry)])) : value
+  const version = '2026-11-02T00:00:00Z'
+  const leaf = message('102', { from: { user: { id: teamId, tenantId: tenant } }, lastModifiedDateTime: version, attachments: quoteReference('101') })
+  const parent = message('101', { from: { user: { id: teamId, tenantId: tenant } }, lastModifiedDateTime: version, attachments: quoteReference('100') })
+  const root = message('100', { lastModifiedDateTime: version })
+  let requests = 0
+  const items = await pollTeams({ ...teams, allowedActors: [teamId], accountId: actor }, undefined, async request => {
+    requests++; assert.equal(new URL(String(request)).pathname, chatPath())
+    return json({ value: [leaf, reorder(leaf), parent, reorder(parent), root, reorder(root)] })
+  })
+  assert.equal(requests, 1); assert.equal(items.length, 2)
+  assert.deepEqual(items.map(item => item.context?.provider === 'teams' && item.context.messageId), ['102', '101'])
+  assert.ok(items.every(item => item.thread === `chat:${teams.chatIds[0]}:100`))
 })

@@ -80,7 +80,8 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
       if (url.pathname === '/repos/company/project') return Response.json({ default_branch: 'main' })
       if (url.pathname.endsWith('/branches/main')) return Response.json({ commit: { sha: head } })
       if (url.pathname.endsWith('/check-runs')) return Response.json({ check_runs: [] })
-      return Response.json(await response(url, init))
+      const result = await response(url, init)
+      return result instanceof Response ? result : Response.json(result)
     },
   })
   const lifecycle = module.exports.activateAutomation({ subscriptions: [], extensionUri: {} }, {
@@ -97,6 +98,7 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
     onWorker: (handler: (request: AgentRun) => Promise<void>) => { worker = handler }, get credentials() { return credentials },
     initialize: () => commands.get('superagent.dashboard')!(),
     start: () => commands.get('superagent.startService')!(),
+    stop: () => panel.action({ action: 'stopService' }),
     save: (value: unknown) => panel.action({ action: 'saveSettings', revision: snapshot().settings.revision, value }),
     restore: (revision: number) => panel.action({ action: 'restoreSettings', revision, baseRevision: snapshot().settings.revision }),
     poll: () => panel.action({ action: 'poll' }),
@@ -900,5 +902,172 @@ for (const choice of ['Confirm each tool', 'Run within approved tickets'] as con
       assert.equal(f.values['execution.permissionMode'], choice === 'Run within approved tickets' ? 'ticket' : 'ask')
       assert.equal(f.values['delivery.enabled'], false)
     } finally { await f.close() }
+  })
+}
+
+
+async function ancestryWait(check: () => boolean, label = 'Teams ancestry integration did not settle') {
+  const until = Date.now() + 4000
+  while (!check()) { if (Date.now() > until) assert.fail(label); await new Promise(resolve => setTimeout(resolve, 5)) }
+}
+const ancestryPath = (chatId: string, id?: string) => `/v1.0/chats/${encodeURIComponent(chatId)}/messages${id ? `/${id}` : ''}`
+function ancestryMessages() {
+  const quote = (id: string, parent: string, actor: string) => ({ ...teamsMessage(id, actor), chatId: chat,
+    createdDateTime: id === '102' ? new Date().toISOString() : '2026-01-01T00:00:00.000Z',
+    webUrl: `https://teams.microsoft.com/l/message/${encodeURIComponent(chat)}/${id}`,
+    attachments: [{ contentType: 'messageReference', content: JSON.stringify({ messageId: parent }) }],
+    body: { contentType: 'html', content: `<blockquote itemid="https://teams.microsoft.com/l/message/${encodeURIComponent(chat)}/${parent}">Earlier message ${parent}</blockquote><p>${id === '102' ? 'Authorized incremental follow-up' : 'Historical intermediate quote'}</p>` } })
+  return { root: { ...teamsMessage('100', nativeActor), chatId: chat, createdDateTime: '2026-01-01T00:00:00.000Z' },
+    intermediate: quote('101', '100', savedActor), latest: quote('102', '101', nativeActor) }
+}
+const ancestryCursorKey = (f: ReturnType<typeof fixture>) => Object.keys(f.runtime.repositories.automation().metadata).find(key => key.startsWith('source:teams:'))!
+const ancestryIdle = (f: ReturnType<typeof fixture>) => !f.runtime.repositories.automation().effects.some(effect => ['start', 'deliver'].includes(effect.kind) && ['pending', 'running'].includes(effect.status))
+function ancestryWorker(f: ReturnType<typeof fixture>) {
+  f.onWorker(async request => {
+    await new Promise(resolve => setTimeout(resolve, 5))
+    await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'waiting', summary: 'Waiting on the approved root100 conversation' })
+  })
+}
+async function startAncestryTicket(f: ReturnType<typeof fixture>) {
+  await f.initialize(); await f.save({ enabled: true, acceptMode: 'off', pollIntervalMs: 3_600_000 })
+  f.respond(() => ({ value: [] }))
+  const context: SourceContext = { provider: 'teams', sourceConfigId: 'approved-root100', tenantId: tenant, chatId: chat,
+    rootMessageId: '100', messageId: '100', nativeThreadId: '100', human: true, bot: false, allowedActor: true, subscribed: false }
+  const ticket = f.runtime.create('Handle the approved root100 conversation', { source: 'teams', id: 'approved-root100', actor: nativeActor, context,
+    url: `https://teams.microsoft.com/l/message/${encodeURIComponent(chat)}/100` })
+  ancestryWorker(f); f.chooseWarnings('Confirm each tool', 'Keep replies local'); await f.start()
+  await ancestryWait(() => f.runs.length === 1 && ancestryIdle(f) && !!ancestryCursorKey(f))
+  return { ticketId: ticket.id, sessionId: f.runs[0]!.sessionId, originId: ticket.origin.triggerId, cursorKey: ancestryCursorKey(f) }
+}
+function ancestryResponse(messages: ReturnType<typeof ancestryMessages>, url: URL) {
+  if (url.pathname === ancestryPath(chat)) return { value: [messages.latest] }
+  if (url.pathname === ancestryPath(chat, '101')) return messages.intermediate
+  if (url.pathname === ancestryPath(chat, '100')) return messages.root
+  return { value: [] }
+}
+
+test('Teams incremental quote ancestry reaches the same root100 worker and persistent session across polling and reopen', async () => {
+  const configuration = { 'teams.tenantId': tenant, 'teams.chatIds': [chat], 'teams.allowedActors': [nativeActor] }
+  let current: ReturnType<typeof fixture> | undefined = fixture(configuration)
+  const directory = current.directory, messages = ancestryMessages()
+  try {
+    const f = current, original = await startAncestryTicket(f), mandate = structuredClone(f.runtime.get(original.ticketId).mandate)
+    f.respond(url => ancestryResponse(messages, url)); await f.poll()
+    const trigger = f.runtime.repositories.snapshot().triggers.find(trigger => (trigger.meta.provider as { messageId?: string } | undefined)?.messageId === '102')!
+    assert.ok(trigger)
+    assert.equal((trigger.meta.provider as { rootMessageId: string }).rootMessageId, '100', 'An absent immediate quote target must not be guessed to be the conversation root')
+    await ancestryWait(() => f.runs.length === 2 && ancestryIdle(f))
+    const followup = f.runs[1]!
+    assert.equal(followup.ticketId, original.ticketId); assert.equal(followup.sessionId, original.sessionId)
+    assert.equal(trigger.channel!.thread, `${trigger.source}:100`)
+    assert.equal(trigger.channel!.address.rootMessageId, '100')
+    assert.equal(trigger.channel!.address.messageId, '102')
+    assert.equal(trigger.url, messages.latest.webUrl)
+    assert.deepEqual((trigger.meta.provider as { referencedMessageIds: string[] }).referencedMessageIds, ['101'])
+    assert.ok(trigger.threads.some(ref => ref.id === '100')); assert.ok(trigger.threads.some(ref => ref.id === '101'))
+    assert.ok(followup.prompt.includes('Authorized incremental follow-up'))
+    assert.ok(f.requests.some(({ url }) => url.pathname === ancestryPath(chat, '101') && url.search === ''))
+    assert.ok(f.requests.filter(({ url }) => url.pathname.includes('/messages/')).every(({ url, authorization }) => url.origin === 'https://graph.microsoft.com'
+      && [ancestryPath(chat, '101'), ancestryPath(chat, '100')].includes(url.pathname) && authorization === 'Bearer graph-credential'))
+    const verify = (host: ReturnType<typeof fixture>) => {
+      const events = host.runtime.repositories.snapshot().triggers
+      assert.equal(events.filter(event => event.id === trigger.id).length, 1)
+      assert.equal(events.some(event => (event.meta.provider as { messageId?: string } | undefined)?.messageId === '101'), false, 'Fetched ancestors are not new inbox triggers')
+      assert.equal(host.runtime.list().length, 1)
+      assert.deepEqual(host.runtime.get(original.ticketId).mandate, mandate)
+      assert.equal(host.runtime.get(original.ticketId).inputs.filter(input => input.kind === 'trigger' && input.triggerId === trigger.id).length, 1)
+    }
+    verify(f); await f.poll(); await new Promise(resolve => setTimeout(resolve, 15)); verify(f); assert.equal(f.runs.length, 2)
+    const cursor = f.runtime.readData(original.cursorKey)
+    await f.close(true); current = undefined
+    current = fixture(configuration, directory); const reopened = current
+    await reopened.initialize(); ancestryWorker(reopened); reopened.respond(url => ancestryResponse(messages, url))
+    assert.deepEqual(reopened.runtime.readData(original.cursorKey), cursor)
+    reopened.chooseWarnings('Confirm each tool', 'Keep replies local'); await reopened.start(); await reopened.poll()
+    await new Promise(resolve => setTimeout(resolve, 25)); verify(reopened)
+    assert.equal(reopened.runs.length, 0, 'Repeated source polling after restart must not repeat already-read work')
+    assert.equal(reopened.runtime.repositories.automation().sessions.find(session => session.ticketId === original.ticketId)!.sessionId, original.sessionId)
+  } finally { if (current) await current.close(); else rmSync(directory, { recursive: true, force: true }) }
+})
+
+test('Teams failed ancestry retains its cursor while another scope commits and later recovery resumes the same worker', async () => {
+  const otherChat = '19:independent@thread.v2'
+  const configuration = { 'teams.tenantId': tenant, 'teams.chatIds': [chat], 'teams.allowedActors': [nativeActor] }
+  let current: ReturnType<typeof fixture> | undefined = fixture(configuration)
+  const directory = current.directory, messages = ancestryMessages()
+  try {
+    const f = current, original = await startAncestryTicket(f), before = f.runtime.readData(original.cursorKey)
+    f.values['teams.chatIds'] = [chat, otherChat]
+    const independent = { ...teamsMessage('900', nativeActor), chatId: otherChat, mentions: [{ mentioned: { user: { id: account } } }],
+      body: { contentType: 'text', content: 'Independent approved scope progressed' } }
+    const respond = (missing: boolean, url: URL) => {
+      if (url.pathname === ancestryPath(otherChat)) return { value: [independent] }
+      if (url.pathname === ancestryPath(chat, '101') && missing) return Response.json({ error: { code: 'NotFound', message: 'Missing ancestor101' } }, { status: 404 })
+      return ancestryResponse(messages, url)
+    }
+    f.respond(url => respond(true, url))
+    await assert.rejects(f.poll(), /Teams|ancestor|ancestr|thread/i)
+    assert.deepEqual(f.runtime.readData(original.cursorKey), before)
+    assert.equal(f.runtime.repositories.snapshot().triggers.some(trigger => (trigger.meta.provider as { messageId?: string } | undefined)?.messageId === '102'), false)
+    assert.ok(f.runtime.repositories.snapshot().triggers.some(trigger => trigger.text === 'Independent approved scope progressed'))
+    const otherKeys = Object.keys(f.runtime.repositories.automation().metadata).filter(key => key.startsWith('source:teams:') && key !== original.cursorKey)
+    assert.equal(otherKeys.length, 1); assert.ok(f.runtime.readData(otherKeys[0]!))
+    assert.match(f.runtime.repositories.automation().health.at(-1)!.error, /ancestor|ancestr|unverif|lookup|reply.*(?:root|thread)/i)
+    assert.equal(f.runs.length, 1)
+    await f.close(true); current = undefined
+    const recoveredConfiguration = { ...configuration, 'teams.chatIds': [chat, otherChat] }
+    current = fixture(recoveredConfiguration, directory); const reopened = current
+    await reopened.initialize(); ancestryWorker(reopened); reopened.respond(url => respond(false, url))
+    assert.deepEqual(reopened.runtime.readData(original.cursorKey), before)
+    reopened.chooseWarnings('Confirm each tool', 'Keep replies local'); await reopened.start(); await reopened.poll()
+    await ancestryWait(() => reopened.runs.length === 1 && ancestryIdle(reopened))
+    assert.equal(reopened.runs[0]!.ticketId, original.ticketId); assert.equal(reopened.runs[0]!.sessionId, original.sessionId)
+    const latest = reopened.runtime.repositories.snapshot().triggers.find(trigger => (trigger.meta.provider as { messageId?: string } | undefined)?.messageId === '102')!
+    assert.equal((latest.meta.provider as { rootMessageId: string }).rootMessageId, '100')
+    assert.notDeepEqual(reopened.runtime.readData(original.cursorKey), before)
+    await reopened.poll(); await new Promise(resolve => setTimeout(resolve, 15)); assert.equal(reopened.runs.length, 1)
+  } finally { if (current) await current.close(); else rmSync(directory, { recursive: true, force: true }) }
+})
+
+for (const change of ['native source', 'saved policy', 'accept mode', 'cancellation'] as const) {
+  test(`Teams ancestry lookup cannot commit after late ${change}`, async () => {
+    const f = fixture({ 'teams.tenantId': tenant, 'teams.chatIds': [chat], 'teams.allowedActors': [nativeActor] })
+    let release!: () => void, started = false, finished = false
+    const ancestor = new Promise<void>(resolve => { release = resolve })
+    try {
+      const original = await startAncestryTicket(f), before = f.runtime.readData(original.cursorKey), messages = ancestryMessages()
+      if (change === 'accept mode') {
+        await f.save({ sources: { teams: { allowedActors: [], admission: { unlistedAddressed: 'inferred' } } } })
+        Object.assign(messages.latest, { mentions: [{ mentioned: { user: { id: account } } }] })
+      }
+      f.respond(async url => {
+        if (url.pathname === ancestryPath(chat, '101')) { started = true; await ancestor }
+        return ancestryResponse(messages, url)
+      })
+      const poll = f.poll().then(() => { finished = true; return undefined }, error => { finished = true; return error })
+      await ancestryWait(() => started || finished)
+      assert.equal(started, true, 'The incremental reply must verify its absent parent before committing a cursor')
+      let stopping: Promise<unknown> | undefined
+      if (change === 'native source') f.values['teams.chatIds'] = ['19:replacement@thread.v2']
+      else if (change === 'saved policy') await f.save({ sources: { teams: { allowedActors: [] } } })
+      else if (change === 'accept mode') await f.save({ acceptMode: 'observe' })
+      else { stopping = f.stop(); await ancestryWait(() => !f.snapshot().settings.value.enabled) }
+      release()
+      const error = await poll
+      if (change !== 'cancellation') assert.ok(error, 'A stale Teams generation must reject rather than commit old source events')
+      if (stopping) await stopping
+      assert.deepEqual(f.runtime.readData(original.cursorKey), before)
+      assert.equal(f.runtime.repositories.snapshot().triggers.some(trigger => (trigger.meta.provider as { messageId?: string } | undefined)?.messageId === '102'), false)
+      assert.equal(f.runs.length, 1)
+      if (change === 'accept mode') {
+        await f.poll()
+        const received = f.runtime.repositories.snapshot().triggers.find(trigger => (trigger.meta.provider as { messageId?: string } | undefined)?.messageId === '102')!
+        assert.ok(received, 'A fresh poll must rebuild the preflight for the now-observed inferred admission')
+        assert.equal((received.meta.provider as { rootMessageId: string }).rootMessageId, '100')
+        assert.notDeepEqual(f.runtime.readData(original.cursorKey), before)
+        await new Promise(resolve => setTimeout(resolve, 15))
+        assert.equal(f.runs.length, 1, 'Observe mode must not turn the newly observed event into worker input')
+      }
+    } finally { release(); await f.close() }
   })
 }
