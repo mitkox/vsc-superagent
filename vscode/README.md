@@ -32,7 +32,7 @@ Use `code` instead for a supported stable build. The publisher `superagent-local
 
 The native agent delegates the unchanged request rather than implementing a duplicate task in the routing chat. `@superagent /status` reads state and `/panel` opens supervision. Dispatch supports an explicit ticket ID for an in-scope follow-up. The previous manual New Ticket / Review / Continue workflow remains available.
 
-Workers start from the primary checkout's committed HEAD, preserving dirty files. Each ticket retains its worktree, branch and Copilot session. Inspection opens a separate window when the service is active. Ticket authorization covers unattended shell commands only when the operator chooses that mode. These commands run as the operator; a worktree is not an OS sandbox. Managed approvals, sandbox bypasses, unknown tools and paths outside the ticket still require native confirmation.
+Workers start from the primary checkout's committed HEAD, preserving dirty files. Each ticket retains its worktree, branch and Copilot session. Inspection opens a separate window when the service is active. Ticket authorization covers unattended shell commands only when the operator chooses that mode. These commands run as the operator; a worktree is not an OS sandbox. Managed approvals, sandbox bypasses, unknown tools and direct SDK file requests outside the ticket still require native confirmation. Shell path/URL metadata is advisory and does not confine programs: commands may read environment variables, access files beyond the worktree and use the network as the operator. The built-in source reply switch does not restrict arbitrary CLI commands; use an OS/container sandbox and network policy for isolation.
 
 ## GitHub
 

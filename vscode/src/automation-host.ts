@@ -152,6 +152,7 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
               const current = h.runtime.get(ticket.id)
               if (current.ended) break
               const thread = githubThreadRef(base, pull.number)
+              if (h.runtime.repositories.threads.get(threadKey(thread))?.unsubscribed?.includes(ticket.id)) continue
               if (pull.state === 'open' || !current.follows?.some(follow => follow.thread === threadKey(thread))) h.runtime.engine.bindThread(ticket.id, thread, true)
               if (!prNumbers.includes(pull.number)) prNumbers.push(pull.number)
             }
@@ -312,7 +313,7 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
   async function start(): Promise<void> {
     assertCurrent()
     const answer = await vscode.window.showWarningMessage('Start continuous Superagent work for this repository?', { modal: true,
-      detail: 'Configured sources will be polled and authorized requests will start persistent Copilot workers in separate worktrees. Policy and source allowlists stay under your control. Choose whether ticket authorization also covers worker commands.' }, 'Confirm each tool', 'Run within approved tickets')
+      detail: 'Configured sources will be polled and authorized requests will start persistent Copilot workers in separate worktrees. Run within approved tickets permits commands without per-command confirmation as your OS user. Those commands can read environment variables and files outside the worktree and use the network. Worktrees do not sandbox commands. The source reply setting does not restrict CLI commands. Managed approvals and sandbox bypasses still require confirmation.' }, 'Confirm each tool', 'Run within approved tickets')
     if (!answer) return
     await config().update('execution.permissionMode', answer === 'Run within approved tickets' ? 'ticket' : 'ask', vscode.ConfigurationTarget.Global)
     const writes = await vscode.window.showWarningMessage('Enable replies to the configured source conversations?', { modal: true,
@@ -354,7 +355,7 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
       case 'stopTicket': h.runtime.stop(id); s.kick(); break
       case 'retry': h.runtime.retry(id); s.kick(); break
       case 'retryEffect': s.retryEffect(id); break
-      case 'unsubscribe': h.runtime.engine.unsubscribe(id); s.kick(); break
+      case 'unsubscribe': h.runtime.unsubscribeThread(id, config().get<string>('github.repository', '') ? { origin: config().get('github.origin', 'https://api.github.com'), repository: config().get('github.repository', '') } : undefined); s.kick(); break
       case 'reevaluate': h.runtime.engine.reevaluate(id); s.kick(); break
       case 'conversation': {
         const ticket = h.runtime.get(id)

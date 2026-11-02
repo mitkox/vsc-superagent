@@ -110,7 +110,7 @@ function validate(value: unknown): StateData {
   const valid = rows('triggers', row => text(row.id) && text(row.source) && Array.isArray(row.threads) && row.threads.length > 0 && row.threads.every(ref)
     && ref(row.actor) && typeof row.human === 'boolean' && text(row.at) && text(row.text) && record(row.meta))
     && (data.dispositions as unknown[]).every(row => Array.isArray(row) && row.length === 2 && text(row[0]) && record(row[1]) && strings(row[1].fanout) && text(row[1].at))
-    && rows('threads', row => text(row.key) && ref(row.ref) && text(row.createdAt) && strings(row.subscriptions) && strings(row.correlated) && strings(row.pending) && record(row.meta))
+    && rows('threads', row => text(row.key) && ref(row.ref) && text(row.createdAt) && strings(row.subscriptions) && optional(row.unsubscribed, strings) && strings(row.correlated) && strings(row.pending) && record(row.meta))
     && rows('tickets', row => text(row.id) && text(row.title) && text(row.decisionId) && record(row.mandate) && ref(row.mandate.actor)
       && text(row.mandate.policyVersion) && ['explicit', 'inferred'].includes(String(row.mandate.strength)) && record(row.mandate.basis) && text(row.mandate.scope)
       && Array.isArray(row.channels) && row.channels.every(item => record(item) && text(item.source) && text(item.thread) && record(item.address) && Object.values(item.address).every(text))

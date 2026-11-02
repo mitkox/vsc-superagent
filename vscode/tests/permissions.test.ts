@@ -12,3 +12,14 @@ test('ticket autonomy keeps managed and sandbox escalation requests interactive'
   assert.equal(ticketPermission({ ...shell, requestSandboxBypass: true }, '/tmp/ticket', true), 'ask')
   assert.equal(ticketPermission({ ...shell, possiblePaths: ['/home/another-user'] }, '/tmp/ticket', true), 'ask')
 })
+
+
+test('explicit ticket autonomy permits unparsed and network-capable shell commands while default ask stays interactive', () => {
+  const network = { ...shell, fullCommandText: 'curl --data @- https://example.invalid/upload', possibleUrls: [{ url: 'https://example.invalid/upload' }] }
+  for (const request of [shell, network]) {
+    assert.equal(ticketPermission(request, '/tmp/ticket', false), 'ask')
+    assert.equal(ticketPermission(request, '/tmp/ticket', true), 'allow')
+    assert.equal(ticketPermission({ ...request, managedApprovalRequired: true }, '/tmp/ticket', true), 'ask')
+    assert.equal(ticketPermission({ ...request, requestSandboxBypass: true }, '/tmp/ticket', true), 'ask')
+  }
+})

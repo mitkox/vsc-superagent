@@ -39,7 +39,8 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
   const values: Record<string, unknown> = { ...initial }
   const commands = new Map<string, () => Promise<unknown>>()
   const requests: { url: URL; authorization: string | null; method: string; body?: string }[] = [], signins: string[][] = []
-  const errors: string[] = []
+  const errors: string[] = [], warningChoices: (string | undefined)[] = []
+  const warnings: { message: string; detail: string; choices: string[]; permissionMode: unknown }[] = []
   let panel!: PanelHost, signIn: (() => void | Promise<void>) | undefined, githubCredential: (() => void | Promise<void>) | undefined, response: (url: URL, init?: RequestInit) => unknown = () => []
   let credentials = 0, worker: ((request: AgentRun) => Promise<void>) | undefined
   const runs: AgentRun[] = []
@@ -54,7 +55,10 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
     } },
     commands: { registerCommand: (name: string, callback: () => Promise<unknown>) => { commands.set(name, callback); return disposable } },
     window: { showErrorMessage: async (error: string) => { errors.push(error) },
-      showWarningMessage: async (_message: string, _options: unknown, first: string) => first },
+      showWarningMessage: async (message: string, options: unknown, first: string, ...others: string[]) => {
+        warnings.push({ message, detail: (options as { detail?: string })?.detail ?? '', choices: [first, ...others], permissionMode: values['execution.permissionMode'] })
+        return warningChoices.shift() ?? first
+      } },
     lm: { registerTool: () => disposable },
     Uri: { joinPath: (_uri: unknown, ...parts: string[]) => ({ fsPath: join(directory, ...parts) }) },
     ConfigurationTarget: { Global: 1 },
@@ -88,13 +92,15 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
     },
   })
   const snapshot = () => panel.snapshot() as { settings: { revision: number; value: AutomationSettings } }
-  return { directory, runtime, values, requests, signins, errors, runs, snapshot,
+  return { directory, runtime, values, requests, signins, errors, warnings, runs, snapshot,
+    chooseWarnings: (...choices: (string | undefined)[]) => { warningChoices.push(...choices) },
     onWorker: (handler: (request: AgentRun) => Promise<void>) => { worker = handler }, get credentials() { return credentials },
     initialize: () => commands.get('superagent.dashboard')!(),
     start: () => commands.get('superagent.startService')!(),
     save: (value: unknown) => panel.action({ action: 'saveSettings', revision: snapshot().settings.revision, value }),
     restore: (revision: number) => panel.action({ action: 'restoreSettings', revision, baseRevision: snapshot().settings.revision }),
     poll: () => panel.action({ action: 'poll' }),
+    unsubscribe: (id: string) => panel.action({ action: 'unsubscribe', id }),
     respond: (handler: (url: URL, init?: RequestInit) => unknown) => { response = handler },
     onSignIn: (handler: () => void | Promise<void>) => { signIn = handler },
     onGitHubCredential: (handler: () => void | Promise<void>) => { githubCredential = handler },
@@ -800,5 +806,99 @@ for (const change of ['requester', 'source', 'delivery'] as const) {
       assert.equal(f.runtime.get(ticket.id).mandate.actor.source, 'vscode')
       assert.equal(f.runtime.get(ticket.id).ended, undefined)
     } finally { release(); await f.close() }
+  })
+}
+
+
+for (const scenario of ['canonical', 'legacy-only', 'mixed'] as const) {
+  test(`native unsubscribe of ${scenario} PR bindings survives discovery and reopen without suppressing a different PR`, async () => {
+    const configuration = { 'github.repository': 'company/project', 'github.allowedActors': [] }
+    let current: ReturnType<typeof fixture> | undefined = fixture(configuration)
+    const directory = current.directory
+    try {
+      const f = current
+      await f.initialize(); await f.save({ enabled: true })
+      const ticket = f.runtime.create('Keep this PR detached until the operator restores it')
+      const canonical = githubThreadRef(repositoryConfig, 42), legacy = oldPullRef(42)
+      const canonicalKey = `${canonical.source}:${canonical.id}`, legacyKey = `${legacy.source}:${legacy.id}`
+      if (scenario !== 'canonical') f.runtime.engine.bindThread(ticket.id, legacy, true)
+      if (scenario !== 'legacy-only') f.runtime.engine.bindThread(ticket.id, canonical, true)
+      const originalRef = scenario === 'canonical' ? canonical : legacy
+      const historical = { id: `unsubscribe-history-${scenario}`, source: originalRef.source, threads: [originalRef], actor: { source: originalRef.source, id: 'person' }, human: true,
+        at: new Date().toISOString(), text: 'Historical PR context is retained after unsubscribe', url: 'https://github.com/company/project/pull/42#issuecomment-1', meta: {} }
+      f.runtime.repositories.atomic(() => f.runtime.repositories.triggers.save(historical))
+      const branch = `superagent/${ticket.id}`
+      let includeNewPr = false
+      const respond = (url: URL) => {
+        if (url.searchParams.has('head')) return (includeNewPr ? [42, 43] : [42]).map(number => ({ ...pull(number), user: { login: 'agent' },
+          head: { sha: String(number % 10).repeat(40), ref: branch, repo: { full_name: 'company/project' } } }))
+        if (url.pathname.endsWith('/pulls/42')) return pull(42)
+        if (url.pathname.endsWith('/pulls/43')) return pull(43)
+        return []
+      }
+      f.respond(respond)
+      await f.unsubscribe(scenario === 'canonical' ? canonicalKey : legacyKey)
+      for (let pass = 0; pass < 2; pass++) {
+        await f.poll()
+        assert.equal(f.runtime.get(ticket.id).follows?.some(follow => follow.thread === canonicalKey || follow.thread === legacyKey) ?? false, false,
+          'Discovery must not recreate a PR association removed through the native panel')
+        assert.equal(f.runtime.repositories.threads.get(canonicalKey)?.subscriptions.includes(ticket.id) ?? false, false)
+      }
+      assert.deepEqual(f.runtime.repositories.triggers.get(historical.id), historical)
+      await f.close(true); current = undefined
+      current = fixture(configuration, directory); const reopened = current
+      await reopened.initialize(); reopened.respond(respond)
+      await reopened.poll()
+      assert.equal(reopened.runtime.get(ticket.id).follows?.some(follow => follow.thread === canonicalKey || follow.thread === legacyKey) ?? false, false)
+      assert.deepEqual(reopened.runtime.repositories.triggers.get(historical.id), historical)
+      assert.equal(reopened.runtime.repositories.threads.get(canonicalKey)?.unsubscribed?.includes(ticket.id), true)
+
+      // Read-only context is an explicit read grant, not permission for discovery to restore ownership.
+      reopened.runtime.engine.followForContext(ticket.id, canonical)
+      await reopened.poll()
+      const context = reopened.runtime.repositories.threads.get(canonicalKey)!
+      assert.ok(context.subscriptions.includes(ticket.id)); assert.ok(context.context?.includes(ticket.id)); assert.ok(context.unsubscribed?.includes(ticket.id))
+      assert.equal(reopened.runtime.get(ticket.id).follows?.some(follow => follow.thread === canonicalKey && follow.own) ?? false, false)
+
+      includeNewPr = true
+      await reopened.poll()
+      const anotherKey = `${canonical.source}:43`
+      assert.ok(reopened.runtime.get(ticket.id).follows?.some(follow => follow.thread === anotherKey && follow.own))
+      assert.equal(reopened.runtime.get(ticket.id).follows?.some(follow => follow.thread === canonicalKey) ?? false, false)
+
+      reopened.runtime.bindPullRequest(ticket.id, 42, true, repositoryConfig)
+      assert.ok(reopened.runtime.get(ticket.id).follows?.some(follow => follow.thread === canonicalKey && follow.own))
+      const restored = reopened.runtime.repositories.threads.get(canonicalKey)!
+      assert.equal(restored.unsubscribed?.includes(ticket.id) ?? false, false)
+      assert.equal(restored.context?.includes(ticket.id) ?? false, false)
+      await reopened.poll()
+      assert.ok(reopened.runtime.get(ticket.id).follows?.some(follow => follow.thread === canonicalKey && follow.own))
+      assert.deepEqual(reopened.runtime.repositories.triggers.get(historical.id), historical)
+    } finally { if (current) await current.close(); else rmSync(directory, { recursive: true, force: true }) }
+  })
+}
+
+for (const choice of ['Confirm each tool', 'Run within approved tickets'] as const) {
+  test(`native start discloses operator command privileges before selecting ${choice}`, async () => {
+    const f = fixture({ 'execution.permissionMode': 'ask' })
+    try {
+      f.chooseWarnings(choice === 'Confirm each tool' ? undefined : choice, 'Keep replies local')
+      await f.start()
+      assert.deepEqual(f.errors, [])
+      const start = f.warnings.find(warning => warning.message.startsWith('Start continuous Superagent work'))!
+      assert.ok(start)
+      assert.equal(start.permissionMode, 'ask', 'Disclosure must precede changing the native command permission mode')
+      assert.deepEqual(start.choices, ['Confirm each tool', 'Run within approved tickets'])
+      assert.match(start.detail, /operator|your (?:os |operating.system )?(?:user|account)|as you/i)
+      assert.match(start.detail, /environment|credentials|secrets/i)
+      assert.match(start.detail, /outside|other files|arbitrary files/i)
+      assert.match(start.detail, /network|internet/i)
+      assert.match(start.detail, /not (?:a )?sandbox|not (?:a )?security boundary|no privilege isolation|does not (?:sandbox|isolate privileges)/i)
+      const reply = f.warnings.find(warning => warning.message.startsWith('Enable replies'))!
+      assert.ok(reply)
+      assert.match(`${start.detail} ${reply.detail}`, /repl(?:y|ies).*?(?:not|independent|separate).*?(?:cli|command|network)/i)
+      assert.equal(f.values['execution.permissionMode'], choice === 'Run within approved tickets' ? 'ticket' : 'ask')
+      assert.equal(f.values['delivery.enabled'], false)
+    } finally { await f.close() }
   })
 }

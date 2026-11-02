@@ -339,3 +339,74 @@ test('mixed alias migration preserves each existing canonical read and write per
     assert.deepEqual(f.runtime.repositories.threads.get(key), current)
   } finally { f.clean() }
 })
+
+
+for (const mixed of [false, true]) {
+  test(`native unsubscribe canonicalizes proved ${mixed ? 'mixed' : 'legacy-only'} PR aliases without changing unknown sources or read-only intent`, () => {
+    const f = fixture()
+    try {
+      const owner = f.runtime.create('Detach the known PR'), reader = f.runtime.create('Keep historical read-only status')
+      const legacy = legacyRef(githubScope, 42), canonical = githubRepositoryRef(githubScope, 42), legacyKey = threadKey(legacy), canonicalKey = threadKey(canonical)
+      const foreign = legacyRef({ ...githubScope, repository: 'unrelated/project' }, 99), opaque = { source: 'github', id: `${'f'.repeat(64)}:pr-77` }
+      f.runtime.engine.bindThread(owner.id, legacy, true)
+      f.runtime.engine.followForContext(reader.id, legacy)
+      if (mixed) f.runtime.engine.bindThread(owner.id, canonical, true)
+      f.runtime.engine.bindThread(owner.id, foreign, true); f.runtime.engine.bindThread(owner.id, opaque, false)
+      const foreignBefore = f.runtime.repositories.threads.get(threadKey(foreign)), opaqueBefore = f.runtime.repositories.threads.get(threadKey(opaque))
+      const historical = { id: `native-unsubscribe-history-${mixed}`, source: legacy.source, threads: [legacy], actor: { source: legacy.source, id: 'person' }, human: true,
+        at: new Date().toISOString(), text: 'Preserve the old source identity and URL', url: 'https://github.com/company/project/pull/42', meta: {} }
+      f.runtime.repositories.atomic(() => f.runtime.repositories.triggers.save(historical))
+      // The fallback keeps the unchanged baseline on its real native unsubscribe behavior rather than failing on a missing new API.
+      const boundary = f.runtime as TicketRuntime & { unsubscribeThread?: (key: string, scope?: GitHubRepositoryScope) => boolean }
+      if (boundary.unsubscribeThread) boundary.unsubscribeThread(legacyKey, githubScope)
+      else f.runtime.engine.unsubscribe(legacyKey)
+      f.runtime.reconcileGitHubBindings(githubScope)
+      assert.equal(f.runtime.get(owner.id).follows?.some(follow => follow.thread === canonicalKey || follow.thread === legacyKey) ?? false, false)
+      const detached = f.runtime.repositories.threads.get(canonicalKey)!
+      assert.equal(detached.subscriptions.includes(owner.id), false); assert.equal(detached.subscriptions.includes(reader.id), false)
+      assert.ok(detached.unsubscribed?.includes(owner.id)); assert.ok(detached.unsubscribed?.includes(reader.id))
+      assert.deepEqual(f.runtime.repositories.threads.get(threadKey(foreign)), foreignBefore)
+      assert.deepEqual(f.runtime.repositories.threads.get(threadKey(opaque)), opaqueBefore)
+      assert.ok(f.runtime.get(owner.id).follows?.some(follow => follow.thread === threadKey(foreign)))
+      assert.ok(f.runtime.get(owner.id).follows?.some(follow => follow.thread === threadKey(opaque)))
+      assert.deepEqual(f.runtime.repositories.triggers.get(historical.id), historical)
+
+      f.runtime.engine.followForContext(owner.id, canonical)
+      f.runtime.reconcileGitHubBindings(githubScope)
+      const context = f.runtime.repositories.threads.get(canonicalKey)!
+      assert.ok(context.context?.includes(owner.id)); assert.ok(context.unsubscribed?.includes(owner.id))
+      assert.equal(f.runtime.get(owner.id).follows?.some(follow => follow.thread === canonicalKey) ?? false, false)
+      f.runtime.bindPullRequest(owner.id, 42, true, githubScope)
+      f.runtime.reconcileGitHubBindings(githubScope)
+      const restored = f.runtime.repositories.threads.get(canonicalKey)!
+      assert.equal(restored.context?.includes(owner.id) ?? false, false)
+      assert.equal(restored.unsubscribed?.includes(owner.id) ?? false, false)
+      assert.ok(restored.unsubscribed?.includes(reader.id))
+      assert.equal(restored.subscriptions.includes(reader.id), false)
+      assert.ok(f.runtime.get(owner.id).follows?.some(follow => follow.thread === canonicalKey && follow.own))
+      assert.deepEqual(f.runtime.repositories.triggers.get(historical.id), historical)
+      assert.equal(f.runtime.repositories.threads.get(threadKey(githubRepositoryRef(githubScope, 99))), undefined)
+      assert.equal(f.runtime.repositories.threads.get(threadKey(githubRepositoryRef(githubScope, 77))), undefined)
+    } finally { f.clean() }
+  })
+}
+
+
+test('native unsubscribe with invalid or unprovable current configuration removes only the exact historical thread', () => {
+  for (const scope of [{ origin: 'not-an-origin', repository: 'invalid' }, { ...githubScope, repository: 'another/project' }]) {
+    const f = fixture()
+    try {
+      const ticket = f.runtime.create('Detach the historical unknown binding')
+      const unknown = { source: 'github', id: `${'e'.repeat(64)}:pr-77` }, known = githubRepositoryRef(githubScope, 42)
+      f.runtime.engine.bindThread(ticket.id, unknown, true); f.runtime.engine.bindThread(ticket.id, known, true)
+      const knownBefore = f.runtime.repositories.threads.get(threadKey(known))
+      const boundary = f.runtime as TicketRuntime & { unsubscribeThread?: (key: string, scope?: GitHubRepositoryScope) => boolean }
+      const removed = boundary.unsubscribeThread ? boundary.unsubscribeThread(threadKey(unknown), scope) : f.runtime.engine.unsubscribe(threadKey(unknown))
+      assert.equal(removed, true)
+      assert.equal(f.runtime.get(ticket.id).follows?.some(follow => follow.thread === threadKey(unknown)) ?? false, false)
+      assert.equal(f.runtime.repositories.threads.get(threadKey(unknown))!.subscriptions.includes(ticket.id), false)
+      assert.deepEqual(f.runtime.repositories.threads.get(threadKey(known)), knownBefore)
+      assert.ok(f.runtime.get(ticket.id).follows?.some(follow => follow.thread === threadKey(known) && follow.own))
+    } finally { f.clean() }
+  }
+})

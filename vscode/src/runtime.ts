@@ -267,41 +267,66 @@ export class TicketRuntime {
     return (this.get(id).follows ?? []).every(follow => !follow.thread.startsWith('github:') || follow.thread.startsWith(canonical) || this.legacyPullRequestNumber(follow.thread, legacy) !== undefined)
   }
 
+  /** Native unsubscription canonicalizes only repository aliases proved by configured scope. */
+  unsubscribeThread(thread: string, source?: GitHubRepositoryScope): boolean {
+    if (source && thread.startsWith('github:')) {
+      let namespace: string
+      try { namespace = githubRepositoryRef(source, 1).source } catch { return this.engine.unsubscribe(thread) }
+      const number = this.legacyPullRequestNumber(thread, this.legacyPullRequestPrefix(source)) ?? this.legacyPullRequestNumber(thread, `${namespace}:`)
+      if (number !== undefined) return this.repo.atomic(() => {
+        this.reconcileGitHubBindings(source)
+        return this.engine.unsubscribe(`${namespace}:${number}`)
+      })
+    }
+    return this.engine.unsubscribe(thread)
+  }
+
   /** Migrate only aliases derived from the proved native repository configuration. Historical threads stay readable. */
   reconcileGitHubBindings(source: GitHubRepositoryScope): void {
     const namespace = githubRepositoryRef(source, 1).source, prefix = this.legacyPullRequestPrefix(source)
     this.repo.atomic(() => {
+      const blocked = new Map(this.repo.threads.list().filter(thread => thread.ref.source === namespace && thread.unsubscribed?.length)
+        .map(thread => [thread.key, new Set(thread.unsubscribed!)]))
       for (const legacy of this.repo.threads.list()) {
         const number = this.legacyPullRequestNumber(legacy.key, prefix)
         if (number === undefined || legacy.ref.source !== 'github' || threadKey(legacy.ref) !== legacy.key) continue
         const ref = { source: namespace, id: String(number) }, key = threadKey(ref)
         const current = this.repo.threads.get(key)
-        const subscriptions = [...new Set([...current?.subscriptions ?? [], ...legacy.subscriptions])]
+        const unsubscribed = [...new Set([...current?.unsubscribed ?? [], ...legacy.unsubscribed ?? []])]
+        const optOut = new Set(unsubscribed)
+        if (optOut.size) blocked.set(key, optOut)
+        const movedOptOut = new Set(legacy.unsubscribed ?? [])
+        const subscriptions = [...new Set([...current?.subscriptions ?? [], ...legacy.subscriptions])].filter(id => !movedOptOut.has(id)
+          && (!optOut.has(id) || !!current?.subscriptions.includes(id) && !!current.context?.includes(id)))
         // Existing canonical permissions win; new subscribers retain the legacy read-only restriction.
         const context = [...new Set([...current?.context ?? [], ...(legacy.context ?? []).filter(id => legacy.subscriptions.includes(id) && !current?.subscriptions.includes(id))])]
-        if (!current || JSON.stringify(subscriptions) !== JSON.stringify(current.subscriptions) || JSON.stringify(context) !== JSON.stringify(current.context ?? [])) {
+        if (!current || JSON.stringify(subscriptions) !== JSON.stringify(current.subscriptions) || JSON.stringify(context) !== JSON.stringify(current.context ?? [])
+          || JSON.stringify(unsubscribed) !== JSON.stringify(current.unsubscribed ?? [])) {
           this.repo.threads.save({ ...current ?? { key, ref, createdAt: legacy.createdAt, correlated: [], pending: [], meta: {} },
-            subscriptions, ...(context.length ? { context } : {}) })
+            subscriptions, ...(context.length ? { context } : {}), ...(unsubscribed.length ? { unsubscribed } : {}) })
         }
-        // Move active subscriptions once; keeping them on the alias would undo a later canonical unsubscribe.
-        // Its context/history remain intact for the immutable triggers that still name the old thread.
-        if (legacy.subscriptions.length) {
+        // Move active subscriptions and opt-outs once, so stale aliases cannot undo a later positive canonical bind.
+        // Their context/history remain intact for immutable triggers that still name the old thread.
+        if (legacy.subscriptions.length || legacy.unsubscribed?.length) {
           legacy.subscriptions = []
+          delete legacy.unsubscribed
           this.repo.threads.save(legacy)
         }
       }
       for (const ticket of this.repo.tickets.list()) {
-        if (!ticket.follows?.some(follow => this.legacyPullRequestNumber(follow.thread, prefix) !== undefined)) continue
+        if (!ticket.follows?.some(follow => this.legacyPullRequestNumber(follow.thread, prefix) !== undefined || blocked.get(follow.thread)?.has(ticket.id))) continue
         const follows = new Map<string, Follow>()
         // Prefer the canonical record's verified closure when both aliases exist.
-        for (const follow of ticket.follows.filter(follow => this.legacyPullRequestNumber(follow.thread, prefix) === undefined)) follows.set(follow.thread, follow)
+        for (const follow of ticket.follows.filter(follow => this.legacyPullRequestNumber(follow.thread, prefix) === undefined && !blocked.get(follow.thread)?.has(ticket.id))) follows.set(follow.thread, follow)
         for (const follow of ticket.follows) {
           const number = this.legacyPullRequestNumber(follow.thread, prefix)
           if (number === undefined) continue
           const key = `${namespace}:${number}`, current = follows.get(key)
+          if (blocked.get(key)?.has(ticket.id)) continue
           follows.set(key, { thread: key, own: !!current?.own || follow.own, ...(current?.closed ?? follow.closed ? { closed: current?.closed ?? follow.closed } : {}) })
         }
-        ticket.follows = [...follows.values()]
+        if (follows.size) ticket.follows = [...follows.values()]
+        else delete ticket.follows
         this.repo.tickets.save(ticket)
       }
     })

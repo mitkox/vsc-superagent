@@ -219,6 +219,7 @@ export class Tickets extends EnginePart {
     const tickets = current?.subscriptions.filter(id => ticketId === undefined || id === ticketId) ?? []
     if (!current || !tickets.length) return false
     current.subscriptions = current.subscriptions.filter(id => !tickets.includes(id))
+    if (by === 'person') current.unsubscribed = [...new Set([...current.unsubscribed ?? [], ...tickets])]
     this.repo.threads.save(current)
     for (const id of tickets) {
       const ticket = this.repo.tickets.get(id)
@@ -493,15 +494,19 @@ export class Tickets extends EnginePart {
   followForContext(ticketId: string, ref: ThreadRef): boolean {
     if (!liveTicket(this.require(ticketId))) throw new UserError('ticketEnded')
     if (this.thread(ref).subscriptions.includes(ticketId)) return false
-    this.subscribe(ticketId, ref)
+    this.subscribe(ticketId, ref, false)
     const thread = this.thread(ref)
     thread.context = [...thread.context ?? [], ticketId]
     this.repo.threads.save(thread)
     return true
   }
   /** Subscribe a ticket to a Thread; later Triggers on it reach the ticket as Inputs, as the ticket's own once it was for context. */
-  private subscribe(ticketId: string, ref: ThreadRef): void {
+  private subscribe(ticketId: string, ref: ThreadRef, positive = true): void {
     const thread = this.thread(ref)
+    if (positive && thread.unsubscribed?.includes(ticketId)) {
+      thread.unsubscribed = thread.unsubscribed.filter(id => id !== ticketId)
+      if (!thread.unsubscribed.length) delete thread.unsubscribed
+    }
     if (!thread.subscriptions.includes(ticketId)) { thread.subscriptions.push(ticketId); this.emit('thread.subscribed', { threadKey: thread.key, ticketId }) }
     if (thread.context?.includes(ticketId)) thread.context = thread.context.filter(id => id !== ticketId)
     this.repo.threads.save(thread)

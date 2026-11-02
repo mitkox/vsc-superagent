@@ -275,7 +275,7 @@
           "type": "string",
           "default": "ask",
           "scope": "application",
-          "description": "Ask for each worker permission, or run commands within locally approved ticket mandates.",
+          "description": "Ask for each worker permission (default), or permit unattended commands as your OS user for approved tickets. Commands can access environment variables, files beyond the worktree and the network; worktrees and the source reply setting do not sandbox CLI commands. Managed approvals and sandbox bypasses still require confirmation.",
           "enum": [
             "ask",
             "ticket"

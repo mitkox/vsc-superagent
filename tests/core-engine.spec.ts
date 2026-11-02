@@ -1802,3 +1802,76 @@ describe('operational source admission', () => {
     expect(h.outbox.slice(1).map(message => message.triggerId)).toEqual(['2', '2'])
   })
 })
+
+
+describe('durable explicit thread unsubscribe', () => {
+  it('records one per-ticket opt-out across repeated unsubscribe without erasing history', () => {
+    const h = harness(), id = accepted(h).ticketId!
+    const ref = { source: 'gh', id: 'pr-7' }
+    h.engine.bindThread(id, ref, true)
+    h.tick(1); h.engine.receive(trigger('2', { threads: [ref] })); h.settle()
+    const inputs = h.repo.tickets.get(id)!.inputs
+    const history = h.repo.triggers.get('2')
+    expect(h.engine.unsubscribe('gh:pr-7')).toBe(true)
+    expect(h.repo.threads.get('gh:pr-7')).toMatchObject({ subscriptions: [], unsubscribed: [id] })
+    expect(h.repo.tickets.get(id)?.follows).toBeUndefined()
+    expect(h.repo.tickets.get(id)?.inputs).toEqual(inputs)
+    expect(h.repo.triggers.get('2')).toEqual(history)
+    expect(h.engine.unsubscribe('gh:pr-7')).toBe(false)
+    expect(h.repo.threads.get('gh:pr-7')?.unsubscribed).toEqual([id])
+    h.engine.bindThread(id, ref, true)
+    expect(h.repo.threads.get('gh:pr-7')?.unsubscribed).toBeUndefined()
+    expect(h.repo.tickets.get(id)?.follows).toEqual([{ thread: 'gh:pr-7', own: true }])
+  })
+  it('read-only follow preserves the opt-out until an explicit positive bind restores ownership', () => {
+    const h = harness(), id = accepted(h).ticketId!, ref = { source: 'gh', id: 'pr-7' }
+    h.engine.bindThread(id, ref, true); h.engine.unsubscribe('gh:pr-7')
+    expect(h.engine.followForContext(id, ref)).toBe(true)
+    expect(h.engine.followForContext(id, ref)).toBe(false)
+    expect(h.repo.threads.get('gh:pr-7')).toMatchObject({ subscriptions: [id], context: [id], unsubscribed: [id] })
+    expect(h.repo.tickets.get(id)?.follows).toBeUndefined()
+    h.tick(1); h.engine.receive(trigger('2', { threads: [ref] })); h.settle()
+    expect(h.repo.tickets.get(id)?.inputs.at(-1)).toMatchObject({ kind: 'trigger', triggerId: '2', context: true })
+    expect(() => h.engine.reply({ purpose: 'acknowledgement', ticketId: id, triggerId: '2', text: 'taking ownership' })).toThrow()
+    h.engine.bindThread(id, ref, true)
+    expect(h.repo.threads.get('gh:pr-7')?.unsubscribed).toBeUndefined()
+    expect(h.repo.threads.get('gh:pr-7')?.context).not.toContain(id)
+    h.tick(1); h.engine.receive(trigger('3', { threads: [ref] })); h.settle()
+    expect(() => h.engine.reply({ purpose: 'acknowledgement', ticketId: id, triggerId: '3', text: 'authorized again' })).not.toThrow()
+  })
+  it('positive binding clears only its own ticket and exact thread opt-out', () => {
+    const h = harness(), first = accepted(h, '1', 'first').ticketId!, second = accepted(h, '2', 'second').ticketId!
+    const ref = { source: 'gh', id: 'pr-7' }
+    h.engine.bindThread(first, ref, true); h.engine.bindThread(second, ref, true)
+    h.engine.unsubscribe('gh:pr-7')
+    expect(new Set(h.repo.threads.get('gh:pr-7')?.unsubscribed)).toEqual(new Set([first, second]))
+    h.engine.bindThread(first, ref, true)
+    expect(h.repo.threads.get('gh:pr-7')?.unsubscribed).toEqual([second])
+    h.engine.followForContext(second, ref)
+    expect(h.repo.threads.get('gh:pr-7')?.unsubscribed).toEqual([second])
+    for (const other of [{ source: 'gh', id: 'pr-8' }, { source: 'other-repository', id: 'pr-7' }]) {
+      h.engine.bindThread(second, other, true)
+      expect(h.repo.threads.get(`${other.source}:${other.id}`)?.unsubscribed).toBeUndefined()
+    }
+    expect(h.repo.threads.get('gh:pr-7')?.unsubscribed).toEqual([second])
+    expect(h.engine.unsubscribe('gh:pr-7')).toBe(true)
+    expect(new Set(h.repo.threads.get('gh:pr-7')?.unsubscribed)).toEqual(new Set([first, second]))
+  })
+  it('a new positive decision can subscribe a new ticket without opting an older ticket back in', () => {
+    const h = harness(), previous = accepted(h).ticketId!
+    h.engine.unsubscribe('chat:t1')
+    h.tick(1); h.engine.receive(trigger('2')); h.pump()
+    const decision = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Separate authorized work', scope: 'new request', reason: 'positive decision' })
+    expect(decision.ticketId).not.toBe(previous)
+    expect(h.repo.threads.get('chat:t1')).toMatchObject({ subscriptions: [decision.ticketId], unsubscribed: [previous] })
+  })
+  it('positive attachment clears its ticket opt-out without restoring another ticket subscription', () => {
+    const h = harness(), first = accepted(h, '1', 'first').ticketId!, second = accepted(h, '2', 'second').ticketId!
+    const ref = { source: 'gh', id: 'pr-7' }
+    h.engine.bindThread(first, ref, true); h.engine.bindThread(second, ref, true); h.engine.unsubscribe('gh:pr-7')
+    h.tick(1); h.engine.receive(trigger('3', { threads: [ref] }))
+    h.engine.attach(first, '3', 'Native positive routing decision')
+    expect(h.repo.threads.get('gh:pr-7')).toMatchObject({ subscriptions: [first], unsubscribed: [second] })
+    expect(h.repo.tickets.get(first)?.inputs.at(-1)).toMatchObject({ triggerId: '3', note: 'Native positive routing decision' })
+  })
+})
