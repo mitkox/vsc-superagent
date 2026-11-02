@@ -242,9 +242,10 @@ export function automationGate(settings: AutomationSettings, trigger: Trigger, p
     : { admissible: false, reason: 'actorNotAllowed' }
 }
 
-export function automationPolicy(settings: AutomationSettings, paused = false, verifiedStatus?: (trigger: Trigger, ticket: Ticket) => boolean, verifiedDefaultStatus?: DefaultStatusAuthority, mandateOrigins?: (mandate: Mandate) => readonly (Trigger | undefined)[] | undefined): Policy {
+export function automationPolicy(settings: AutomationSettings, paused = false, verifiedStatus?: (trigger: Trigger, ticket: Ticket) => boolean, verifiedDefaultStatus?: DefaultStatusAuthority, mandateOrigins?: (mandate: Mandate) => readonly (Trigger | undefined)[] | undefined, receives?: (input: Pick<Trigger, 'source' | 'meta'>) => boolean): Policy {
   const inferred = (rules: readonly string[]) => settings.acceptMode === 'auto' && rules.length > 0 && rules.every(id => settings.rules.some(rule => rule.enabled && rule.id === id))
-  const gate = (trigger: Trigger, participating: boolean) => automationGate(settings, trigger, participating, verifiedDefaultStatus)
+  const gate = (trigger: Trigger, participating: boolean): GateResult => receives?.(trigger) === false
+    ? { admissible: false, reason: 'sourceScopeRemoved' } : automationGate(settings, trigger, participating, verifiedDefaultStatus)
   const policy: Policy = {
     version: automationPolicyVersion(settings), paused: paused || !settings.enabled, evalTimeoutMs: settings.assessment.timeoutMs,
     gate: (trigger, thread, tickets) => {
@@ -253,6 +254,7 @@ export function automationPolicy(settings: AutomationSettings, paused = false, v
       return gate(trigger, [...thread.subscriptions, ...tickets.map(ticket => ticket.id)].some(id => !thread.context?.includes(id)))
     },
     admitsInput(trigger, ticket, contextOnly) {
+      if (receives?.(trigger) === false) return false
       const origin = [ticket.origin.triggerId, ...ticket.origin.triggerIds ?? []].includes(trigger.id)
       if (origin && ticket.mandate.strength === 'inferred' && ticket.mandate.actor.source === trigger.actor.source && ticket.mandate.actor.id === trigger.actor.id
         && policy.revalidate(ticket.mandate)) {
@@ -268,6 +270,7 @@ export function automationPolicy(settings: AutomationSettings, paused = false, v
     admitsInferred: inferred,
     revalidate(mandate: Mandate) {
       if (local(mandate.actor.source, mandate.actor.id)) return true
+      if (receives?.({ source: mandate.actor.source, meta: mandate.basis.scope ?? {} }) === false) return false
       // Earlier versions could accept one scope from unrelated senders or receiving rows. The immutable scope cannot be
       // narrowed by retiring just one Input; require every persisted origin to retain one current authority cohort.
       const origins = mandateOrigins?.(mandate)

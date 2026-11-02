@@ -17,6 +17,9 @@ export interface AutomationDependencies {
   poll(signal: AbortSignal): Promise<Trigger[]>
   send(message: OutboundMessage, signal: AbortSignal): Promise<void>
   canSend?(): boolean
+  /** Live native receiving scope, separate from sender admission and the local operator grant. */
+  receivesSource?(input: Pick<Trigger, 'source' | 'meta'>): boolean
+  receivesChannel?(channel: ChannelRef): boolean
   readSource?(ticketId: string, request: unknown, signal: AbortSignal): Promise<unknown>
   claimPullRequest?(ticket: Ticket, number: number, signal: AbortSignal): Promise<ThreadRef>
   resolveThread?(family: 'github' | 'teams', id: string, signal: AbortSignal): Promise<ThreadRef>
@@ -280,7 +283,7 @@ export class AutomationService {
       const family = sourceFamily(trigger.source), source = family && settings.sources[family]
       return !!source && settings.acceptMode === 'auto' && source.allowedBots.some(actor => actor.toLowerCase() === trigger.actor.id.toLowerCase())
         && automationGate(settings, trigger).admissible && this.runtime.approvedBotInput(trigger, ticket, settings.rules.filter(rule => rule.enabled).map(rule => rule.id), automationPolicyVersion(settings))
-    }, input => this.runtime.verifiedDefaultStatus(input), mandate => this.runtime.mandateOrigins(mandate))
+    }, input => this.runtime.verifiedDefaultStatus(input), mandate => this.runtime.mandateOrigins(mandate), this.deps.receivesSource)
   }
   private inputAllowed(ticket: Ticket, id: string): boolean {
     const input = ticket.inputs.find(input => input.id === id)
@@ -299,6 +302,7 @@ export class AutomationService {
   private outboundState(message: OutboundMessage): 'allowed' | 'pending' | 'revoked' {
     const settings = this.settings.value, family = sourceFamily(message.channel.source)
     if (!this.running || this.disposed || this.runtime.paused || !settings.enabled || this.deps.canSend?.() === false || family && !settings.sources[family].enabled) return 'pending'
+    if (this.deps.receivesChannel?.(message.channel) === false) return 'revoked'
     if (!message.ticketId) return 'allowed'
     const ticket = this.runtime.repositories.tickets.get(message.ticketId)
     if (!ticket || ticket.ended?.by === 'human' || !this.policy().revalidate(ticket.mandate)) return 'revoked'

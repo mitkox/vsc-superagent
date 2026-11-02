@@ -14,6 +14,8 @@ import type { AutomationSettings } from '../src/settings.ts'
 import type { PanelHost } from '../src/panel.ts'
 import type { AgentRun } from '../src/agent-backend.ts'
 import type { AssessmentOutcome } from '../../src/core/index.ts'
+import type { PermissionRequest } from '@github/copilot-sdk'
+import type { CopilotBackendOptions } from '../src/copilot.ts'
 
 const requireModule = createRequire(import.meta.url)
 const code = buildSync({
@@ -47,13 +49,22 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
   let assessor: ((prompt: string) => AssessmentOutcome | Promise<AssessmentOutcome>) | undefined
   let panel!: PanelHost, signIn: (() => void | Promise<void>) | undefined, githubCredential: (() => void | Promise<void>) | undefined, response: (url: URL, init?: RequestInit) => unknown = () => []
   let credentials = 0, worker: ((request: AgentRun) => Promise<void>) | undefined
-  const runs: AgentRun[] = []
+  const runs: AgentRun[] = [], aborts: string[] = [], prepares: string[] = []
+  let permission: CopilotBackendOptions['onPermissionRequest'] | undefined, preparation: ((ticketId: string) => Promise<void>) | undefined
+  const configurationListeners = new Set<(event: { affectsConfiguration(section: string): boolean }) => void>()
+  const fireConfiguration = (...keys: string[]) => {
+    const changed = keys.map(key => key.startsWith('superagent.') ? key : `superagent.${key}`)
+    const event = { affectsConfiguration: (section: string) => changed.some(key => key === section || key.startsWith(section + '.') || section.startsWith(key + '.')) }
+    for (const listener of configurationListeners) listener(event)
+  }
   const disposable = { dispose() {} }
   const api = {
     workspace: { getConfiguration: () => ({
       get: (key: string, fallback?: unknown) => values[key] ?? fallback,
-      update: async (key: string, value: unknown) => { values[key] = value },
-    }) },
+      update: async (key: string, value: unknown) => { values[key] = value; queueMicrotask(() => fireConfiguration(key)) },
+    }), onDidChangeConfiguration: (listener: (event: { affectsConfiguration(section: string): boolean }) => void) => {
+      configurationListeners.add(listener); return { dispose: () => { configurationListeners.delete(listener) } }
+    } },
     authentication: { getSession: async (_provider: string, scopes: string[]) => {
       signins.push(scopes); await signIn?.(); return { accessToken: 'graph-credential' }
     } },
@@ -71,7 +82,8 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
   const module = { exports: {} as { activateAutomation(context: unknown, hooks: unknown): { shutdown(): Promise<void> } } }
   runInNewContext(code, {
     module, exports: module.exports, require: (name: string) => name === 'vscode' ? api : name === './copilot.ts' ? {
-      CopilotBackend: class { async check() { return { authenticated: true } } async abort() {} async dispose() {} async assess(prompt: string) { return assessor ? assessor(prompt) : { kind: 'ignore', reason: 'No stop or new task' } }
+      CopilotBackend: class { constructor(options: CopilotBackendOptions) { permission = options.onPermissionRequest }
+        async check() { return { authenticated: true } } async abort(ticketId: string) { aborts.push(ticketId) } async dispose() {} async assess(prompt: string) { return assessor ? assessor(prompt) : { kind: 'ignore', reason: 'No stop or new task' } }
         async run(request: AgentRun) { runs.push(request); if (worker) await worker(request); else await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'waiting', summary: 'Waiting for a native input' }) } },
     } : name === './panel.ts' ? { SuperagentPanel: class {
       constructor(host: PanelHost) { panel = host }
@@ -89,16 +101,23 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
       return result instanceof Response ? result : Response.json(result)
     },
   })
-  const lifecycle = module.exports.activateAutomation({ subscriptions: [], extensionUri: {} }, {
-    host: async () => ({ runtime, root: directory, identity: 'local-test', trees: { prepare: async () => directory, validate: async () => directory } }),
+  const subscriptions: { dispose(): unknown }[] = []
+  const prepare = async (ticketId: string) => { prepares.push(ticketId); await preparation?.(ticketId); return directory }
+  const lifecycle = module.exports.activateAutomation({ subscriptions, extensionUri: {} }, {
+    host: async () => ({ runtime, root: directory, identity: 'local-test', trees: { prepare, validate: prepare } }),
     guard: () => 'local-test', changed() {}, github: async () => {
       credentials++; await githubCredential?.()
-      return { origin: 'https://api.github.com', repository: values['github.repository'], account: 'agent',
+      return { origin: values['github.origin'] ?? 'https://api.github.com', repository: values['github.repository'], account: 'agent',
         allowedActors: values['github.allowedActors'] ?? [], token: `github-credential-${credentials}` }
     },
   })
   const snapshot = () => panel.snapshot() as { settings: { revision: number; value: AutomationSettings } }
-  return { directory, runtime, values, requests, signins, errors, warnings, runs, snapshot,
+  return { directory, runtime, values, requests, signins, errors, warnings, runs, aborts, prepares, snapshot, fireConfiguration,
+    permission: (request: AgentRun, input: PermissionRequest) => {
+      assert.ok(permission, 'The actual native Copilot permission callback must be registered')
+      return permission(input, { sessionId: request.sessionId, ticketId: request.ticketId, rootSessionId: request.sessionId, directory: request.directory, signal: request.signal })
+    },
+    onPrepare: (handler: (ticketId: string) => Promise<void>) => { preparation = handler },
     chooseWarnings: (...choices: (string | undefined)[]) => { warningChoices.push(...choices) },
     onWarning: (handler?: (entry: HostWarning) => string | undefined | Promise<string | undefined>) => { warning = handler },
     onAssessment: (handler: (prompt: string) => AssessmentOutcome | Promise<AssessmentOutcome>) => { assessor = handler },
@@ -113,7 +132,7 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
     respond: (handler: (url: URL, init?: RequestInit) => unknown) => { response = handler },
     onSignIn: (handler: () => void | Promise<void>) => { signIn = handler },
     onGitHubCredential: (handler: () => void | Promise<void>) => { githubCredential = handler },
-    close: async (preserveStorage = false) => { await lifecycle.shutdown(); runtime.dispose(); if (!preserveStorage) rmSync(directory, { recursive: true, force: true }) },
+    close: async (preserveStorage = false) => { await lifecycle.shutdown(); for (const subscription of subscriptions) subscription.dispose(); runtime.dispose(); if (!preserveStorage) rmSync(directory, { recursive: true, force: true }) },
   }
 }
 
@@ -1500,5 +1519,216 @@ test('GitHub native generation cannot close a known PR from a lifecycle response
     f.values['github.repository'] = 'company/project'; f.respond(url => url.pathname.endsWith('/pulls/42') ? pull(42, true, true) : [])
     await f.poll()
     assert.equal(f.runtime.get(ticket.id).follows!.find(follow => follow.thread === `${ref.source}:42`)!.closed?.outcome, 'merged')
+  } finally { release(); await f.close() }
+})
+
+
+type LiveTarget = 'github' | 'chat' | 'channel'
+const liveShell: PermissionRequest = { kind: 'shell', fullCommandText: 'npm test', commands: [], intention: 'Run the approved ticket verification',
+  hasWriteFileRedirection: false, possiblePaths: [], possibleUrls: [], canOfferSessionApproval: false }
+function liveConfiguration(target: LiveTarget): Record<string, unknown> {
+  return target === 'github' ? { 'github.repository': 'company/project', 'github.allowedActors': ['owner'] }
+    : { 'teams.tenantId': tenant, 'teams.allowedActors': [nativeActor], 'teams.chatIds': target === 'chat' ? [chat] : [], 'teams.channels': target === 'channel' ? [channel] : [] }
+}
+function liveTrigger(f: ReturnType<typeof fixture>, target: LiveTarget, review = false) {
+  const common = { sourceConfigId: 'native-live-scope', nativeThreadId: target === 'github' ? '42' : '100', human: true, bot: false, allowedActor: true, subscribed: true, addressed: 'mention' as const, createdAt: new Date().toISOString() }
+  const context: SourceContext = target === 'github'
+    ? { ...common, provider: 'github', origin: String(f.values['github.origin'] ?? 'https://api.github.com'), repository: String(f.values['github.repository']), account: 'agent', number: 42,
+      isPullRequest: review, kind: review ? 'review-comment' : 'comment', commentId: review ? 301 : 100, ...(review ? { reviewRootCommentId: 300, reviewThreadId: 'PRRT_live_scope' } : {}) }
+    : { ...common, provider: 'teams', tenantId: String(f.values['teams.tenantId']), rootMessageId: '100', messageId: '101',
+      ...(target === 'chat' ? { chatId: (f.values['teams.chatIds'] as string[])[0]! } : (f.values['teams.channels'] as typeof channel[])[0]!) }
+  return sourceTrigger({ id: `live-native-${target}${review ? '-review' : ''}`, source: target === 'github' ? 'github' : 'teams', actor: target === 'github' ? 'owner' : nativeActor,
+    text: 'LIVE_SCOPE_ORIGINAL_REQUEST', thread: common.nativeThreadId, context, url: target === 'github' ? `https://github.com/company/project/pull/42#${review ? 'discussion_r301' : 'issuecomment-100'}` : `https://teams.microsoft.com/l/message/${encodeURIComponent(chat)}/101` })
+}
+async function liveStart(f: ReturnType<typeof fixture>, target: LiveTarget, options: { local?: boolean; checkpoint?: boolean; preparing?: boolean; review?: boolean } = {}) {
+  await f.initialize(); await f.save({ enabled: true, acceptMode: 'off', pollIntervalMs: 3_600_000, execution: { retryLimit: 0 } })
+  f.respond(url => url.origin === 'https://graph.microsoft.com' ? { value: [] } : [])
+  const trigger = liveTrigger(f, target, options.review)
+  const ticket = options.local ? f.runtime.create('Locally approved imported work', { source: target === 'github' ? 'github' : 'teams', id: trigger.id, actor: trigger.actor.id, context: trigger.meta.provider as SourceContext, url: trigger.url }) : (() => {
+    f.runtime.engine.receive(trigger)
+    const decision = f.runtime.engine.decide(trigger.id, { kind: 'accept', title: 'Approved live source work', scope: 'Only the original source request', reason: 'Addressed listed requester' })
+    return f.runtime.get(decision.ticketId!)
+  })()
+  f.onWorker(async request => {
+    if (options.checkpoint) { await new Promise(resolve => setTimeout(resolve, 5)); await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'waiting', summary: 'Waiting at a durable source checkpoint' }) }
+    else await new Promise<void>(resolve => { if (request.signal.aborted) resolve(); else request.signal.addEventListener('abort', () => resolve(), { once: true }) })
+  })
+  f.chooseWarnings('Run within approved tickets', 'Keep replies local'); await f.start()
+  if (!options.preparing) await ancestryWait(() => f.runs.length === 1 && (!options.checkpoint || ancestryIdle(f)), 'The live source fixture did not start its actual worker')
+  return { ticketId: ticket.id, trigger, originId: ticket.origin.triggerId }
+}
+
+const liveChanges = [
+  { label: 'GitHub repository', target: 'github', key: 'github.repository', next: 'company/replacement' },
+  { label: 'GitHub origin', target: 'github', key: 'github.origin', next: 'https://github.example/api/v3' },
+  { label: 'Teams tenant', target: 'chat', key: 'teams.tenantId', next: account },
+  { label: 'Teams chat', target: 'chat', key: 'teams.chatIds', next: ['19:replacement@thread.v2'] },
+  { label: 'Teams team', target: 'channel', key: 'teams.channels', next: [{ ...channel, teamId: account }] },
+  { label: 'Teams channel', target: 'channel', key: 'teams.channels', next: [{ ...channel, channelId: '19:replacement@thread.tacv2' }] },
+] as const
+for (const change of liveChanges) {
+  test(`live native ${change.label} withdrawal rejects permission and custom tools before an event, then aborts the active backend`, async () => {
+    const f = fixture(liveConfiguration(change.target))
+    try {
+      const original = await liveStart(f, change.target), run = f.runs[0]!
+      assert.equal((await f.permission(run, liveShell)).kind, 'approve-once')
+      assert.equal((await f.permission({ ...run, sessionId: 'wrong-root-session' }, liveShell)).kind, 'reject')
+      f.values[change.key] = structuredClone(change.next)
+      assert.equal((await f.permission(run, liveShell)).kind, 'reject', 'Current native receiving identity must be checked without relying on a config event')
+      await assert.rejects(run.tools.find(tool => tool.name === 'orchestrator_read')!.invoke({ resource: 'ticket' }), /authoriz|revok|scope|ended|abort/i)
+      f.fireConfiguration(change.key)
+      await ancestryWait(() => run.signal.aborted && f.aborts.includes(original.ticketId), 'The native configuration event did not abort the obsolete worker')
+      assert.equal(f.runs.length, 1)
+      assert.ok(f.runtime.repositories.triggers.get(original.originId), 'Revocation must retain the historical source request')
+    } finally { await f.close() }
+  })
+}
+
+test('live native held interactive approval rechecks source scope after the operator answers', async () => {
+  const f = fixture(liveConfiguration('github'))
+  let release!: () => void, offered = false, done = false
+  const approval = new Promise<void>(resolve => { release = resolve })
+  try {
+    await liveStart(f, 'github'); const run = f.runs[0]!
+    f.onWarning(async entry => { if (entry.message.startsWith('Allow shell')) { offered = true; await approval } return entry.choices[0] })
+    const decision = Promise.resolve(f.permission(run, { ...liveShell, managedApprovalRequired: true })).then(value => { done = true; return value })
+    await ancestryWait(() => offered || done); assert.equal(offered, true)
+    f.values['github.repository'] = 'company/replacement'; release()
+    assert.equal((await decision).kind, 'reject', 'An old-scope consent dialog cannot approve a command after its source has been withdrawn')
+    f.fireConfiguration('github.repository'); await ancestryWait(() => run.signal.aborted)
+  } finally { release(); await f.close() }
+})
+
+test('live native scope is revalidated after delayed preparation before any backend turn', async () => {
+  const f = fixture(liveConfiguration('github'))
+  let release!: () => void
+  const preparation = new Promise<void>(resolve => { release = resolve })
+  try {
+    f.onPrepare(async () => preparation)
+    const original = await liveStart(f, 'github', { preparing: true })
+    await ancestryWait(() => f.prepares.includes(original.ticketId))
+    f.values['github.repository'] = 'company/replacement'; release()
+    await ancestryWait(() => f.runs.length > 0 || !f.runtime.repositories.automation().effects.some(effect => ['start', 'deliver'].includes(effect.kind) && effect.status === 'running'))
+    assert.equal(f.runs.length, 0, 'No backend may start from a formerly valid mandate after async preparation')
+    assert.ok(f.runtime.repositories.triggers.get(original.originId))
+  } finally { release(); await f.close() }
+})
+
+for (const target of ['github', 'chat'] as const) {
+  test(`live native ${target} withdrawal remains enforced for persisted assignments and sessions after reopen`, async () => {
+    const configuration = liveConfiguration(target)
+    let current: ReturnType<typeof fixture> | undefined = fixture(configuration)
+    const directory = current.directory
+    try {
+      const original = await liveStart(current, target, { checkpoint: true }), sessionId = current.runs[0]!.sessionId
+      const history = structuredClone(current.runtime.repositories.triggers.get(original.originId))
+      await current.close(true); current = undefined
+      const replacement = target === 'github' ? { 'github.repository': 'company/replacement' } : { 'teams.chatIds': ['19:replacement@thread.v2'] }
+      current = fixture({ ...configuration, ...replacement }, directory); const reopened = current
+      await reopened.initialize()
+      try { reopened.runtime.followup(original.ticketId, 'Resume the original source work after storage reopen') } catch { /* A revoked persisted mandate may refuse the followup immediately. */ }
+      reopened.respond(url => url.origin === 'https://graph.microsoft.com' ? { value: [] } : [])
+      reopened.chooseWarnings('Run within approved tickets', 'Keep replies local'); await reopened.start()
+      await new Promise(resolve => setTimeout(resolve, 30))
+      assert.equal(reopened.runs.length, 0, 'A persisted session does not retain source authority after its exact receiving identity is removed')
+      assert.equal(reopened.runtime.repositories.automation().sessions.find(session => session.ticketId === original.ticketId)!.sessionId, sessionId)
+      assert.deepEqual(reopened.runtime.repositories.triggers.get(original.originId), history)
+      assert.deepEqual(reopened.errors, [])
+    } finally { if (current) await current.close(); else rmSync(directory, { recursive: true, force: true }) }
+  })
+}
+
+test('live native equivalent GitHub URL and repository case retain the active grant', async () => {
+  const f = fixture(liveConfiguration('github'))
+  try {
+    await liveStart(f, 'github'); const run = f.runs[0]!
+    f.values['github.origin'] = 'https://API.GITHUB.COM/'; f.values['github.repository'] = 'COMPANY/PROJECT'
+    assert.equal((await f.permission(run, liveShell)).kind, 'approve-once')
+    f.fireConfiguration('github.origin', 'github.repository'); await new Promise(resolve => setTimeout(resolve, 15))
+    assert.equal(run.signal.aborted, false); assert.ok(await run.tools.find(tool => tool.name === 'orchestrator_read')!.invoke({ resource: 'ticket' }))
+  } finally { await f.close() }
+})
+
+test('live native Teams UUID normalization and additive scopes retain the original configured channel', async () => {
+  const tenantWithLetters = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', teamWithLetters = 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff'
+  const original = { teamId: teamWithLetters, channelId: channel.channelId }
+  const f = fixture({ ...liveConfiguration('channel'), 'teams.tenantId': tenantWithLetters, 'teams.channels': [original] })
+  try {
+    await liveStart(f, 'channel'); const run = f.runs[0]!
+    f.values['teams.tenantId'] = tenantWithLetters.toUpperCase()
+    f.values['teams.channels'] = [{ ...original, teamId: teamWithLetters.toUpperCase() }, { teamId: account, channelId: '19:added@thread.tacv2' }]
+    f.values['teams.chatIds'] = ['19:added@thread.v2']
+    assert.equal((await f.permission(run, liveShell)).kind, 'approve-once')
+    f.fireConfiguration('teams.tenantId', 'teams.channels', 'teams.chatIds'); await new Promise(resolve => setTimeout(resolve, 15))
+    assert.equal(run.signal.aborted, false); assert.ok(await run.tools.find(tool => tool.name === 'orchestrator_read')!.invoke({ resource: 'ticket' }))
+  } finally { await f.close() }
+})
+
+for (const target of ['github', 'chat'] as const) {
+  test(`live native locally approved ${target} import retains its worker and stored history while removed provider replies are revoked`, async () => {
+    const f = fixture(liveConfiguration(target))
+    try {
+      const original = await liveStart(f, target, { local: true }), run = f.runs[0]!, history = structuredClone(f.runtime.repositories.triggers.get(original.originId))
+      assert.equal(f.runtime.get(original.ticketId).mandate.actor.source, 'vscode')
+      if (target === 'github') f.values['github.repository'] = 'company/replacement'
+      else f.values['teams.chatIds'] = ['19:replacement@thread.v2']
+      assert.equal((await f.permission(run, liveShell)).kind, 'approve-once', 'The local operator grant survives withdrawal of imported provider context')
+      f.fireConfiguration(target === 'github' ? 'github.repository' : 'teams.chatIds'); await new Promise(resolve => setTimeout(resolve, 15))
+      assert.equal(run.signal.aborted, false)
+      const thread = original.trigger.threads[0]!, retained = await run.tools.find(tool => tool.name === 'orchestrator_read')!.invoke({ resource: `thread/${thread.source}:${thread.id}` })
+      assert.ok(JSON.stringify(retained).includes('Locally approved imported work'))
+      assert.deepEqual(f.runtime.repositories.triggers.get(original.originId), history)
+      f.values['delivery.enabled'] = true
+      await run.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'ready', summary: 'Locally authorized work completed after source removal' })
+      await ancestryWait(() => f.runtime.get(original.ticketId).ended?.outcome === 'completed' && f.runtime.repositories.automation().effects.some(effect => effect.kind === 'outbound' && ['cancelled', 'failed', 'completed'].includes(effect.status)))
+      assert.equal(f.runtime.repositories.automation().effects.find(effect => effect.kind === 'outbound')!.status, 'cancelled')
+      assert.equal(f.requests.filter(request => request.method === 'POST').length, 0, 'The retained local grant does not authorize writes to removed provider scope')
+    } finally { await f.close() }
+  })
+}
+
+test('live native review resolution rechecks the removed channel after its authenticated GraphQL lookup', async () => {
+  const f = fixture(liveConfiguration('github'))
+  let release!: () => void, started = false, done = false
+  const lookup = new Promise<void>(resolve => { release = resolve })
+  try {
+    const original = await liveStart(f, 'github', { local: true, review: true }), run = f.runs[0]!
+    f.values['delivery.enabled'] = true
+    f.respond(async (url, init) => {
+      if (url.pathname !== '/graphql') return []
+      const body = JSON.parse(String(init?.body))
+      if (body.query.startsWith('query')) {
+        started = true; await lookup
+        return { data: { repository: { pullRequest: { reviewThreads: { nodes: [{ id: 'PRRT_live_scope', isResolved: false, comments: { nodes: [{ databaseId: 300 }] } }], pageInfo: { hasNextPage: false } } } } } }
+      }
+      return { data: { resolveReviewThread: { thread: { id: 'PRRT_live_scope', isResolved: true } } } }
+    })
+    const resolution = run.tools.find(tool => tool.name === 'orchestrator_review_resolve')!.invoke({ trigger_id: original.originId }).then(value => { done = true; return { value } }, error => { done = true; return { error } })
+    await ancestryWait(() => started || done, 'The review tool did not reach its exact authenticated lookup'); assert.equal(started, true)
+    f.values['github.repository'] = 'company/replacement'; release()
+    const outcome = await resolution
+    const writes = f.requests.filter(request => request.body && JSON.parse(request.body).query?.startsWith('mutation'))
+    assert.equal(writes.length, 0, 'A removed receiving channel must prevent the actual review mutation after its read await')
+    assert.ok('error' in outcome); assert.equal((await f.permission(run, liveShell)).kind, 'approve-once')
+  } finally { release(); await f.close() }
+})
+
+test('live native deferred reply revocation preserves an already-attempted journal instead of silently cancelling it', async () => {
+  const f = fixture(liveConfiguration('github'))
+  let release!: () => void, started = false
+  const credential = new Promise<void>(resolve => { release = resolve })
+  try {
+    const original = await liveStart(f, 'github', { local: true }), run = f.runs[0]!
+    await f.poll(); f.values['delivery.enabled'] = true
+    f.onGitHubCredential(async () => { started = true; await credential })
+    await run.tools.find(tool => tool.name === 'orchestrator_ack')!.invoke({ trigger_id: original.originId, text: 'Imported request acknowledged' })
+    await ancestryWait(() => started)
+    const effect = f.runtime.repositories.automation().effects.find(effect => effect.kind === 'outbound')!
+    assert.ok(effect?.message); f.runtime.writeData(`delivery:${effect.message.id}`, { attempted: true })
+    f.values['github.repository'] = 'company/replacement'; f.fireConfiguration('github.repository'); release()
+    await ancestryWait(() => f.runtime.repositories.automation().effects.find(row => row.id === effect.id)!.status === 'failed')
+    assert.deepEqual(f.runtime.readData(`delivery:${effect.message.id}`), { attempted: true })
+    assert.equal(f.requests.filter(request => request.method === 'POST').length, 0)
+    assert.equal((await f.permission(run, liveShell)).kind, 'approve-once')
   } finally { release(); await f.close() }
 })

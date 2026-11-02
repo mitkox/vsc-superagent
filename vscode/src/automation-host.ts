@@ -20,6 +20,7 @@ import { readTeamsMembers } from './membership.ts'
 import { restartChangedScan } from './checkpoints.ts'
 import { SourceResources } from './source-resources.ts'
 import { sendDurableReply } from './outbound.ts'
+import { receivesNativeChannel, receivesNativeSource } from './receiving-scope.ts'
 
 export interface AutomationHost { runtime: TicketRuntime; trees: Worktrees; root: string; identity: string }
 export interface AutomationHooks {
@@ -344,6 +345,8 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
       const promptParts: Record<string, string> = JSON.parse(await readFile(vscode.Uri.joinPath(context.extensionUri, 'dist', 'prompts', 'defaults.json').fsPath, 'utf8').catch(() => '{}'))
       service = new AutomationService(h.runtime, { backend, prepare: (ticket, directory) => directory === undefined ? h.trees.prepare(ticket.id) : h.trees.validate(ticket.id, directory), poll, send, changed: notify,
         systemPrompt: prompt, promptParts, claimPullRequest, canSend: () => config().get('delivery.enabled', false),
+        receivesSource: input => receivesNativeSource(input, receivingConfig()),
+        receivesChannel: channel => receivesNativeChannel(channel, receivingConfig()),
         resolveThread: async (family, id, signal) => {
           if (family !== 'github' || !/^[1-9]\d*$/.test(id)) throw new Error('Use a complete scoped Teams thread identity')
           const credential = await github(); signal.throwIfAborted()
@@ -470,6 +473,12 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
     notify()
     return result
   }
+
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
+    if (!service || closing || !['superagent.github', 'superagent.teams', 'superagent.delivery.enabled'].some(key => event.affectsConfiguration(key))) return
+    // Receiving checks read native configuration live; preserve normal partial policy/membership saves.
+    service.kick()
+  }))
 
   const register = (name: string, callback: () => Promise<unknown>) => context.subscriptions.push(vscode.commands.registerCommand(`superagent.${name}`, () =>
     callback().catch(() => vscode.window.showErrorMessage('Superagent could not complete the operation. Check configured credentials, Copilot CLI sign-in and service policy.'))))

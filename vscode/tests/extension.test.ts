@@ -54,6 +54,12 @@ function fixture() {
     requests: URL[] = [],
     signins: string[][] = [];
   const disposable = { dispose() {} };
+  type ConfigurationEvent = { affectsConfiguration(section: string): boolean };
+  const configurationListeners = new Set<(event: ConfigurationEvent) => void>();
+  const fireConfiguration = (changed: string) => {
+    const event = { affectsConfiguration: (section: string) => changed === section || changed.startsWith(section + ".") || section.startsWith(changed + ".") };
+    for (const listener of configurationListeners) listener(event);
+  };
   let promptCount = 0,
     gitActivations = 0;
   let approve = true;
@@ -63,6 +69,10 @@ function fixture() {
     workspace: {
       isTrusted: true,
       workspaceFolders: [{ uri: { scheme: "file", fsPath: root } }],
+      onDidChangeConfiguration(listener: (event: ConfigurationEvent) => void) {
+        configurationListeners.add(listener);
+        return { dispose: () => { configurationListeners.delete(listener); } };
+      },
       getConfiguration(section: string) {
         return {
           get: (key: string, fallback?: unknown) =>
@@ -73,6 +83,7 @@ function fixture() {
           }),
           update: async (key: string, value: unknown) => {
             values[`${section}.${key}`] = value;
+            fireConfiguration(`${section}.${key}`);
           },
         };
       },
