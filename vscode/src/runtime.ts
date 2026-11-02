@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { Engine, latestAssignment, runningAssignment } from '../../src/core/index.ts'
-import type { Policy, ReportState, Ticket, Trigger } from '../../src/core/index.ts'
+import { Engine, latestAssignment, runningAssignment, threadKey, isoTime } from '../../src/core/index.ts'
+import type { Follow, Mandate, Policy, ReportState, SourceScope, Ticket, Trigger } from '../../src/core/index.ts'
 import { DurableRepositories } from './state.ts'
+import type { GitHubRepositoryScope, SourceContext } from './sources.ts'
+import { githubBase, githubRepositoryRef, sourceTrigger } from './sources.ts'
 
-export interface ExternalOrigin { source: string; id: string; actor: string }
+export interface ExternalOrigin { source: string; id: string; actor: string; context?: SourceContext; url?: string; thread?: string }
 
 const REPORT_STATES = new Set<ReportState>(['progress', 'waiting', 'ready', 'blocked', 'failed', 'dropped'])
 const POLICY_VERSION = 'vscode-local-approval-v1'
@@ -14,7 +16,9 @@ function boundedText(value: unknown, label = 'text'): string {
 }
 
 function validateOrigin(origin: ExternalOrigin | undefined): void {
-  if (origin && (!origin.source || !origin.id || !origin.actor || Object.values(origin).some(value => typeof value !== 'string' || value.length > 1_000 || value.includes('\0')))) throw new Error('Invalid external origin')
+  if (!origin) return
+  if (!origin.source || !origin.id || !origin.actor || [origin.source, origin.id, origin.actor, origin.url ?? '', origin.thread ?? ''].some(value => typeof value !== 'string' || value.length > 4_000 || value.includes('\0'))) throw new Error('Invalid external origin')
+  if (origin.context !== undefined && (!origin.context || typeof origin.context !== 'object' || origin.context.provider !== origin.source || JSON.stringify(origin.context).length > 100_000 || JSON.stringify(origin.context).includes('\\u0000'))) throw new Error('Invalid external provider context')
 }
 
 /**
@@ -23,9 +27,14 @@ function validateOrigin(origin: ExternalOrigin | undefined): void {
  */
 export class TicketRuntime {
   private readonly repo: DurableRepositories
-  private readonly engine: Engine
-  constructor(storageDir: string) {
+  /** Native integration boundary; never hand the complete engine to a model. */
+  readonly engine: Engine
+  private automation = false
+  private automatedPolicy?: () => Policy
+  private automatedScope?: SourceScope
+  constructor(storageDir: string, options: { automation?: boolean } = {}) {
     this.repo = new DurableRepositories(storageDir)
+    this.automation = options.automation === true || this.repo.automation().activated
     const policy: Policy = {
       version: POLICY_VERSION,
       get paused() { return false },
@@ -38,20 +47,51 @@ export class TicketRuntime {
     }
     this.engine = new Engine({
       repo: this.repo,
-      policy: () => ({ ...policy, paused: this.repo.paused }),
-      scope: { scope: input => input.source === 'vscode' ? { listened: true, observed: false } : { listened: false, reason: 'localApprovalRequired' } },
-      assessor: { request: () => { throw new Error('Autonomous assessments are disabled') } },
-      executor: { start: () => {}, deliver: () => {}, stop: () => {} },
+      policy: () => this.automatedPolicy ? this.automatedPolicy() : { ...policy, paused: this.repo.paused },
+      scope: { scope: input => this.automatedScope ? this.automatedScope.scope(input) : input.source === 'vscode' ? { listened: true, observed: false } : { listened: false, reason: 'localApprovalRequired' } },
+      assessor: {
+        request: candidate => {
+          if (!this.automation) throw new Error('Autonomous assessments are disabled')
+          this.repo.enqueue({ id: `assessment:${candidate.evalId}`, kind: 'assessment', candidate })
+        },
+        release: evalId => {
+          if (!this.automation) return
+          this.repo.mutateAutomation(data => {
+            const effect = data.effects.find(row => row.id === `assessment:${evalId}`)
+            if (effect && effect.status === 'pending') effect.status = 'cancelled'
+          })
+        },
+      },
+      executor: {
+        start: (ticket, assignment) => { if (this.automation) this.repo.enqueue({ id: `start:${assignment.id}`, kind: 'start', ticketId: ticket.id, assignmentId: assignment.id }) },
+        deliver: (ticket, assignment) => {
+          if (!this.automation || !ticket.undelivered.length) return
+          const identity = createHash('sha256').update(JSON.stringify(ticket.undelivered)).digest('hex')
+          this.repo.enqueue({ id: `deliver:${assignment.id}:${identity}`, kind: 'deliver', ticketId: ticket.id, assignmentId: assignment.id, inputIds: [...ticket.undelivered] })
+        },
+        stop: (ticket, assignment, reason) => { if (this.automation) this.repo.enqueue({ id: `stop:${assignment.id}`, kind: 'stop', ticketId: ticket.id, assignmentId: assignment.id, reason }) },
+      },
       outbox: {
-        send: () => { throw new Error('External delivery requires separate operator approval') },
-        status: () => undefined,
-        withdraw: () => {},
+        send: message => {
+          if (!this.automation) throw new Error('External delivery requires separate operator approval')
+          this.repo.enqueue({ id: `outbound:${message.id}`, kind: 'outbound', ticketId: message.ticketId, message })
+        },
+        status: id => {
+          const effect = this.repo.automation().effects.find(row => row.id === `outbound:${id}`)
+          return !effect ? undefined : effect.status === 'completed' ? 'sent' : effect.status === 'cancelled' ? 'dropped' : 'pending'
+        },
+        withdraw: id => {
+          if (this.automation) this.repo.mutateAutomation(data => {
+            const effect = data.effects.find(row => row.id === `outbound:${id}`)
+            if (effect && ['pending', 'running', 'failed'].includes(effect.status)) effect.status = 'cancelled'
+          })
+        },
       },
       emit: event => this.repo.audit(event.type, 'ticketId' in event.data ? event.data.ticketId : undefined),
     })
     try {
       this.repo.atomic(() => {
-        for (const ticket of this.repo.tickets.open()) {
+        for (const ticket of this.automation ? [] : this.repo.tickets.open()) {
           const assignment = runningAssignment(ticket)
           if (!assignment || ['ready', 'waiting', 'blocked', 'failed'].includes(assignment.report?.state ?? '')) continue
           this.engine.report(ticket.id, { state: 'blocked', summary: 'The extension host stopped during work. Inspect the worktree and external state, then explicitly retry before continuing.' })
@@ -61,6 +101,117 @@ export class TicketRuntime {
   }
 
   get paused(): boolean { return this.repo.paused }
+  get repositories(): DurableRepositories { this.repo.assertOpen(); return this.repo }
+  configureAutomation(policy: () => Policy, scope: SourceScope): void {
+    this.repo.assertOpen(); this.automation = true; this.automatedPolicy = policy; this.automatedScope = scope
+  }
+  readData<T = unknown>(key: string): T | undefined { this.repo.assertOpen(); return this.repo.automation().metadata[key] as T | undefined }
+  writeData(key: string, value: unknown): void {
+    if (!/^[a-zA-Z0-9._:-]{1,200}$/.test(key) || ['__proto__', 'constructor', 'prototype'].includes(key)) throw new Error('Invalid metadata key')
+    let encoded: string | undefined
+    try { encoded = JSON.stringify(value) } catch { throw new Error('Metadata must be JSON data') }
+    if (value !== undefined && (encoded === undefined || Buffer.byteLength(encoded) > 1_000_000)) throw new Error('Metadata exceeds the size limit')
+    this.repo.mutateAutomation(data => { if (value === undefined) delete data.metadata[key]; else data.metadata[key] = JSON.parse(encoded!) })
+  }
+  /** Native host boundary: call only after authenticated, repository-scoped PR/head status readback. */
+  receiveVerifiedStatus(received: Trigger, scope: GitHubRepositoryScope): void {
+    const trigger = { ...received, at: isoTime(received.at) }
+    const provider = trigger.meta.provider as { kind?: unknown; number?: unknown; commitId?: unknown } | undefined
+    const ref = githubRepositoryRef(scope, Number(provider?.number))
+    if (provider?.kind !== 'checks' || trigger.human || trigger.actor.id !== 'github-actions[bot]' || trigger.actor.source !== ref.source
+      || trigger.source !== ref.source || !trigger.threads.some(thread => threadKey(thread) === threadKey(ref))
+      || typeof provider.commitId !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(provider.commitId)) throw new Error('Invalid verified PR status')
+    this.repo.atomic(() => {
+      const bindings = this.list().filter(ticket => this.sourceBinding(ticket, trigger, true)).map(ticket => ({ ticketId: ticket.id, mandate: this.digest(ticket.mandate) }))
+      this.writeData(`verified-ci:${trigger.id}`, { event: this.digest(trigger), bindings })
+      this.engine.receive(trigger)
+    })
+  }
+
+  /** Native host boundary: authenticate the default branch and exact head before recording this event. */
+  receiveVerifiedDefaultStatus(received: Trigger, scope: GitHubRepositoryScope & { branch: string; head: string }): void {
+    const trigger = { ...received, at: isoTime(received.at) }
+    const provider = trigger.meta.provider as Record<string, unknown> | undefined
+    const source = githubRepositoryRef(scope, 1).source
+    if (!scope.branch || scope.branch.length > 256 || /[\x00-\x20\x7f]/.test(scope.branch) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(scope.head)
+      || provider?.provider !== 'github' || provider.kind !== 'branch-checks' || typeof provider.origin !== 'string' || typeof provider.repository !== 'string'
+      || githubBase(provider.origin).href !== githubBase(scope.origin).href || provider.repository.toLowerCase() !== scope.repository.toLowerCase()
+      || provider.branch !== scope.branch || typeof provider.head !== 'string' || provider.head.toLowerCase() !== scope.head.toLowerCase()
+      || trigger.human || trigger.addressed || trigger.actor.id !== 'github-actions[bot]' || trigger.actor.source !== source || trigger.source !== source
+      || trigger.threads.length !== 1 || trigger.threads[0]?.source !== source || trigger.threads[0]?.id !== `branch:${scope.branch}` || trigger.channel) throw new Error('Invalid verified default-branch status')
+    this.repo.atomic(() => {
+      const bindings = this.list().filter(ticket => !ticket.ended && this.verifiedDefaultStatus(ticket.mandate)
+        && this.automatedPolicy?.().revalidate(ticket.mandate) && this.sourceBinding(ticket, trigger)).map(ticket => ({ ticketId: ticket.id, mandate: this.digest(ticket.mandate) }))
+      this.writeData(`verified-default-ci:${trigger.id}`, { event: this.digest(trigger), source, branch: scope.branch, head: scope.head.toLowerCase(), bindings })
+      this.engine.receive(trigger)
+    })
+  }
+  /** Exact event proof for intake, or its immutable source reference for later mandate revalidation. */
+  verifiedDefaultStatus(input: Trigger | Mandate): boolean {
+    const mandate = 'basis' in input ? input : undefined
+    const id = mandate?.basis.scope?.defaultStatusEventId
+    const trigger = mandate ? typeof id === 'string' ? this.repo.triggers.get(id) : undefined : input as Trigger
+    if (!trigger || trigger.human || trigger.addressed || trigger.actor.id !== 'github-actions[bot]' || trigger.actor.source !== trigger.source) return false
+    const provider = trigger.meta.provider as Record<string, unknown> | undefined
+    const receipt = this.readData<{ event: string; source: string; branch: string; head: string }>(`verified-default-ci:${trigger.id}`)
+    let at: string
+    try { at = isoTime(trigger.at) } catch { return false }
+    if (!receipt || provider?.kind !== 'branch-checks' || provider.provider !== 'github' || receipt.source !== trigger.source
+      || receipt.branch !== provider.branch || typeof provider.head !== 'string' || receipt.head !== provider.head.toLowerCase()
+      || receipt.event !== this.digest({ ...trigger, at })) return false
+    if (mandate && (!mandate.basis.scope?.provider || typeof mandate.basis.scope.provider !== 'object')) return false
+    return !mandate || mandate.actor.source === trigger.source && mandate.actor.id === trigger.actor.id
+      && this.digest(mandate.basis.scope?.provider) === this.digest(provider)
+  }
+
+  /** A new authenticated default-branch fact may update only its existing, still-rule-authorized CI ticket. */
+  verifiedDefaultInput(trigger: Trigger, ticket: Ticket): boolean {
+    if (ticket.ended || !this.verifiedDefaultStatus(trigger) || !this.verifiedDefaultStatus(ticket.mandate)
+      || !this.automatedPolicy?.().revalidate(ticket.mandate) || !this.sourceBinding(ticket, trigger)) return false
+    const receipt = this.readData<{ bindings?: { ticketId: string; mandate: string }[] }>(`verified-default-ci:${trigger.id}`)
+    return receipt?.bindings?.some(binding => binding.ticketId === ticket.id && binding.mandate === this.digest(ticket.mandate)) ?? false
+  }
+
+  /** Host-only result of a successful configured-bot assessment; no new mandate is granted. */
+  approveBotInput(trigger: Trigger, ticketIds: string[], rules: string[], policyVersion: string): void {
+    if (trigger.human || !rules.length || !['github', 'teams'].some(family => trigger.source.startsWith(`${family}:`))) throw new Error('Invalid approved bot context')
+    const bindings = ticketIds.flatMap(id => {
+      const ticket = this.get(id)
+      return !ticket.ended && this.sourceBinding(ticket, trigger) ? [{ ticketId: id, mandate: this.digest(ticket.mandate) }] : []
+    })
+    this.writeData(`approved-bot:${trigger.id}`, { event: this.digest({ ...trigger, at: isoTime(trigger.at) }), bindings, rules: [...rules], policyVersion })
+  }
+  approvedBotInput(trigger: Trigger, ticket: Ticket, enabledRules: string[], policyVersion: string): boolean {
+    const receipt = this.readData<{ event: string; bindings: { ticketId: string; mandate: string }[]; rules: string[]; policyVersion: string }>(`approved-bot:${trigger.id}`)
+    return !!receipt && receipt.event === this.digest(trigger) && receipt.policyVersion === policyVersion && receipt.rules.length > 0 && receipt.rules.every(rule => enabledRules.includes(rule))
+      && receipt.bindings.some(binding => binding.ticketId === ticket.id && binding.mandate === this.digest(ticket.mandate)) && this.sourceBinding(ticket, trigger)
+  }
+  botInputTargets(trigger: Trigger): Ticket[] { return this.list().filter(ticket => !ticket.ended && this.sourceBinding(ticket, trigger)) }
+
+  verifiedStatus(trigger: Trigger, ticket: Ticket): boolean {
+    const receipt = this.readData<{ event: string; bindings: { ticketId: string; mandate: string }[] }>(`verified-ci:${trigger.id}`)
+    return !!receipt && receipt.event === this.digest(trigger) && receipt.bindings.some(binding => binding.ticketId === ticket.id && binding.mandate === this.digest(ticket.mandate))
+      && this.sourceBinding(ticket, trigger, true)
+  }
+
+  private sourceBinding(ticket: Ticket, trigger: Trigger, pullRequest = false): boolean {
+    return trigger.threads.some(ref => {
+      const key = threadKey(ref), thread = this.repo.threads.get(key)
+      if (!thread?.subscriptions.includes(ticket.id) || thread.context?.includes(ticket.id)) return false
+      const origin = this.repo.triggers.get(ticket.origin.triggerId), provider = origin?.meta.provider as { isPullRequest?: unknown } | undefined
+      return !!ticket.follows?.some(follow => follow.thread === key) || (!pullRequest || provider?.isPullRequest === true) && !!origin?.threads.some(ref => threadKey(ref) === key)
+    })
+  }
+  private digest(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex') }
+
+  /** Exact persisted contributors to an accepted mandate; missing source records fail current authority closed. */
+  mandateOrigins(mandate: Mandate): (Trigger | undefined)[] | undefined {
+    const identity = this.digest(mandate)
+    const tickets = this.list().filter(ticket => this.digest(ticket.mandate) === identity)
+    if (!tickets.length) return undefined
+    const ids = [...new Set(tickets.flatMap(ticket => [ticket.origin.triggerId, ...ticket.origin.triggerIds ?? []]))]
+    return ids.map(id => this.repo.triggers.get(id))
+  }
   list(): Ticket[] { this.repo.assertOpen(); return this.repo.tickets.list() }
   get(id: string): Ticket {
     this.repo.assertOpen()
@@ -70,12 +221,12 @@ export class TicketRuntime {
     return ticket
   }
 
-  context(id: string): { ticket: Ticket; messages: { id: string; text: string; at: string }[] } {
+  context(id: string): { ticket: Ticket; messages: Trigger[] } {
     const ticket = this.get(id)
     const triggerIds = new Set([ticket.origin.triggerId, ...ticket.inputs.flatMap(input => input.kind === 'trigger' ? [input.triggerId] : [])])
     const messages = [...triggerIds].flatMap(triggerId => {
       const trigger = this.repo.triggers.get(triggerId)
-      return trigger ? [{ id: trigger.id, text: trigger.text, at: trigger.at }] : []
+      return trigger ? [trigger] : []
     })
     return { ticket, messages }
   }
@@ -111,7 +262,11 @@ export class TicketRuntime {
     const origin = this.repo.triggers.get(ticket.origin.triggerId)
     if (!origin?.threads[0]) throw new Error('Ticket origin is missing')
     return this.repo.atomic(() => {
-      this.engine.receive(this.trigger(request, origin.threads[0]!.id, externalOrigin))
+      const primary = origin.threads[0]!
+      const trigger = this.trigger(request, primary.source === 'vscode' ? primary.id : `followup-${randomUUID()}`, externalOrigin)
+      this.engine.receive(trigger)
+      // A named native follow-up belongs to its chosen ticket, including a ticket whose origin is a provider thread.
+      if (!this.get(id).inputs.some(input => input.kind === 'trigger' && input.triggerId === trigger.id)) this.engine.attach(id, trigger.id)
       return this.get(id)
     })
   }
@@ -144,23 +299,89 @@ export class TicketRuntime {
     return this.repo.atomic(() => this.engine.report(id, { state, summary: report, ...(attention ? { question: attention } : {}) }))
   }
 
-  reportWithPullRequest(id: string, state: ReportState, summary: string, question: string | undefined, number: number, source: string): Ticket {
+  reportWithPullRequest(id: string, state: ReportState, summary: string, question: string | undefined, number: number, source: GitHubRepositoryScope): Ticket {
     this.get(id)
     this.pullRequestNumber(number)
     if (!REPORT_STATES.has(state)) throw new Error('Invalid report state')
     const report = boundedText(summary, 'report summary')
     const attention = question === undefined ? undefined : boundedText(question, 'question')
-    const ref = this.pullRequestRef(number, source)
+    githubRepositoryRef(source, number)
     if (!this.matchesPullRequestSource(id, source)) throw new Error('Ticket follows another GitHub source')
     return this.repo.atomic(() => {
-      this.engine.bindThread(id, ref, true)
+      this.reconcileGitHubBindings(source)
+      this.engine.bindThread(id, githubRepositoryRef(source, number), true)
       return this.engine.report(id, { state, summary: report, ...(attention ? { question: attention } : {}) })
     })
   }
 
-  matchesPullRequestSource(id: string, source: string): boolean {
-    const prefix = `github:${createHash('sha256').update(boundedText(source, 'pull request source')).digest('hex')}:pr-`
-    return (this.get(id).follows ?? []).every(follow => !follow.thread.startsWith('github:') || follow.thread.startsWith(prefix))
+  matchesPullRequestSource(id: string, source: GitHubRepositoryScope): boolean {
+    const canonical = `${githubRepositoryRef(source, 1).source}:`, legacy = this.legacyPullRequestPrefix(source)
+    return (this.get(id).follows ?? []).every(follow => !follow.thread.startsWith('github:') || follow.thread.startsWith(canonical) || this.legacyPullRequestNumber(follow.thread, legacy) !== undefined)
+  }
+
+  /** Native unsubscription canonicalizes only repository aliases proved by configured scope. */
+  unsubscribeThread(thread: string, source?: GitHubRepositoryScope): boolean {
+    if (source && thread.startsWith('github:')) {
+      let namespace: string
+      try { namespace = githubRepositoryRef(source, 1).source } catch { return this.engine.unsubscribe(thread) }
+      const number = this.legacyPullRequestNumber(thread, this.legacyPullRequestPrefix(source)) ?? this.legacyPullRequestNumber(thread, `${namespace}:`)
+      if (number !== undefined) return this.repo.atomic(() => {
+        this.reconcileGitHubBindings(source)
+        return this.engine.unsubscribe(`${namespace}:${number}`)
+      })
+    }
+    return this.engine.unsubscribe(thread)
+  }
+
+  /** Migrate only aliases derived from the proved native repository configuration. Historical threads stay readable. */
+  reconcileGitHubBindings(source: GitHubRepositoryScope): void {
+    const namespace = githubRepositoryRef(source, 1).source, prefix = this.legacyPullRequestPrefix(source)
+    this.repo.atomic(() => {
+      const blocked = new Map(this.repo.threads.list().filter(thread => thread.ref.source === namespace && thread.unsubscribed?.length)
+        .map(thread => [thread.key, new Set(thread.unsubscribed!)]))
+      for (const legacy of this.repo.threads.list()) {
+        const number = this.legacyPullRequestNumber(legacy.key, prefix)
+        if (number === undefined || legacy.ref.source !== 'github' || threadKey(legacy.ref) !== legacy.key) continue
+        const ref = { source: namespace, id: String(number) }, key = threadKey(ref)
+        const current = this.repo.threads.get(key)
+        const unsubscribed = [...new Set([...current?.unsubscribed ?? [], ...legacy.unsubscribed ?? []])]
+        const optOut = new Set(unsubscribed)
+        if (optOut.size) blocked.set(key, optOut)
+        const movedOptOut = new Set(legacy.unsubscribed ?? [])
+        const subscriptions = [...new Set([...current?.subscriptions ?? [], ...legacy.subscriptions])].filter(id => !movedOptOut.has(id)
+          && (!optOut.has(id) || !!current?.subscriptions.includes(id) && !!current.context?.includes(id)))
+        // Existing canonical permissions win; new subscribers retain the legacy read-only restriction.
+        const context = [...new Set([...current?.context ?? [], ...(legacy.context ?? []).filter(id => legacy.subscriptions.includes(id) && !current?.subscriptions.includes(id))])]
+        if (!current || JSON.stringify(subscriptions) !== JSON.stringify(current.subscriptions) || JSON.stringify(context) !== JSON.stringify(current.context ?? [])
+          || JSON.stringify(unsubscribed) !== JSON.stringify(current.unsubscribed ?? [])) {
+          this.repo.threads.save({ ...current ?? { key, ref, createdAt: legacy.createdAt, correlated: [], pending: [], meta: {} },
+            subscriptions, ...(context.length ? { context } : {}), ...(unsubscribed.length ? { unsubscribed } : {}) })
+        }
+        // Move active subscriptions and opt-outs once, so stale aliases cannot undo a later positive canonical bind.
+        // Their context/history remain intact for immutable triggers that still name the old thread.
+        if (legacy.subscriptions.length || legacy.unsubscribed?.length) {
+          legacy.subscriptions = []
+          delete legacy.unsubscribed
+          this.repo.threads.save(legacy)
+        }
+      }
+      for (const ticket of this.repo.tickets.list()) {
+        if (!ticket.follows?.some(follow => this.legacyPullRequestNumber(follow.thread, prefix) !== undefined || blocked.get(follow.thread)?.has(ticket.id))) continue
+        const follows = new Map<string, Follow>()
+        // Prefer the canonical record's verified closure when both aliases exist.
+        for (const follow of ticket.follows.filter(follow => this.legacyPullRequestNumber(follow.thread, prefix) === undefined && !blocked.get(follow.thread)?.has(ticket.id))) follows.set(follow.thread, follow)
+        for (const follow of ticket.follows) {
+          const number = this.legacyPullRequestNumber(follow.thread, prefix)
+          if (number === undefined) continue
+          const key = `${namespace}:${number}`, current = follows.get(key)
+          if (blocked.get(key)?.has(ticket.id)) continue
+          follows.set(key, { thread: key, own: !!current?.own || follow.own, ...(current?.closed ?? follow.closed ? { closed: current?.closed ?? follow.closed } : {}) })
+        }
+        if (follows.size) ticket.follows = [...follows.values()]
+        else delete ticket.follows
+        this.repo.tickets.save(ticket)
+      }
+    })
   }
 
   stop(id: string): Ticket { this.get(id); return this.repo.atomic(() => this.engine.stopTicket(id, 'Stopped locally by the operator')) }
@@ -171,27 +392,36 @@ export class TicketRuntime {
     this.repo.atomic(() => { this.repo.setPaused(value); this.repo.audit(value ? 'processing.paused' : 'processing.resumed') })
   }
 
-  bindPullRequest(id: string, number: number, own: boolean, source: string): Ticket {
+  bindPullRequest(id: string, number: number, own: boolean, source: GitHubRepositoryScope): Ticket {
     this.get(id)
     this.pullRequestNumber(number)
     if (typeof own !== 'boolean') throw new Error('Invalid pull request ownership')
-    return this.repo.atomic(() => this.engine.bindThread(id, this.pullRequestRef(number, source), own))
+    return this.repo.atomic(() => {
+      this.reconcileGitHubBindings(source)
+      return this.engine.bindThread(id, githubRepositoryRef(source, number), own)
+    })
   }
 
-  closePullRequest(number: number, outcome: 'merged' | 'closed', source: string): void {
+  closePullRequest(number: number, outcome: 'merged' | 'closed', source: GitHubRepositoryScope): void {
     this.repo.assertOpen()
     this.pullRequestNumber(number)
     if (outcome !== 'merged' && outcome !== 'closed') throw new Error('Invalid pull request outcome')
-    this.repo.atomic(() => this.engine.threadClosed(this.pullRequestRef(number, source), outcome, new Date().toISOString()))
+    this.repo.atomic(() => {
+      this.reconcileGitHubBindings(source)
+      this.engine.threadClosed(githubRepositoryRef(source, number), outcome, new Date().toISOString())
+    })
   }
 
   dispose(): void { this.repo.dispose() }
 
   private trigger(text: string, thread: string, origin?: ExternalOrigin): Trigger {
+    const provider = origin?.context ? sourceTrigger({ id: origin.id, source: origin.context.provider, actor: origin.actor, text, thread: origin.thread ?? origin.context.nativeThreadId, context: origin.context, ...(origin.url ? { url: origin.url } : {}) }) : undefined
     return {
-      id: randomUUID(), source: 'vscode', threads: [{ source: 'vscode', id: thread }],
+      id: randomUUID(), source: 'vscode', threads: [{ source: 'vscode', id: thread }, ...(provider?.threads ?? [])],
       actor: { source: 'vscode', id: 'local-operator' }, human: true, addressed: 'direct',
-      at: new Date().toISOString(), text, meta: origin ? { externalOrigin: { ...origin }, locallyApproved: true } : { locallyApproved: true },
+      at: new Date().toISOString(), text, ...(origin?.url ? { url: origin.url } : {}),
+      ...(provider?.channel ? { channel: provider.channel } : {}),
+      meta: origin ? { externalOrigin: structuredClone(origin), ...(origin.context ? { provider: structuredClone(origin.context) } : {}), locallyApproved: true } : { locallyApproved: true },
     }
   }
   private requireUnpaused(): void { if (this.repo.paused) throw new Error('Superagent processing is paused') }
@@ -201,9 +431,14 @@ export class TicketRuntime {
       return prior?.source === origin.source && prior.id === origin.id
     }))
   }
-  private pullRequestRef(number: number, source: string): { source: string; id: string } {
-    const identity = boundedText(source, 'pull request source')
-    return { source: 'github', id: `${createHash('sha256').update(identity).digest('hex')}:pr-${number}` }
+  private legacyPullRequestPrefix(source: GitHubRepositoryScope): string {
+    const credentialKey = `github:${createHash('sha256').update(JSON.stringify([source.origin, source.repository])).digest('hex')}`
+    return `github:${createHash('sha256').update(credentialKey).digest('hex')}:pr-`
+  }
+  private legacyPullRequestNumber(key: string, prefix: string): number | undefined {
+    if (!key.startsWith(prefix)) return
+    const suffix = key.slice(prefix.length), number = Number(suffix)
+    return Number.isSafeInteger(number) && number > 0 && String(number) === suffix ? number : undefined
   }
   private pullRequestNumber(number: number): void { if (!Number.isSafeInteger(number) || number <= 0) throw new Error('Invalid pull request number') }
 }

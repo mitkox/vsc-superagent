@@ -61,6 +61,7 @@ export class Engine {
    */
   threadClosed(thread: ThreadRef, outcome: 'merged' | 'closed', at: string): void {
     // Normalize source timestamps (such as GitHub whole seconds) to canonical ISO form.
+    this.revalidateInputs()
     this.repo.atomic(() => { this.tickets.threadClosed(thread, outcome, isoTime(at)) })
   }
 
@@ -73,6 +74,7 @@ export class Engine {
    * moves forward by the pause's length once processing resumes. Each Eval and each ticket update takes one transaction.
    */
   evaluateDue(): void {
+    this.revalidateInputs()
     const policy = this.options.policy()
     for (const thread of this.repo.threads.active()) if (thread.evaluating) this.repo.atomic(() => { this.evals.due(thread, policy) })
     if (policy.paused) return
@@ -87,7 +89,7 @@ export class Engine {
   // The main Session
 
   /** The candidate of the Eval that holds a Trigger, as its assessor sees it; undefined while no Eval holds it. */
-  candidate(triggerId: string): Candidate | undefined { return this.evals.candidate(triggerId) }
+  candidate(triggerId: string): Candidate | undefined { this.revalidateInputs(); return this.evals.candidate(triggerId) }
   /**
    * Decide a Trigger: the Eval that holds it, or a direct Eval of it alone when none does, such as a person's explicit
    * request the main Session routes. A proactive candidate is accepted only in `auto` mode with enabled rules its assessment
@@ -97,7 +99,7 @@ export class Engine {
    * ticket's worker still decides the Trigger and the outcome is not a stop, or an inferred candidate is accepted outside `auto`
    * mode or without enabled matching rules.
    */
-  decide(triggerId: string, outcome: Outcome): Decision { return this.repo.atomic(() => this.evals.decide(triggerId, outcome)) }
+  decide(triggerId: string, outcome: Outcome): Decision { this.revalidateInputs(); return this.repo.atomic(() => this.evals.decide(triggerId, outcome)) }
   /**
    * Attach a Trigger to a ticket that the message points at: the ticket follows the Trigger's Threads and receives it as an
    * Input with the routing note, and the Eval that holds the Trigger ends, since the ticket has it now; the other Triggers of
@@ -163,7 +165,7 @@ export class Engine {
    * Assignment ends and a new one starts under the same Mandate.
    * @throws UserError when the ticket is unknown, has ended, or is not retryable.
    */
-  retryTicket(ticketId: string): Ticket { return this.repo.atomic(() => this.tickets.retry(ticketId)) }
+  retryTicket(ticketId: string): Ticket { this.revalidateInputs(); return this.repo.atomic(() => this.tickets.retry(ticketId)) }
 
   // The Executor
 
@@ -179,7 +181,12 @@ export class Engine {
    * an Assignment that no longer runs is dropped. Its worker reads each once its Session takes it into a step (`inputsRead`).
    */
   inputsDelivered(ticketId: string, assignmentId: string, inputIds: string[]): void {
-    this.repo.atomic(() => { this.assignments.delivered(ticketId, assignmentId, inputIds) })
+    this.revalidateInputs()
+    this.repo.atomic(() => {
+      const ticket = this.repo.tickets.get(ticketId)
+      const selected = this.options.policy().admitsInput && ticket ? inputIds.filter(id => ticket.inputs.some(input => input.id === id && !input.passive)) : inputIds
+      if (!this.options.policy().admitsInput || selected.length) this.assignments.delivered(ticketId, assignmentId, selected)
+    })
   }
   /**
    * The Executor's fact that the worker's Session of an open ticket took the messages that carried Inputs into a step, from
@@ -187,7 +194,12 @@ export class Engine {
    * @throws UserError when the ticket is unknown.
    */
   inputsRead(ticketId: string, inputIds: string[]): void {
-    this.repo.atomic(() => { this.assignments.read(ticketId, inputIds) })
+    this.revalidateInputs()
+    this.repo.atomic(() => {
+      const ticket = this.repo.tickets.get(ticketId)
+      const selected = this.options.policy().admitsInput && ticket ? inputIds.filter(id => ticket.inputs.some(input => input.id === id && !input.passive)) : inputIds
+      if (!this.options.policy().admitsInput || selected.length) this.assignments.read(ticketId, selected)
+    })
   }
   /** The Executor's fact that a turn of the worker of the Assignment that runs the ticket ended, after a report too. */
   turnEnded(ticketId: string, assignmentId: string): void {
@@ -204,6 +216,7 @@ export class Engine {
    * its pull request's), or one it does not follow.
    */
   markUnrelated(ticketId: string, thread: string, reason: string): void {
+    this.revalidateInputs()
     this.repo.atomic(() => { this.tickets.markUnrelated(ticketId, thread, reason) })
   }
   /**
@@ -236,14 +249,41 @@ export class Engine {
    * @throws UserError for an unknown or ended ticket, an ended assignment, a question that comes with a ready result or an
    * answer, or a question or answer that names a message that is not a person's or did not reach the ticket.
    */
-  report(ticketId: string, report: WorkerReport): Ticket { return this.repo.atomic(() => this.assignments.report(ticketId, report)) }
+  report(ticketId: string, report: WorkerReport): Ticket { return this.repo.atomic(() => {
+    const ticket = this.repo.tickets.get(ticketId)
+    for (const id of [report.askedBy, report.answers]) if (id && ticket) {
+      const trigger = this.repo.triggers.get(id)
+      if (trigger && !this.tickets.inputAllowed(ticket, trigger, false)) throw new UserError(report.askedBy === id ? 'notAsker' : 'notAnswerable')
+    }
+    return this.assignments.report(ticketId, report)
+  }) }
   /**
    * Handles an assignment that was running when the host stopped: restarts it with a recovery note unless its latest report is
    * `waiting`, `ready`, `blocked`, or `failed` and no Input reached its worker after that report, in which case it keeps its
    * Session and state and gets the Inputs that wait for it.
    */
   assignmentInterrupted(ticketId: string, assignmentId: string): void {
-    this.repo.atomic(() => { this.assignments.interrupted(ticketId, assignmentId) })
+    this.revalidateInputs()
+    this.repo.atomic(() => {
+      const ticket = this.repo.tickets.get(ticketId)
+      const assignment = ticket?.assignments.find(item => item.id === assignmentId)
+      const report = assignment?.report
+      // Retired delivered text is history, not proof of unfinished work after a stable report.
+      if (this.options.policy().admitsInput && ticket && report && ['waiting', 'ready', 'blocked', 'failed'].includes(report.state)
+        && ticket.inputs.some(input => input.passive && input.kind === 'trigger' && input.deliveredTo === assignmentId)
+        && !ticket.undelivered.length && !ticket.inputs.some(input => !input.passive && input.kind !== 'policy-changed'
+          && (input.at >= report.at || (input.kind === 'trigger' && input.deliveredTo === assignmentId && (input.readAt === null || !!input.readAt && input.readAt >= report.at))))) return
+      this.assignments.interrupted(ticketId, assignmentId)
+    })
+  }
+
+  /** Reconcile durable operational inputs and assessment queues against current source admission. */
+  revalidateInputs(): void {
+    if (!this.options.policy().admitsInput) return
+    this.repo.atomic(() => {
+      for (const ticket of this.repo.tickets.list()) this.tickets.revalidate(ticket)
+      this.evals.revalidate(this.options.policy())
+    })
   }
 
   // Settings
@@ -253,7 +293,8 @@ export class Engine {
    * under the new version.
    */
   policyChanged(from: string, to: string, effects: ReadonlyMap<string, PolicyEffect> = new Map()): void {
-    this.repo.atomic(() => { this.tickets.policyChanged(from, to, effects); this.evals.policyChanged(from, to) })
+    this.repo.atomic(() => { this.tickets.policyChanged(from, to, effects); this.evals.policyChanged(from, to);
+      for (const ticket of this.repo.tickets.list()) this.tickets.revalidate(ticket); this.evals.revalidate(this.options.policy()) })
   }
 }
 

@@ -77,14 +77,16 @@ export class Tickets extends EnginePart {
   threadClosed(thread: ThreadRef, outcome: 'merged' | 'closed', at: string): void {
     const closed = threadKey(thread)
     for (const ticket of this.repo.tickets.open()) {
-      const follow = ticket.follows?.find(item => item.thread === closed && !item.closed)
+      const follow = ticket.follows?.find(item => item.thread === closed)
       if (!follow) continue
-      follow.closed = { at, outcome }
-      this.repo.tickets.save(ticket)
+      if (!follow.closed) {
+        follow.closed = { at, outcome }
+        this.repo.tickets.save(ticket)
+      }
       const done = this.followsDone(ticket)
-      if (!done || this.unfinished(ticket, at)) continue
+      if (!done || this.unfinished(ticket, follow.closed.at)) continue
       // Work resumed after the close and finished ends now.
-      const resumed = Date.parse(latestAssignment(ticket)?.createdAt ?? '') > Date.parse(at)
+      const resumed = Date.parse(latestAssignment(ticket)?.createdAt ?? '') > Date.parse(follow.closed.at)
       this.end(ticket.id, 'executor', done.outcome, resumed ? this.now() : done.at)
     }
   }
@@ -111,6 +113,7 @@ export class Tickets extends EnginePart {
     const current = this.require(ticketId)
     if (current.ended?.by === 'human') throw new UserError('ticketStopped')
     if (!liveTicket(current) && !this.policy().revalidate(current.mandate)) throw new UserError('mandateRevoked')
+    if (!this.inputAllowed(current, trigger, false)) throw new UserError('notReached')
     return trigger
   }
   /**
@@ -216,6 +219,7 @@ export class Tickets extends EnginePart {
     const tickets = current?.subscriptions.filter(id => ticketId === undefined || id === ticketId) ?? []
     if (!current || !tickets.length) return false
     current.subscriptions = current.subscriptions.filter(id => !tickets.includes(id))
+    if (by === 'person') current.unsubscribed = [...new Set([...current.unsubscribed ?? [], ...tickets])]
     this.repo.threads.save(current)
     for (const id of tickets) {
       const ticket = this.repo.tickets.get(id)
@@ -233,12 +237,16 @@ export class Tickets extends EnginePart {
    */
   addInput(ticket: Ticket, input: TicketInput): void {
     if (ticket.inputs.some(existing => existing.id === input.id)) return
+    if (this.policy().admitsInput && input.kind === 'trigger') {
+      const trigger = this.repo.triggers.get(input.triggerId)
+      if (!trigger || !this.inputAllowed(ticket, trigger, !!input.context)) input.passive = true
+    }
     ticket.inputs.push(input); ticket.updatedAt = this.now()
     // Hold back automated inputs while the worker is waiting on a person.
     const held = liveTicket(ticket) && automatic(input) && waitsForPerson(ticket)
-    if (!held) ticket.undelivered.push(input.id)
+    if (!held && !input.passive) ticket.undelivered.push(input.id)
     this.repo.tickets.save(ticket)
-    if (!liveTicket(ticket) || held) return
+    if (!liveTicket(ticket) || held || input.passive) return
     const running = runningAssignment(ticket), latest = latestAssignment(ticket)
     if (running) this.options.executor.deliver(ticket, running)
     else if (latest?.state === 'pending' && !waitsForPerson(ticket)) this.options.executor.start(ticket, latest)
@@ -252,25 +260,101 @@ export class Tickets extends EnginePart {
   wake(ticketId: string): void {
     const ticket = this.repo.tickets.get(ticketId)
     if (!ticket || liveTicket(ticket) || ticket.ended?.by === 'human' || !ticket.undelivered.length) return
+    this.revalidate(ticket)
+    if (!ticket.undelivered.length) return
     const policy = this.policy()
     if (policy.paused) return
     if (!policy.revalidate(ticket.mandate)) { this.refuse(ticket); return }
     // Only a human's message resumes an ended ticket; bot/CI triggers wait alongside inputs from before the ticket ended.
-    const first = ticket.undelivered.map(id => ticket.inputs.find(input => input.id === id)).find(input => input?.kind === 'trigger' && input.human)
+    const first = ticket.undelivered.map(id => ticket.inputs.find(input => input.id === id)).find(input => !input?.passive && input?.kind === 'trigger' && input.human)
     if (first?.kind !== 'trigger') return
     const at = this.now()
+    const previousEnd = ticket.ended
     delete ticket.ended; ticket.updatedAt = at
     const assignment = this.newAssignment(ticket)
     // Prepend the resumed marker so it is delivered ahead of the waiting messages.
-    const resumed: TicketInput = { id: key('input', ticket.id, 'resumed', first.triggerId), kind: 'resumed', triggerId: first.triggerId, at }
+    const resumed: TicketInput = { id: key('input', ticket.id, 'resumed', first.triggerId), kind: 'resumed', triggerId: first.triggerId, at, ...policy.admitsInput ? { previousEnd } : {} }
     ticket.inputs.push(resumed); ticket.undelivered.unshift(resumed.id)
     this.repo.tickets.save(ticket)
     this.options.executor.start(ticket, assignment)
     this.emit('ticket.resumed', { ticketId, triggerId: first.triggerId })
   }
+  /** Current operational admission, separate from the right to read retained source history. */
+  inputAllowed(ticket: Ticket, trigger: Trigger, contextOnly?: boolean): boolean {
+    const inputs = ticket.inputs.filter(input => input.kind === 'trigger' && input.triggerId === trigger.id)
+    if (inputs.some(input => input.passive)) return false
+    const context = contextOnly ?? (inputs.length > 0 && inputs.every(input => input.kind === 'trigger' && !!input.context))
+    return this.policy().admitsInput?.(trigger, ticket, context) ?? true
+  }
+  /** Retire revoked operational inputs without rewriting what a worker actually received or read. */
+  revalidate(ticket: Ticket): void {
+    const policy = this.policy()
+    if (!policy.admitsInput) return
+    let changed = false
+    const denied = new Set<string>()
+    for (const input of ticket.inputs) {
+      if (input.kind !== 'trigger') continue
+      const trigger = this.repo.triggers.get(input.triggerId)
+      if (!input.passive && trigger && policy.admitsInput(trigger, ticket, !!input.context)) continue
+      denied.add(input.triggerId)
+      const retiring = !input.passive
+      if (retiring) { input.passive = true; changed = true }
+      const disposition = this.repo.triggers.disposition(input.triggerId)
+      if (disposition?.fanout.includes(ticket.id)) this.repo.triggers.saveDisposition(input.triggerId, { ...disposition,
+        fanout: disposition.fanout.filter(id => id !== ticket.id), context: disposition.context?.filter(id => id !== ticket.id) })
+      // Acknowledgement ids are shared per Trigger; another authorized owner may still need its queued message.
+      const authorized = trigger && this.repo.tickets.list().some(other =>
+        (other.origin.triggerIds.includes(trigger.id) || (disposition?.fanout.includes(other.id) && !disposition.context?.includes(other.id)))
+        && !other.inputs.some(item => item.passive && item.kind === 'trigger' && item.triggerId === trigger.id)
+        && policy.admitsInput!(trigger, other, false))
+      if (retiring && !authorized) this.options.outbox.withdraw(key('ack', input.triggerId))
+    }
+    for (const input of ticket.inputs) if (input.kind === 'resumed' && denied.has(input.triggerId) && !input.passive) {
+      input.passive = true; changed = true
+    }
+    const pending = ticket.undelivered.filter(id => !ticket.inputs.find(input => input.id === id)?.passive)
+    if (pending.length !== ticket.undelivered.length) { ticket.undelivered = pending; changed = true }
+    if (ticket.attention?.triggerId && denied.has(ticket.attention.triggerId)) {
+      this.replies.withdrawAttention(ticket.attention.id); delete ticket.attention; changed = true
+    }
+    if (ticket.answers?.some(id => denied.has(id))) { ticket.answers = ticket.answers.filter(id => !denied.has(id)); changed = true }
+    // Older versions could wake an ended ticket solely from an unadmitted sender. Cancel that derived assignment too.
+    const resumed = ticket.inputs.findLast(input => input.kind === 'resumed')
+    if (liveTicket(ticket) && resumed?.kind === 'resumed' && resumed.passive) {
+      const exact = ticket.assignments.findLastIndex(assignment => assignment.createdAt === resumed.at)
+      const index = exact >= 0 ? exact : ticket.assignments.findIndex(assignment => assignment.createdAt >= resumed.at)
+      const current = index < 0 ? [] : ticket.assignments.slice(index)
+      for (const input of ticket.inputs) if (!input.passive && input.kind === 'text' && current.some(assignment => input.id === key('input', ticket.id, 'restart', assignment.id))) {
+        input.passive = true; changed = true
+      }
+      const first = ticket.inputs.findLastIndex(input => input.kind === 'trigger' && input.triggerId === resumed.triggerId)
+      const independent = ticket.inputs.some((input, position) => !input.passive && input.kind !== 'policy-changed'
+        && input.kind !== 'resumed' && (position >= first || ticket.undelivered.includes(input.id)
+          || (input.kind === 'trigger' && current.some(assignment => assignment.id === input.deliveredTo))))
+      if (current.length && !independent) {
+        const previous = ticket.assignments[index - 1]
+        const done = this.followsDone(ticket)
+        const reported = previous?.report?.state
+        const outcome = reported === 'dropped' ? (done?.outcome ?? 'dropped')
+          : reported === 'ready' ? (!ticket.follows?.length ? 'completed' : done && previous?.endedAt && done.at <= previous.endedAt ? done.outcome : undefined) : undefined
+        const prior = resumed.previousEnd ?? (outcome && previous?.endedAt ? { at: previous.endedAt, by: 'executor' as const, outcome } : undefined)
+        for (const input of ticket.inputs) if (input.kind === 'policy-changed' && input.at >= resumed.at) input.passive = true
+        ticket.undelivered = ticket.undelivered.filter(id => !ticket.inputs.find(input => input.id === id)?.passive)
+        if (ticket.attention) { this.replies.withdrawAttention(ticket.attention.id); delete ticket.attention }
+        delete ticket.delivery
+        ticket.ended = prior ?? { at: this.now(), by: 'executor', outcome: 'stopped', reason: 'Resumption input is no longer admitted.' }
+        for (const assignment of current) if (assignment.state !== 'ended') {
+          this.endAssignment(ticket, assignment, 'inputAdmissionRevoked')
+          this.options.executor.stop(ticket, assignment, 'inputAdmissionRevoked')
+        }
+        changed = true
+      }
+    }
+    if (changed) { ticket.updatedAt = this.now(); this.repo.tickets.save(ticket) }
+  }
   /** The Triggers of a ticket's trigger Inputs, or of those of them whose Input ids are `ids`. */
   private triggersOf(ticket: Ticket, ids?: readonly string[]): Trigger[] {
-    return ticket.inputs.flatMap(input => input.kind === 'trigger' && (!ids || ids.includes(input.id))
+    return ticket.inputs.flatMap(input => !input.passive && input.kind === 'trigger' && (!ids || ids.includes(input.id))
       ? this.repo.triggers.get(input.triggerId) ?? [] : [])
   }
   /**
@@ -304,7 +388,10 @@ export class Tickets extends EnginePart {
       // The main Session that stopped this ticket on the message decides the rest of it itself, unless a ticket handed it back.
       const stopped = decision?.kind === 'stop' && decision.ticketId === ticketId && !disposition?.handbacks?.length
       const decided = !!decision && (settled(decision) || stopped)
-      if (!this.owners(trigger).length && !disposition?.acked?.length && !decided) this.queueForEval(trigger)
+      if (!this.owners(trigger).length && !disposition?.acked?.length && !decided) {
+        const policy = this.policy(), thread = this.thread(trigger.threads[0]!)
+        if (!policy.admitsInput || policy.gate(trigger, thread, this.ticketsOnThread(thread)).admissible) this.queueForEval(trigger)
+      }
     }
   }
   /** An ended ticket that cannot resume takes none of the messages that waited for it (see `letGo`). */
@@ -331,7 +418,7 @@ export class Tickets extends EnginePart {
    * in the Session out, so its delivery is the only one. An earlier end let go of what earlier Assignments left.
    */
   private requeueUntaken(ticket: Ticket, replaced: Assignment): void {
-    const untaken = ticket.inputs.filter(input => input.kind === 'trigger' && input.readAt === null && input.deliveredTo === replaced.id
+    const untaken = ticket.inputs.filter(input => !input.passive && input.kind === 'trigger' && input.readAt === null && input.deliveredTo === replaced.id
       && !ticket.undelivered.includes(input.id))
     ticket.undelivered.unshift(...untaken.map(input => input.id))
   }
@@ -374,7 +461,7 @@ export class Tickets extends EnginePart {
     const latest = latestAssignment(ticket)
     if (taken || !(Date.parse(latest?.createdAt ?? '') > Date.parse(at))) return taken
     const report = latest?.report
-    const later = ticket.inputs.some(input => input.kind !== 'policy-changed' && Date.parse(input.at) > Date.parse(report?.at ?? ''))
+    const later = ticket.inputs.some(input => !input.passive && input.kind !== 'policy-changed' && Date.parse(input.at) > Date.parse(report?.at ?? ''))
     return report?.state !== 'ready' || ticket.undelivered.length > 0 || later
   }
   /** Add a pending Assignment; a failed delivery to the one before it no longer concerns the ticket. */
@@ -407,15 +494,19 @@ export class Tickets extends EnginePart {
   followForContext(ticketId: string, ref: ThreadRef): boolean {
     if (!liveTicket(this.require(ticketId))) throw new UserError('ticketEnded')
     if (this.thread(ref).subscriptions.includes(ticketId)) return false
-    this.subscribe(ticketId, ref)
+    this.subscribe(ticketId, ref, false)
     const thread = this.thread(ref)
     thread.context = [...thread.context ?? [], ticketId]
     this.repo.threads.save(thread)
     return true
   }
   /** Subscribe a ticket to a Thread; later Triggers on it reach the ticket as Inputs, as the ticket's own once it was for context. */
-  private subscribe(ticketId: string, ref: ThreadRef): void {
+  private subscribe(ticketId: string, ref: ThreadRef, positive = true): void {
     const thread = this.thread(ref)
+    if (positive && thread.unsubscribed?.includes(ticketId)) {
+      thread.unsubscribed = thread.unsubscribed.filter(id => id !== ticketId)
+      if (!thread.unsubscribed.length) delete thread.unsubscribed
+    }
     if (!thread.subscriptions.includes(ticketId)) { thread.subscriptions.push(ticketId); this.emit('thread.subscribed', { threadKey: thread.key, ticketId }) }
     if (thread.context?.includes(ticketId)) thread.context = thread.context.filter(id => id !== ticketId)
     this.repo.threads.save(thread)

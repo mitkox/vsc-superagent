@@ -4,5 +4,6 @@
 !LICENSE
 !SECURITY.md
 !agents/**
+!dist/prompts/**
 !dist/extension.cjs
 !dist/extension.cjs.sha256

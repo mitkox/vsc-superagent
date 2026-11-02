@@ -1,55 +1,61 @@
 # Superagent for Copilot
 
-A native VS Code extension that brings an approval-based ticket engine to GitHub Copilot. Select **Superagent** in Copilot's agents dropdown. It manages approved tasks, isolated worktrees, follow-ups, progress, questions, retries, pause/stop, and pull-request completion. GitHub and Microsoft Teams provide read-only inbox candidates.
+Continuous repository agents inside VS Code, using the original dsh-superagent ticket engine, the official GitHub Copilot SDK, GitHub and **Microsoft Teams**.
 
-This is an adaptation with enterprise safety controls. Production deployment requires the acceptance steps in [SECURITY.md](SECURITY.md). Native discovery, activation, agent contribution and tool registration were smoke-tested in an isolated VS Code Insiders 1.145 profile. Copilot model execution and Microsoft tenant access still require live qualification.
+An authorized request is assessed, assigned a persistent Copilot session and isolated Git worktree, and worked through implementation and verification. Source follow-ups, reviews and CI reach the same ticket. Acknowledgements, questions and results return to the original conversation when delivery is enabled. Supervision shows work needing attention, sources, triggers, decisions, execution, transcripts and versioned settings.
 
-## Build and install
+The service requires a running VS Code workspace extension host. Closing that host stops its workers; reopening resumes an enabled service and recovers durable assignments. It does not install an operating-system daemon.
 
-Requirements: VS Code **1.144+**, Git, a Copilot subscription permitted by your organization, Node **22.19+**, and npm. The version floor follows the stable API definitions used to build this package. No proposed API is required.
+## Install
 
-From `vscode/`:
+Requirements: VS Code **1.144+**, Git, Node **22.19+**, and an installed, authenticated **GitHub Copilot CLI** compatible with SDK **1.0.28** (connection validated with CLI **1.0.105**, protocol **3**). The SDK uses existing Copilot sign-in; no OpenAI or DeepSeek key is required. Organization policies and subscription permissions apply.
+
+From this directory:
 
 ```sh
 npm ci --ignore-scripts
 npm run package
-code --install-extension dist/vsc-superagent.vsix
+code-insiders --install-extension dist/vsc-superagent.vsix
 ```
 
-`npm run check` typechecks the extension and shared core, runs behavioral/security tests, bundles the extension, and checks the package's security properties. `npm run audit:production` audits shipped npm dependencies; the extension currently has none. The VSIX includes only the bundled extension, agent definition, license and documentation. Its bundle has a SHA-256 file for artifact verification. The publisher ID `superagent-local` is a local packaging identity, not a verified Marketplace publisher.
+Use `code` instead for a supported stable build. The publisher `superagent-local` is a local package identity. SDK JavaScript and adapted original prompts are bundled; the installed CLI runs through stdio. There is no extension HTTP listener or runtime download. Set `superagent.copilot.cliPath` when the executable is not on the extension host's PATH.
 
-## Local workflow
+## Start work
 
-1. Open one trusted local Git repository. Remote extension hosts with a local filesystem may work but need separate qualification. Virtual and multi-root workspaces are disabled.
-2. Run **Superagent: Apply Local Privacy Settings**. It explicitly offers to disable VS Code telemetry plus Copilot/Agent Host OpenTelemetry and debug file logging. Remove any `COPILOT_OTEL_*` or `OTEL_*` exporter environment overrides and reload. Superagent blocks its work tools while those known telemetry mechanisms are enabled, and also until `github.copilot.chat.agentDebugLog.fileLogging.enabled` is explicitly `false` (the command sets it; Copilot experiments can otherwise turn it on). A setup that never ran the command needs one reload after running it. Values that switch export off, such as `COPILOT_OTEL_FILE_EXPORTER_PATH=/dev/null`, are ignored, and the error names each active setting or variable.
-3. Run **Superagent: New Ticket** and approve the concrete request.
-4. Run **Superagent: Review / Continue Ticket**, choose the ticket, then **Open isolated worktree**. The extension creates a branch from the primary checkout's committed HEAD and opens the worktree in the same window. Dirty source files stay in the primary checkout.
-5. Select **Superagent** in Copilot Chat and ask it to work on the approved ticket. Its ticket tool requests local consent before providing task content to the selected model. Review native edit and terminal approvals normally.
-6. The report tool asks for independent native confirmation of the report. Reports can request human input or review. Pushes, PR creation, comments, merges and deployments require separate authorization through your normal tools.
-7. Include a PR number in an approved report to bind it to the configured GitHub repository. **Refresh followed pull requests** reads actual PR state before recording a merge/close. An unbound ready ticket completes locally; that does not prove code review, CI, merging, deployment or production acceptance.
+1. Open one trusted, file-backed Git repository. Multi-root and virtual workspaces are unsupported.
+2. Run **Superagent: Apply Local Privacy Settings**, then reload. Known VS Code/Copilot exporters must be disabled before work tools become available. The debug file logging setting `github.copilot.chat.agentDebugLog.fileLogging.enabled` must be explicitly `false`, including when set by policy or a language-specific override. Values that disable exporters, such as `COPILOT_OTEL_FILE_EXPORTER_PATH=/dev/null`, are accepted; active exporter errors name the setting or variable without exposing its value.
+3. Configure the source scopes and allowed requester identities below.
+4. Run **Superagent: Check Copilot Connection** to check CLI protocol and login without a model request.
+5. Run **Superagent: Start Service**. Choose per-tool confirmation or execution within approved ticket mandates, and whether source replies are enabled. Complete Microsoft sign-in for Teams.
+6. Select **Superagent** in the Copilot agent picker and state the work, use **@superagent**, or submit a request in an enabled source conversation.
+7. Use **Superagent: Open Supervision** to answer questions, add follow-ups, inspect transcripts, pause, stop, retry or change policy.
 
-Use the Explorer's **Superagent Tickets** view for status. **Pause / Resume Intake**, **Stop Ticket** and **Retry Blocked Ticket** are native commands. Stop revokes future ticket access; use Copilot Chat's Stop control to cancel tools already executing. Crash recovery marks interrupted work blocked and requires an explicit retry. One ticket may actively work at a time; waiting/blocked tickets do not occupy that slot.
+The native agent delegates the unchanged request rather than implementing a duplicate task in the routing chat. `@superagent /status` reads state and `/panel` opens supervision. Dispatch supports an explicit ticket ID for an in-scope follow-up. The previous manual New Ticket / Review / Continue workflow remains available.
 
-## GitHub inbox
+Workers start from the primary checkout's committed HEAD, preserving dirty files. Each ticket retains its worktree, branch and Copilot session. Inspection opens a separate window when the service is active. Ticket authorization covers unattended shell commands only when the operator chooses that mode. These commands run as the operator; a worktree is not an OS sandbox. Managed approvals, sandbox bypasses, unknown tools and direct SDK file requests outside the ticket still require native confirmation. Shell path/URL metadata is advisory and does not confine programs: commands may read environment variables, access files beyond the worktree and use the network as the operator. The built-in source reply switch does not restrict arbitrary CLI commands; use an OS/container sandbox and network policy for isolation.
 
-Configure these at user or managed application scope. Repository settings cannot set security-sensitive source configuration:
+## GitHub
+
+Configure application/user settings, never repository settings:
 
 ```json
 {
   "superagent.github.origin": "https://api.github.com",
   "superagent.github.repository": "your-org/your-repo",
   "superagent.github.account": "your-agent-account",
-  "superagent.github.allowedActors": ["approved-requester"]
+  "superagent.github.allowedActors": ["approved-requester"],
+  "superagent.github.allowedBots": ["github-actions[bot]"],
+  "superagent.github.observe": false
 }
 ```
 
-For GitHub Enterprise Server, set the explicitly approved HTTPS API base, such as `https://github.example.com/api/v3`. Run **Superagent: Configure Source Credential** to enter a fine-grained token limited to that repository with Issues, Pull requests and Metadata read permissions. Credentials are held in VS Code SecretStorage and bound to the exact origin and repository. Re-enter credentials after changing either. Do not put tokens in settings or repository files.
+GitHub Enterprise Server supports an explicitly configured HTTPS `/api/v3` base. **Configure Source Credential** stores a fine-grained token in VS Code SecretStorage, bound to the exact origin/repository. Intake needs Issues, Pull requests and Metadata read; CI needs Checks and Commit statuses read. Replies/review resolution need the corresponding write permissions. Worker Git/gh publishing uses its CLI identity and ticket delivery instructions independently.
 
-**Check GitHub / Teams Inbox** reads issue/PR bodies, issue comments, review comments and review bodies from allowed human senders that explicitly mention the configured account. The first issue and comment scan looks back 24 hours. Review discovery separately cycles through all open and closed PRs and their reviews, regardless of the PR's last update or the review's submission time, because the review-list API does not provide a reliable body-edit cursor. The first review cycle can therefore surface old requests. Later cycles detect changed review bodies by their content identity; unchanged decisions deduplicate across restarts. A candidate can start a ticket or be explicitly attached as a follow-up. Provider content never changes settings or starts execution by itself.
+Allowed people can mention the agent to request work. With `github.observe` enabled, unaddressed activity can be assessed under proactive rules. Subscribed threads deliver human/bot context without repeated mentions. Bots never grant explicit authority. Reviews have an independent resumable scan because edits lack a reliable PR-update cursor. Reported PRs are verified against the actual source PR or the configured agent's `superagent/<ticket-id>` branch. Own PR discovery and actual provider close/merge readback update completion.
 
-## Microsoft Teams inbox
+## Microsoft Teams
 
-Configure your Entra tenant UUID, specific chat IDs and/or team/channel pairs, and allowed sender **Entra object UUIDs**, not display names:
+Teams replaces Feishu. Use Entra tenant/user **object UUIDs**, not display names:
 
 ```json
 {
@@ -62,18 +68,38 @@ Configure your Entra tenant UUID, specific chat IDs and/or team/channel pairs, a
 }
 ```
 
-Run **Check GitHub / Teams Inbox** and complete Microsoft sign-in through VS Code's built-in Microsoft authentication provider. The request pins the configured tenant using `VSCODE_TENANT:<tenant-id>`. Only configured sources are queried. Chat sources request delegated `Chat.Read`; channel sources request delegated `ChannelMessage.Read.All`. Channel access may require administrator consent. Your administrator must approve the VS Code authentication application's access under your tenant's policies. No app secret, bot registration, webhook receiver, service account, send permission, or Teams token pasted into this extension is required.
+The built-in Microsoft provider selects the configured tenant. Delegated scopes are `User.Read` for sender identity, `Chat.Read` and/or `ChannelMessage.Read.All` for intake. Replies add `ChatMessage.Send` and/or `ChannelMessage.Send`. Membership sync adds `ChatMember.Read`. Administrator consent and conditional-access policy may apply. No app secret, bot registration, webhook or token pasted into settings is required. Only public-cloud `https://graph.microsoft.com/v1.0` is supported.
 
-The extension reads only `https://graph.microsoft.com/v1.0`, including channel replies. It strips Teams HTML to plain text, rejects bot/application/system/deleted messages, and checks sender object IDs. Every allowed sender's message in a configured scope is a candidate; use dedicated intake chats/channels. It never posts, replies, reacts or marks messages read. Sovereign Microsoft clouds are not supported by this fixed-origin build.
+To synchronize requesters from a chat's members, set `superagent.teams.syncChatId` to one of the approved `chatIds`, then run **Superagent: Sync Teams Members** and review the replacement allowlist. Enable `superagent.teams.syncMembership` only when that chat's ongoing membership should authorize future requests.
 
-## Bounds and retained data
+Channel replies target the original root; chat replies use `replyWithQuote`. Context retains tenant, chat/team/channel, root, message, quote references, sender, edit time and URL. Sender identity is resolved through `/me` to exclude the service's own messages. HTML is reduced to text; attachments are not automatically downloaded or sent to a model.
 
-All polling is explicit and foreground: nothing watches while the editor is closed or runs on activation. A request times out after 10 seconds and accepts at most 1 MiB. GitHub review discovery scans at most one 25-PR page and 25 review pages per inbox check; it saves progress only after the batch is decided. Run the inbox check again when prompted to complete the cycle. Reviews edited after their PR was scanned appear on a later cycle; large histories may therefore take many checks and API requests. Review or PR pagination changes at a checkpoint restart the cycle without advancing it. Other GitHub lists and Teams chat and reply lists are limited to five pages. A Teams channel scan handles at most 25 roots per invocation and continues on subsequent inbox checks, retaining its lookback until the whole scan completes. If a partially processed page changes order, the channel scan restarts without advancing its cursor. Each source advances independently after its candidates are decided, so a failing source does not block the others. Teams chats stop at older history under Graph's explicit modification-date ordering. A single channel root with more than five pages of replies still exceeds the scan bound; large or frequently changing histories require a separately designed ingestion service. Pagination across requests depends on provider continuation behavior and has not been qualified against live services.
+## Policy, prompts and delivery
 
-Teams message identities now use the edit timestamp rather than the modification timestamp, so reactions do not create new candidates. Existing installations may see a one-time reappearance of an older message because receipts created with the previous identity format are not interchangeable; every candidate still requires local approval.
+Supervision Settings contains the versioned policy. Unlisted senders are ignored by default. Explicit allowed requests work in every proactive mode. Setting `admission.unlistedAddressed` to `explicit` deliberately lets anyone who addresses the agent originate work in that provider's configured scopes, including in `off` and `observe`. Removing a person from `allowedActors` does not deny new requests while another admission grant permits them. `off` ignores inferred candidates; `observe` assesses without starting proactive work; `auto` starts work only with enabled matching rules. Bots and unaddressed messages cannot receive explicit authority.
 
-Private local state is namespaced by the canonical Git common directory under the extension's global storage. Tickets include approved task/follow-up text and its provenance. Files use `0600`, directories `0700` on POSIX. Worktrees and branches are retained; the extension does not delete or reset them. Inbox decision receipts and cursors use VS Code's local global state and are not registered for Settings Sync. The last 2,000 metadata audit entries are retained. State is capped at 16 MiB and fails closed at capacity. These records are local operational data, not telemetry or an immutable compliance audit.
+The existing `sources.<provider>.admission` table remains a family-wide fallback, including future configured scopes. Optional `admissionByScope` rows override individual cells; omitted cells inherit the family fallback. Copy exact keys from **Configured receiving scope keys** in Settings. GitHub keys are `<repository source namespace>:issues`, `:pulls`, `:comments` (including reviews) and `:ci`. Teams keys bind the tenant and exact chat or team/channel: `tenant:<tenant UUID>:chat:<chat ID>` or `tenant:<tenant UUID>:team:<team UUID>:channel:<channel ID>`. These rows only apply to native configured receiving scopes; they do not add conversations or credentials. A dedicated support chat can use an explicit row while other chats retain the default ignore behavior. Removing a narrowing row can reveal a broader family fallback.
 
-After a crash, a stale `state.lock` intentionally prevents concurrent writers. Verify the previous extension host has stopped before removing only that lock in the relevant storage directory. Preserve `state.json`; corruption or incompatible versions fail closed. Back up state and worktrees together. Windows relies on OS access controls; file mode bits do not establish an ACL boundary there.
+Save and Restore ask for native approval when unlisted sender grants broaden, including dormant-source/reception activation and restoring a broader policy. The dialog names affected scopes and the possible operator-identity command grant. Unchanged and narrowing policies do not prompt. The exact validated candidate and base revision are rechecked after consent. Settings always displays committed grants; Start also summarizes persisted policy. Previously saved family grants retain their meaning on reopen, with no background or per-request consent dialogs. Weakening a current cell or disabling its source withdraws future authority; native-approved local imports retain their separate local grant.
 
-VS Code/Copilot/provider telemetry and service logging are separate from this extension. See [SECURITY.md](SECURITY.md) for the precise guarantees and release gates.
+Native requester, bot, enabled and observation changes apply immediately to the corresponding policy field; unchanged native fields preserve dashboard overrides. Per-field applied fingerprints survive reopen, and native configuration events, setup and polling share the same partial reconciliation. Permission checks project pending native changes without writing state. Legacy global fingerprints seed the new baseline unchanged when they match, or recover it from hash-proved settings history. If no baseline can be proved, one conservative migration narrows lists/switches against current native values; review old overrides before restoring them. Admission tables, scoped rows, rules and source history are preserved.
+
+Changing the native GitHub origin/repository or removing a Teams tenant/conversation withdraws source-derived execution, including active tool and permission requests. Equivalent canonical identities and added scopes retain existing grants. Unprovable historical provider scope fails closed; retained source history is preserved. Native-approved local imports retain their separate execution grant, but provider writes still require their original exact destination to be currently configured.
+
+The scoped `ci` row accepts only `unlistedUnaddressed: "inferred"` or `"ignore"`. Its inferred path requires authenticated default-branch readback, unaddressed reception, an active inferred mode and enabled matched rules before execution. It does not promote bot prose or replace PR receipt checks. With no scoped CI opt-in, the existing bot-list behavior remains. Start with observe and inspect decisions before enabling proactive acceptance. Actors/bots, worker concurrency, human priority, models, poll interval and retry limits remain configurable; saves use revision checks and retained history.
+
+Automatic assessments combine only requests with the same sender and receiving-row grant. An older ticket whose accepted scope combined different grants keeps its history, but cannot execute that mixed scope, even if every sender is allowlisted again. Stop the old ticket, then submit fresh requests separately under each grant; normal same-grant batches continue unchanged.
+
+Original worker, communication, scope, delivery and GitHub instructions are packaged with Teams guidance. Team sections, built-in part overrides and team skills are editable. Overrides retain their original default; upgrades identify changed defaults. Worker/assessment previews are separate. Assessments receive source facts and a structured outcome tool without repository execution tools. Policy changes revalidate pending/running authority.
+
+Useful acknowledgements, questions and ready results are relayed; routine progress stays internal. Core reply gates enforce source-thread ownership. Replies are queued durably before sending. Messages beyond the source delivery ceiling use one shortened representation with the beginning, ending and an explicit notice; full reports and queued text remain available in local supervision. Uncertain HTTP outcomes reconcile authenticated receipt markers instead of blindly repeating POSTs. A missing receipt leaves an actionable failed operation; Retry operation checks it again. Publishing and merging follow worker permissions, the immutable mandate, delivery requirements and server-side protections. Original default auto-merge conditions require a separately named merge CLI; none is configured by default.
+
+## Storage and verification
+
+Private state is keyed by canonical Git common directory, with checksums, atomic commits and an exclusive writer lock. Events and source cursors commit together. State retains source context, tickets, assignments, settings/prompts history, transcripts and pending operations, without credentials. Back up state and worktrees together. Corrupt/incompatible state fails closed; preserve it during lock recovery. Branches/worktrees are retained.
+
+Confirmed dead owners on the same host can be recovered automatically. Active or unverifiable owners stay protected. A crash during the short acquisition guard can leave `state.lock.acquire`; inspect owner processes before recovering that guard. State is bounded at 16 MiB. Supervision transcripts are diagnostic tails: at most 500 events per session share a 2 MiB serialized UTF-8 budget, which shrinks further when business records need space. Streamed diagnostics are buffered for up to a short timer interval and drained on worker termination or service stop. Pending diagnostics share a 2 MiB/2,000-event buffer with at most 500 per session; pressure may trim older pending entries. An abrupt process crash can lose the recent unflushed diagnostic tail. Source messages, mandates, reports and effects still commit durably without this delay. Older transcript events can be pruned; source history, tickets, mandates, settings and operations are not evicted. Business records alone exceeding the state limit fail closed. Copilot maintains its own persistent conversation separately.
+
+Requests have ten-second deadlines and one-MiB response caps. Most lists/context reads have five-page bounds. Reviews and channel-root scans retain continuation checkpoints. Large histories take multiple cycles; oversized individual threads need operator attention. Successful independent sources can commit despite another source failing. Chat quotes use scoped ancestor reads bounded to 20 edges per chain and 50 missing ancestors per batch. Unavailable, conflicting or cyclic ancestry preserves that chat's progress and reports the affected message for inspection and retry.
+
+`npm run check` runs typechecking, behavioral tests, shared core tests, bundling and package checks. `npm run audit:production` checks runtime advisories. Fixtures establish adapter/scheduler behavior; tenant permissions, deployment-scale pagination, Copilot policy and OS/remote-host combinations need live acceptance. See [SECURITY.md](SECURITY.md).

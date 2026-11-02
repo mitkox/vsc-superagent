@@ -1,9 +1,9 @@
 name: VS Code extension
 on:
   pull_request:
-    paths: ['vscode/**', 'src/core/**', '.github/workflows/vscode.yml']
+    paths: ['vscode/**', 'src/core/**', 'prompts/**', 'skills/**', '.github/workflows/vscode.yml']
   push:
-    paths: ['vscode/**', 'src/core/**', '.github/workflows/vscode.yml']
+    paths: ['vscode/**', 'src/core/**', 'prompts/**', 'skills/**', '.github/workflows/vscode.yml']
 permissions:
   contents: read
 concurrency:

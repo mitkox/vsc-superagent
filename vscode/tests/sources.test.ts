@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict'
+import { pollDefaultBranchChecks } from '../src/sources.ts'
 import { test } from 'node:test'
-import { pollTeams, pollTeamsBatch, pollGitHub, pollGitHubReviewsBatch, readPullRequest, type GitHubSourceConfig } from '../src/sources.ts'
+import { automationGate, validateSettings } from '../src/settings.ts'
+import type { AutomationSettings } from '../src/settings.ts'
+import type { Trigger } from '../../src/core/index.ts'
+import { pollTeams, pollTeamsBatch, pollGitHub, pollGitHubReviewsBatch, readPullRequest, sourceTrigger, sourceSubscription,
+  githubThreadRef, discoverOwnPullRequests, pollGitHubChecks, readGitHubThread, SourceError, type GitHubSourceConfig } from '../src/sources.ts'
 
 const config: GitHubSourceConfig = {
   origin: 'https://api.github.com', repository: 'company/project', account: 'agent', allowedActors: ['Alice'], token: 'secret-token',
@@ -10,6 +15,31 @@ const issue = (body = '@agent fix this', overrides = {}) => ({
   updated_at: '2026-11-01T10:00:00Z', ...overrides,
 })
 const json = (value: unknown, headers?: HeadersInit) => new Response(JSON.stringify(value), { headers })
+
+test('default-branch CI is read at its actual head and emitted as inferred context', async () => {
+  const head = 'a'.repeat(40), requests: string[] = []
+  const event = await pollDefaultBranchChecks(config, undefined, async input => {
+    const path = new URL(String(input)).pathname; requests.push(path)
+    if (path === '/repos/company/project') return json({ default_branch: 'main' })
+    if (path.endsWith('/branches/main')) return json({ commit: { sha: head } })
+    if (path.endsWith('/statuses')) return json([{ id: 5, state: 'failure', context: 'build' }])
+    return json({ check_runs: [] })
+  })
+  assert.equal(event.human, false)
+  assert.equal(event.threads[0]?.id, 'branch:main')
+  assert.match(event.text, /build: failure/)
+  assert.ok(requests.includes(`/repos/company/project/commits/${head}/check-runs`))
+})
+
+test('a changed approval state on a subscribed review generates a fresh context event', async () => {
+  const read = (state: string) => pollGitHubReviewsBatch({ ...config, subscribedNumbers: [7] }, undefined, undefined, async input =>
+    new URL(String(input)).pathname.endsWith('/reviews')
+      ? json([{ id: 22, user: { login: 'alice', type: 'User' }, body: '', state, submitted_at: '2026-11-01T00:00:00Z' }])
+      : json([{ number: 7 }]))
+  const approved = await read('APPROVED'), dismissed = await read('DISMISSED')
+  assert.equal(approved.items.length, 1)
+  assert.notEqual(approved.items[0]!.id, dismissed.items[0]!.id)
+})
 
 test('GitHub scopes credentials and every request to its configured repository and origin', async () => {
   const requests: URL[] = []
@@ -167,6 +197,62 @@ test('Teams reads only configured Graph scope and permitted human messages as pl
   assert.equal(items[0]?.source, 'teams')
 })
 
+for (const kind of ['chat', 'channel'] as const) {
+  test(`Teams ${kind} human receipt quotes survive subscription collection while authenticated self stays excluded`, async () => {
+    const marker = `[superagent:${'a'.repeat(64)}]`
+    const quote = `<blockquote>Earlier agent reply ${marker}</blockquote><p>Please check the next defect.</p>`
+    const input = { ...teams, allowedActors: [], accountId: actor,
+      ...(kind === 'channel' ? { chatIds: [], channels: [{ teamId, channelId: '19:channel@thread.tacv2' }] } : {}),
+      subscribedThreads: [kind === 'chat' ? 'chat:19:chat@thread.v2:100' : `team:${teamId}:channel:19:channel@thread.tacv2:100`] }
+    const root = message('100', { body: { contentType: 'text', content: `Agent result ${marker}` } })
+    const replies = [message('101', { from: { user: { id: teamId, tenantId: tenant } }, replyToId: '100', body: { contentType: 'html', content: quote } }),
+      message('102', { replyToId: '100', body: { contentType: 'text', content: `Own receipt ${marker}` } }),
+      message('103', { replyToId: '100', body: { contentType: 'text', content: 'Own message without a marker' } })]
+    const fetcher: typeof fetch = async request => json({ value: kind === 'chat' ? [root, ...replies]
+      : new URL(String(request)).pathname.endsWith('/replies') ? replies : [root] })
+    const first = await pollTeams(input, undefined, fetcher), repeated = await pollTeams(input, undefined, fetcher)
+    assert.equal(first.length, 1)
+    assert.equal(first[0]!.actor, teamId)
+    assert.equal(first[0]!.context?.human, true)
+    assert.equal(first[0]!.context?.allowedActor, false)
+    assert.equal(first[0]!.context?.subscribed, true)
+    assert.match(first[0]!.text, /Please check the next defect/)
+    assert.ok(first[0]!.text.includes(marker))
+    assert.equal(repeated[0]?.id, first[0]!.id)
+    const trigger = sourceTrigger(first[0]!)
+    const policy = validateSettings({ enabled: true, acceptMode: 'off', sources: { teams: { enabled: true, allowedActors: [], allowedBots: [] } } })
+    assert.equal(automationGate(policy, trigger).admissible, false)
+    assert.equal(trigger.actor.id, teamId)
+  })
+}
+
+test('Teams human receipt text is not authorship evidence when no account identity is configured', async () => {
+  const marker = `[superagent:${'b'.repeat(64)}]`
+  const items = await pollTeams(teams, undefined, async () => json({ value: [message('101', {
+    body: { contentType: 'html', content: `<blockquote>Earlier result ${marker}</blockquote><p>Please continue.</p>` },
+  })] }))
+  assert.equal(items.length, 1)
+  assert.equal(items[0]!.actor, actor)
+  assert.ok(items[0]!.text.includes(marker))
+})
+
+test('Teams bot-only source policy collects listed applications without granting human authority', async () => {
+  const bot = '44444444-4444-4444-4444-444444444444'
+  let requests = 0
+  const items = await pollTeams({ ...teams, allowedActors: [], allowedBots: [bot] }, undefined, async () => {
+    requests++
+    return json({ value: [message('101', { from: { application: { id: bot } } }),
+      message('102', { from: { application: { id: actor } } }), message('103', { from: { user: { id: bot, tenantId: tenant } } })] })
+  })
+  assert.equal(requests, 1)
+  assert.equal(items.length, 1)
+  assert.equal(items[0]?.actor, bot)
+  assert.equal(items[0]?.context?.provider, 'teams')
+  assert.equal(items[0]?.context?.human, false)
+  assert.equal(items[0]?.context?.allowedActor, false)
+  assert.equal(sourceTrigger(items[0]!).human, false)
+})
+
 test('Teams event IDs bind configured tenant, scope and edited message text', async () => {
   const read = (input = teams, content = 'First') => pollTeams(input, undefined, async () => json({ value: [message('100', {
     from: { user: { id: actor } }, body: { contentType: 'text', content },
@@ -186,6 +272,24 @@ test('Teams reactions do not create a new event but a text edit does', async () 
   const edited = await read('2026-11-01T00:02:00Z', 'Updated', '2026-11-01T00:02:00Z')
   assert.equal(first[0]?.id, reacted[0]?.id)
   assert.notEqual(first[0]?.id, edited[0]?.id)
+})
+
+test('GitHub human receipt quotes remain data across collection surfaces and self identity is excluded', async () => {
+  const marker = `<!-- superagent:${'c'.repeat(64)} -->`, body = `> Earlier reply ${marker}\n\n@agent Please continue.`
+  const users = [{ login: 'alice', type: 'User' }, { login: 'AgEnT', type: 'User' }, { login: 'outsider', type: 'User' }]
+  const fetched = await pollGitHub(config, undefined, async input => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/issues')) return json(users.map((user, index) => issue(body, { id: index + 1, user })))
+    const inline = path.endsWith('/pulls/comments')
+    return json(users.map((user, index) => ({ id: index + (inline ? 20 : 10), user, body, updated_at: '2026-11-01T10:00:00Z',
+      ...(inline ? { pull_request_url: 'https://api.github.com/repos/company/project/pulls/7' } : { issue_url: 'https://api.github.com/repos/company/project/issues/7' }) })))
+  })
+  const reviews = await pollGitHubReviewsBatch(config, undefined, undefined, async input => new URL(String(input)).pathname.endsWith('/pulls')
+    ? json([{ number: 7 }]) : json(users.map((user, index) => ({ id: index + 30, user, body, submitted_at: '2026-11-01T10:00:00Z' }))))
+  const all = [...fetched, ...reviews.items]
+  assert.equal(all.length, 4)
+  assert.ok(all.every(item => item.actor === 'alice' && item.context?.human && item.text.includes(marker)))
+  assert.deepEqual(all.map(item => item.context?.provider === 'github' ? item.context.kind : '').sort(), ['comment', 'issue', 'review', 'review-comment'].sort())
 })
 
 test('GitHub finds an edited old review even when the PR has no recent activity', async () => {
@@ -345,4 +449,408 @@ test('PR lifecycle reads use the configured repository and validate provider fac
   await assert.rejects(readPullRequest(config, -1), /Invalid source configuration/)
   await assert.rejects(readPullRequest(config, 7, undefined, async () => json({ number: 8, state: 'closed', merged: true, head: { sha: 'a'.repeat(40) } })), /Invalid source response/)
   await assert.rejects(readPullRequest(config, 7, undefined, async () => json({ number: 7, state: 'open', merged: true, head: { sha: 'a'.repeat(40) } })), /Invalid source response/)
+})
+
+test('subscribed GitHub review followups retain native review location and do not gain authority', async () => {
+  const result = await pollGitHub({ ...config, subscribedNumbers: [7], allowedActors: [] }, undefined, async input => json(
+    new URL(String(input)).pathname.endsWith('/pulls/comments') ? [{ id: 303, body: 'Please handle this',
+      pull_request_url: 'https://api.github.com/repos/company/project/pulls/7', user: { login: 'reviewer', type: 'User' },
+      in_reply_to_id: 300, pull_request_review_id: 90, path: 'src/file.ts', line: 42, original_line: 41,
+      diff_hunk: '@@ -1 +1 @@\n-old\n+new', commit_id: 'a'.repeat(40), created_at: '2026-11-01T00:00:00Z' }] : []))
+  assert.equal(result.length, 1)
+  const context = result[0]!.context!
+  assert.equal(context.provider, 'github')
+  if (context.provider !== 'github') assert.fail('GitHub context required')
+  assert.equal(context.reviewRootCommentId, 300); assert.equal(context.commentId, 303); assert.equal(context.reviewId, 90)
+  assert.equal(context.path, 'src/file.ts'); assert.equal(context.line, 42); assert.equal(context.originalLine, 41)
+  assert.equal(context.allowedActor, false); assert.equal(context.subscribed, true); assert.equal(context.human, true)
+  const trigger = sourceTrigger(result[0]!)
+  assert.equal(trigger.threads[0]?.source, trigger.channel?.source)
+  assert.equal(trigger.threads[0]?.id, '7'); assert.equal(trigger.channel?.address.reviewRootCommentId, '300')
+  assert.equal(trigger.meta.contextOnly, true); assert.equal(trigger.addressed, undefined)
+  assert.deepEqual(trigger.threads[0], githubThreadRef(config, 7))
+  assert.deepEqual(trigger.meta.provider, context)
+})
+
+test('GitHub subscriptions include unlisted bots as context and still exclude the configured agent', async () => {
+  const comments = [
+    { id: 30, user: { login: 'checks[bot]', type: 'Bot' }, body: 'CI feedback' },
+    { id: 31, user: { login: 'outsider', type: 'User' }, body: 'Followup' },
+    { id: 32, user: { login: 'agent', type: 'User' }, body: '@agent own reply' },
+  ].map(row => ({ ...row, issue_url: 'https://api.github.com/repos/company/project/issues/7' }))
+  const fetcher: typeof fetch = async input => json(new URL(String(input)).pathname.endsWith('/issues/comments') ? comments : [])
+  assert.deepEqual(await pollGitHub(config, undefined, fetcher), [])
+  const items = await pollGitHub({ ...config, subscribedNumbers: [7] }, undefined, fetcher)
+  assert.equal(items.length, 2)
+  assert.equal(items[0]!.context?.bot, true); assert.equal(sourceTrigger(items[0]!).human, false)
+  assert.equal(items[0]!.context?.allowedActor, false)
+  const observed = await pollGitHub({ ...config, observeComments: true, allowedBots: ['checks[bot]'] }, undefined, fetcher)
+  assert.equal(observed.length, 1); assert.equal(sourceTrigger(observed[0]!).human, false)
+})
+
+test('source identities distinguish repositories and Teams tenants while preserving native thread IDs', async () => {
+  const read = (repository: string) => pollGitHub({ ...config, repository }, undefined, async input => json(new URL(String(input)).pathname.endsWith('/issues') ? [issue()] : []))
+  const left = sourceTrigger((await read('company/project'))[0]!), right = sourceTrigger((await read('company/other'))[0]!)
+  assert.notEqual(left.source, right.source); assert.equal(left.threads[0]!.id, right.threads[0]!.id)
+  const [entry] = await pollTeams(teams, undefined, async () => json({ value: [message()] }))
+  const trigger = sourceTrigger(entry!)
+  assert.equal(trigger.threads[0]!.id, '100')
+  assert.equal(trigger.channel!.address.chatId, '19:chat@thread.v2')
+  assert.equal(trigger.channel!.address.rootMessageId, '100')
+  assert.equal(sourceSubscription(entry!.context!), entry!.thread)
+  assert.throws(() => sourceTrigger({ id: 'legacy', source: 'teams', actor, text: 'old', thread: '100' }), /refresh the inbox/)
+})
+
+test('subscribed Teams roots receive other humans and bot replies and exclude native self messages', async () => {
+  const input = { ...teams, chatIds: [], channels: [{ teamId, channelId: '19:channel@thread.tacv2' }], accountId: actor,
+    subscribedThreads: [`team:${teamId}:channel:19:channel@thread.tacv2:100`] }
+  const result = await pollTeams(input, undefined, async input => json({ value: new URL(String(input)).pathname.endsWith('/replies') ? [
+    message('101', { from: { user: { id: teamId } }, replyToId: '100', createdDateTime: '2026-11-01T00:00:00Z', webUrl: 'https://teams.microsoft.com/l/message/channel/101' }),
+    message('102', { from: { application: { id: tenant } }, replyToId: '100' }), message('103'),
+  ] : [message()] }))
+  assert.equal(result.length, 2)
+  const first = result[0]!.context!
+  if (first.provider !== 'teams') assert.fail('Teams context required')
+  assert.equal(first.messageId, '101'); assert.equal(first.rootMessageId, '100')
+  assert.equal(first.teamId, teamId); assert.equal(first.channelId, '19:channel@thread.tacv2')
+  assert.equal(first.tenantId, tenant); assert.equal(first.allowedActor, false); assert.equal(first.createdAt, '2026-11-01T00:00:00Z')
+  assert.equal(result[1]!.context!.bot, true); assert.equal(sourceTrigger(result[1]!).human, false)
+})
+
+test('Teams quoted chat followups bind the original subscribed root and reject cross-chat quote links', async () => {
+  const quoted = (chat: string) => `<blockquote itemid="https://teams.microsoft.com/l/message/${encodeURIComponent(chat)}/100">original</blockquote><p>Followup</p>`
+  const input = { ...teams, allowedActors: [], subscribedThreads: ['chat:19:chat@thread.v2:100'] }
+  const result = await pollTeams(input, undefined, async request => json(new URL(String(request)).pathname.endsWith('/messages/100') ? message('100') : { value: [
+    message('101', { from: { user: { id: teamId } }, body: { contentType: 'html', content: quoted(teams.chatIds[0]!) } }),
+    message('102', { from: { user: { id: teamId } }, body: { contentType: 'html', content: quoted('other-chat') } }),
+  ] }))
+  assert.equal(result.length, 1); assert.equal(result[0]!.thread, input.subscribedThreads[0])
+})
+
+test('bounded thread history reads retain reviews and comments regardless of intake actor gates', async () => {
+  const calls: string[] = []
+  const items = await readGitHubThread({ ...config, allowedActors: [] }, 7, undefined, async input => {
+    const path = new URL(String(input)).pathname; calls.push(path)
+    if (path.endsWith('/issues/7')) return json(issue('Description', { pull_request: {} }))
+    if (path.endsWith('/issues/7/comments')) return json([{ id: 10, body: 'Unlisted comment', user: { login: 'other', type: 'User' } }])
+    if (path.endsWith('/reviews')) return json([{ id: 11, body: 'Changes requested', state: 'CHANGES_REQUESTED', user: { login: 'other', type: 'User' } }])
+    return json([{ id: 12, body: 'Inline', path: 'file.ts', line: 8, user: { login: 'other', type: 'User' } }])
+  })
+  assert.equal(items.length, 4); assert.equal(calls.length, 4)
+  assert.ok(calls.every(path => path.startsWith('/repos/company/project/')))
+  assert.equal(items[2]!.context!.provider === 'github' && items[2]!.context!.state, 'CHANGES_REQUESTED')
+})
+
+test('PR discovery binds the native repository owner, author and exact ticket branch', async () => {
+  const branch = `superagent/${'1'.repeat(32)}`
+  const data = { number: 7, state: 'closed', merged: true, draft: false, user: { login: 'agent' },
+    head: { sha: 'b'.repeat(40), ref: branch, repo: { full_name: 'company/project' } } }
+  const discovered = await discoverOwnPullRequests(config, branch, undefined, async input => {
+    const url = new URL(String(input))
+    assert.equal(url.pathname, '/repos/company/project/pulls')
+    assert.equal(url.searchParams.get('state'), 'all')
+    assert.equal(url.searchParams.get('head'), `company:${branch}`)
+    assert.equal(url.searchParams.get('page'), '1')
+    return json([data, { ...data, number: 8, user: { login: 'other' } },
+      { ...data, number: 9, head: { ...data.head, repo: { full_name: 'other/project' } } },
+      { ...data, number: 10, head: { ...data.head, ref: `superagent/${'2'.repeat(32)}` } }])
+  })
+  assert.equal(discovered.length, 1); assert.equal(discovered[0]!.branch, branch)
+  assert.equal(discovered[0]!.state, 'closed')
+  const pull = await readPullRequest(config, 7, undefined, async () => json(data))
+  assert.equal(pull.author, 'agent'); assert.equal(pull.branch, branch); assert.equal(pull.merged, true)
+  await assert.rejects(discoverOwnPullRequests(config, branch, undefined, async () => json([{ ...data, head: { ...data.head, sha: 'invalid' } }])), /Invalid source response/)
+  let calls = 0
+  await assert.rejects(discoverOwnPullRequests(config, branch, undefined, async () => {
+    calls++; return json([data], { link: '<https://evil.example/next>; rel="next"' })
+  }), /pagination limit exceeded/)
+  assert.equal(calls, 1)
+  await assert.rejects(discoverOwnPullRequests(config, 'unrelated', undefined, async () => { assert.fail('Invalid branch must not dispatch') }), /Invalid source configuration/)
+})
+
+test('CI polling reads statuses and checks for the exact head and produces stable context-only events', async () => {
+  const head = 'a'.repeat(40), calls: string[] = []
+  const fetcher: typeof fetch = async input => {
+    const path = new URL(String(input)).pathname; calls.push(path)
+    if (path.endsWith('/pulls/7')) return json({ number: 7, state: 'open', merged: false, head: { sha: head } })
+    if (path.endsWith('/statuses')) return json([{ id: 1, context: 'lint', state: 'success', updated_at: '2026-11-01T00:00:00Z' }])
+    assert.equal(path, `/repos/company/project/commits/${head}/check-runs`)
+    return json({ check_runs: [{ id: 2, name: 'test', status: 'completed', conclusion: 'failure', completed_at: '2026-11-01T00:00:01Z' }] })
+  }
+  const input = { ...config, subscribedNumbers: [7] }
+  const first = await pollGitHubChecks(input, undefined, undefined, fetcher), repeated = await pollGitHubChecks(input, undefined, undefined, fetcher)
+  assert.equal(calls.length, 6); assert.equal(first[0]!.id, repeated[0]!.id)
+  assert.match(first[0]!.text, /lint: success/); assert.match(first[0]!.text, /test: failure/)
+  const trigger = sourceTrigger(first[0]!)
+  assert.equal(trigger.human, false); assert.equal(trigger.meta.contextOnly, true)
+  assert.equal(first[0]!.context!.provider === 'github' && first[0]!.context!.commitId, head)
+})
+
+test('Graph messageReference attachments and quote chains preserve the subscribed original chat thread', async () => {
+  const reference = (messageId: string) => [{ contentType: 'messageReference', content: JSON.stringify({ messageId, messagePreview: 'Untrusted quoted text' }) }]
+  const result = await pollTeams({ ...teams, allowedActors: [], subscribedThreads: ['chat:19:chat@thread.v2:100'] }, undefined, async () => json({ value: [
+    message('102', { from: { user: { id: teamId } }, attachments: reference('101') }),
+    message('101', { from: { user: { id: teamId } }, attachments: reference('100') }),
+    message('100', { from: { user: { id: teamId } } }),
+  ] }))
+  assert.equal(result.length, 3)
+  assert.ok(result.every(item => item.thread === 'chat:19:chat@thread.v2:100'))
+  const context = result[0]!.context!
+  assert.equal(context.provider === 'teams' && context.rootMessageId, '100')
+  assert.deepEqual(context.provider === 'teams' && context.referencedMessageIds, ['101'])
+  assert.deepEqual(sourceTrigger(result[0]!).threads.map(thread => thread.id), ['100', '101'])
+})
+
+test('automatic collectors delegate every unsubscribed candidate to the same human and bot admission gate', async () => {
+  type Case = { name: string; mode?: AutomationSettings['acceptMode']; human?: boolean; addressed?: boolean;
+    observed?: boolean; listedBot?: boolean; admission?: { unlistedAddressed?: 'explicit' | 'inferred' | 'ignore'; unlistedUnaddressed?: 'inferred' | 'ignore' }; accepted: boolean }
+  const cases: Case[] = [
+    { name: 'explicit unlisted mention while proactive mode is off', mode: 'off', addressed: true, admission: { unlistedAddressed: 'explicit' }, accepted: true },
+    { name: 'inferred unlisted mention in observe mode', addressed: true, admission: { unlistedAddressed: 'inferred' }, accepted: true },
+    { name: 'inferred unlisted mention in auto mode', mode: 'auto', addressed: true, admission: { unlistedAddressed: 'inferred' }, accepted: true },
+    { name: 'inferred unlisted mention while proactive mode is off', mode: 'off', addressed: true, admission: { unlistedAddressed: 'inferred' }, accepted: false },
+    { name: 'inferred unaddressed event with observation', observed: true, admission: { unlistedUnaddressed: 'inferred' }, accepted: true },
+    { name: 'inferred unaddressed event without observation', admission: { unlistedUnaddressed: 'inferred' }, accepted: false },
+    { name: 'inferred unaddressed event while proactive mode is off', mode: 'off', observed: true, admission: { unlistedUnaddressed: 'inferred' }, accepted: false },
+    { name: 'ignored unlisted mention', addressed: true, admission: { unlistedAddressed: 'ignore' }, accepted: false },
+    { name: 'default unlisted denial despite observation', addressed: true, observed: true, accepted: false },
+    { name: 'listed bot mention without observation', human: false, addressed: true, listedBot: true, accepted: true },
+    { name: 'listed unaddressed bot without observation', human: false, listedBot: true, accepted: false },
+    { name: 'listed unaddressed bot with observation', human: false, observed: true, listedBot: true, accepted: true },
+    { name: 'listed bot mention while proactive mode is off', human: false, addressed: true, listedBot: true, mode: 'off', accepted: false },
+    { name: 'unlisted bot cannot use human explicit admission', human: false, addressed: true, admission: { unlistedAddressed: 'explicit' }, accepted: false },
+  ]
+  for (const family of ['github', 'teams'] as const) for (const scenario of cases) {
+    const human = scenario.human !== false, identity = family === 'github' ? human ? 'outsider' : 'checks[bot]' : actor
+    const settings = validateSettings({ enabled: true, acceptMode: scenario.mode ?? 'observe', sources: {
+      [family]: { allowedActors: [], allowedBots: scenario.listedBot ? [identity] : [], allowUnaddressed: !!scenario.observed, admission: scenario.admission },
+    } })
+    const received: Trigger[] = []
+    const admit = (trigger: Trigger) => { received.push(trigger); return automationGate(settings, trigger).admissible }
+    const body = scenario.addressed ? '@agent fix this' : 'Fix this'
+    const items = family === 'github'
+      ? await pollGitHub({ ...config, allowedActors: [], allowedBots: settings.sources.github.allowedBots, admit }, undefined,
+        async input => json(new URL(String(input)).pathname.endsWith('/issues') ? [issue(body, { user: { login: identity, type: human ? 'User' : 'Bot' } })] : []))
+      : await pollTeams({ ...teams, allowedActors: [], allowedBots: settings.sources.teams.allowedBots, accountId: teamId, admit }, undefined, async () => json({ value: [message('100', {
+        from: human ? { user: { id: identity, tenantId: tenant } } : { application: { id: identity } },
+        ...(scenario.addressed ? { mentions: [{ mentioned: { user: { id: teamId } } }] } : {}),
+      })] }))
+    const label = `${family}: ${scenario.name}`
+    assert.equal(received.length, 1, label)
+    assert.equal(items.length, scenario.accepted ? 1 : 0, label)
+    assert.equal(received[0]?.human, human, label)
+    assert.equal(received[0]?.actor.id, identity, label)
+    assert.equal(received[0]?.addressed, scenario.addressed ? 'mention' : undefined, label)
+    assert.equal(received[0]?.actor.source, received[0]?.source, label)
+    assert.equal(received[0]?.threads[0]?.source, received[0]?.source, label)
+    assert.equal((received[0]?.meta.provider as { provider: string }).provider, family, label)
+  }
+})
+
+test('automatic admission callbacks retain subscribed and forced context reads', async () => {
+  const deny = (trigger: Trigger) => automationGate(validateSettings({}), trigger).admissible
+  assert.equal((await pollGitHub({ ...config, allowedActors: [], subscribedNumbers: [7], admit: deny }, undefined,
+    async input => json(new URL(String(input)).pathname.endsWith('/issues') ? [issue()] : []))).length, 1)
+  assert.equal((await pollTeams({ ...teams, allowedActors: [], subscribedThreads: ['chat:19:chat@thread.v2:100'], admit: deny }, undefined,
+    async () => json({ value: [message()] }))).length, 1)
+  const history = await readGitHubThread({ ...config, allowedActors: [], admit: () => { assert.fail('Forced history must bypass admission') } }, 7, undefined,
+    async input => json(new URL(String(input)).pathname.endsWith('/issues/7') ? issue('Unlisted context', { user: { login: 'outsider', type: 'User' } }) : []))
+  assert.equal(history.length, 1)
+})
+
+test('source admission callback configuration is validated before any request', async () => {
+  const fetcher: typeof fetch = async () => { assert.fail('Invalid callback must prevent network activity') }
+  await assert.rejects(pollGitHub({ ...config, admit: true as never }, undefined, fetcher), /Invalid source configuration/)
+  await assert.rejects(pollTeams({ ...teams, admit: true as never }, undefined, fetcher), /Invalid source configuration/)
+})
+
+
+const quoteReference = (messageId: string) => [{ contentType: 'messageReference', content: JSON.stringify({ messageId, messagePreview: 'Untrusted quote preview' }) }]
+const chatPath = (chat = teams.chatIds[0]!) => `/v1.0/chats/${encodeURIComponent(chat)}/messages`
+const ancestryError = (error: unknown): boolean => {
+  assert.ok(error instanceof SourceError)
+  assert.equal(error.constructor.name, 'TeamsAncestryError')
+  assert.match(error.message, /Source progress retained/)
+  assert.doesNotMatch(error.message, /teams-secret|private-graph-token/)
+  return true
+}
+
+test('Teams missing quote ancestry resolves the subscribed root with scoped cached reads and never emits fetched context', async () => {
+  const paths: string[] = [], originalUrl = `https://teams.microsoft.com/l/message/${encodeURIComponent(teams.chatIds[0]!)}/102`
+  const leaf = message('102', { from: { user: { id: teamId, tenantId: tenant } }, attachments: quoteReference('101'),
+    lastModifiedDateTime: '2026-11-02T00:00:00Z', webUrl: originalUrl })
+  const input = { ...teams, allowedActors: [], accountId: actor, since: '2026-11-01T00:00:00Z', subscribedThreads: [`chat:${teams.chatIds[0]}:100`] }
+  const items = await pollTeams(input, undefined, async (request, init) => {
+    const url = new URL(String(request)); paths.push(url.pathname)
+    assert.equal(url.origin, 'https://graph.microsoft.com'); assert.equal(init?.method, 'GET'); assert.equal(init?.redirect, 'error')
+    assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer teams-secret')
+    if (url.pathname === chatPath()) return json({ value: [leaf, { ...leaf, id: '103' }] })
+    assert.equal(url.search, '')
+    if (url.pathname === `${chatPath()}/101`) return json(message('101', { attachments: quoteReference('100'), lastModifiedDateTime: '2020-01-01T00:00:00Z', webUrl: 'https://evil.example/never-fetch' }))
+    assert.equal(url.pathname, `${chatPath()}/100`)
+    return json(message('100', { lastModifiedDateTime: '2020-01-01T00:00:00Z' }))
+  })
+  assert.deepEqual(paths, [chatPath(), `${chatPath()}/101`, `${chatPath()}/100`])
+  assert.equal(items.length, 2)
+  assert.ok(items.every(item => item.thread === `chat:${teams.chatIds[0]}:100`))
+  assert.deepEqual(items.map(item => item.context?.provider === 'teams' && item.context.messageId), ['102', '103'])
+  const context = items[0]!.context!
+  assert.equal(context.provider === 'teams' && context.rootMessageId, '100')
+  assert.deepEqual(context.provider === 'teams' && context.referencedMessageIds, ['101'])
+  assert.equal(items[0]!.url, originalUrl)
+  assert.deepEqual(sourceTrigger(items[0]!).threads.map(thread => thread.id), ['100', '101'])
+})
+
+test('Teams ancestry caches native IDs separately in each configured chat', async () => {
+  const chats = [teams.chatIds[0]!, '19:second@thread.v2'], paths: string[] = []
+  const items = await pollTeams({ ...teams, chatIds: chats }, undefined, async request => {
+    const url = new URL(String(request)); paths.push(url.pathname)
+    const chat = chats.find(chat => url.pathname.startsWith(`${chatPath(chat)}/`) || url.pathname === chatPath(chat))!
+    const root = chat === chats[0] ? '100' : '200'
+    if (url.pathname === chatPath(chat)) return json({ value: [message('102', { replyToId: '101' })] })
+    if (url.pathname.endsWith('/101')) return json(message('101', { replyToId: root }))
+    return json(message(root))
+  })
+  assert.deepEqual(items.map(item => item.thread), [`chat:${chats[0]}:100`, `chat:${chats[1]}:200`])
+  assert.equal(paths.length, 6)
+  assert.ok(chats.every(chat => paths.filter(path => path === `${chatPath(chat)}/101`).length === 1))
+})
+
+test('Teams cyclic ancestry fails the batch rather than inventing a new root', async () => {
+  for (const parentsInList of [true, false]) {
+    let lookups = 0
+    await assert.rejects(pollTeams(teams, undefined, async request => {
+      const url = new URL(String(request))
+      if (url.pathname === chatPath()) return json({ value: [message('102', { replyToId: '101' }),
+        ...parentsInList ? [message('101', { replyToId: '102' })] : []] })
+      lookups++; assert.equal(url.pathname, `${chatPath()}/101`)
+      return json(message('101', { replyToId: '102' }))
+    }), ancestryError)
+    assert.equal(lookups, parentsInList ? 0 : 1)
+  }
+})
+
+test('Teams ancestry obeys its depth bound and never fetches a twenty-first missing node', async () => {
+  for (const withinLimit of [true, false]) {
+    let lookups = 0
+    const read = pollTeams(teams, undefined, async request => {
+      const url = new URL(String(request))
+      if (url.pathname === chatPath()) return json({ value: [message('leaf', { replyToId: 'p0' })] })
+      const current = Number(url.pathname.split('/').at(-1)!.slice(1)); lookups++
+      assert.ok(current < 20)
+      return json(message(`p${current}`, current === 19 && withinLimit ? {} : { replyToId: `p${current + 1}` }))
+    })
+    if (withinLimit) assert.equal((await read)[0]?.thread, `chat:${teams.chatIds[0]}:p19`)
+    else await assert.rejects(read, ancestryError)
+    assert.equal(lookups, 20)
+  }
+})
+
+test('Teams missing-node lookup budget is shared across chats and fails before a fifty-first read', async () => {
+  const chats = [teams.chatIds[0]!, '19:second@thread.v2']
+  let lookups = 0, lists = 0
+  await assert.rejects(pollTeamsBatch({ ...teams, chatIds: chats }, undefined, undefined, async request => {
+    const url = new URL(String(request))
+    if (chats.some(chat => url.pathname === chatPath(chat))) {
+      lists++
+      return json({ value: Array.from({ length: 26 }, (_, index) => message(`child-${index}`, { replyToId: `parent-${index}` })) })
+    }
+    lookups++
+    assert.ok(lookups <= 50)
+    return json(message(decodeURIComponent(url.pathname.split('/').at(-1)!)))
+  }), ancestryError)
+  assert.equal(lists, 2); assert.equal(lookups, 50)
+})
+
+test('Teams rejects malformed direct reply IDs before constructing a lookup URL', async () => {
+  for (const replyToId of ['../me', 'https://evil.example/token', 'bad/id', 101]) {
+    let requests = 0
+    await assert.rejects(pollTeams(teams, undefined, async () => {
+      requests++; assert.equal(requests, 1)
+      return json({ value: [message('102', { replyToId })] })
+    }), ancestryError)
+    assert.equal(requests, 1)
+  }
+})
+
+test('Teams ancestry rejects missing deleted and mismatched native parent records before returning a batch', async () => {
+  const bad = [new Response('{}', { status: 404 }), message('wrong-id'), message('101', { deletedDateTime: '2026-11-01T00:00:00Z' }),
+    message('101', { chatId: '19:unapproved@thread.v2' }), message('101', { tenantId: teamId }),
+    message('101', { from: { user: { id: actor, tenantId: teamId } } })]
+  for (const parent of bad) {
+    let requests = 0
+    await assert.rejects(pollTeamsBatch(teams, undefined, undefined, async request => {
+      requests++
+      if (new URL(String(request)).pathname === chatPath()) return json({ value: [message('102', { replyToId: '101' })] })
+      assert.equal(new URL(String(request)).pathname, `${chatPath()}/101`)
+      return parent instanceof Response ? parent : json(parent)
+    }), ancestryError)
+    assert.equal(requests, 2)
+  }
+})
+
+test('Teams ancestry lookup remains abortable and irrelevant old self deleted or empty children need no lookup', async () => {
+  const controller = new AbortController()
+  let requests = 0
+  await assert.rejects(pollTeams(teams, controller.signal, async request => {
+    requests++
+    if (new URL(String(request)).pathname === chatPath()) return json({ value: [message('102', { replyToId: '101' })] })
+    return new Response(new ReadableStream<Uint8Array>({ start() { setTimeout(() => controller.abort(), 10) } }))
+  }), /Source request cancelled/)
+  assert.equal(requests, 2)
+  requests = 0
+  const items = await pollTeams({ ...teams, accountId: actor, allowedActors: [teamId], since: '2026-11-01T00:00:00Z' }, undefined, async request => {
+    requests++; assert.equal(new URL(String(request)).pathname, chatPath())
+    const row = { from: { user: { id: teamId, tenantId: tenant } }, lastModifiedDateTime: '2026-11-02T00:00:00Z', replyToId: 'missing' }
+    return json({ value: [message('old', { ...row, lastModifiedDateTime: '2020-01-01T00:00:00Z' }),
+      message('self', { ...row, from: { user: { id: actor } } }), message('deleted', { ...row, deletedDateTime: '2026-11-02T00:00:00Z' }),
+      message('empty', { ...row, body: { contentType: 'text', content: '' } }), message('system', { ...row, messageType: 'systemEventMessage' }),
+      message('unlisted', { ...row, from: { user: { id: '44444444-4444-4444-4444-444444444444', tenantId: tenant } } }),
+      message('unlisted-bot', { ...row, from: { application: { id: '55555555-5555-5555-5555-555555555555' } } })] })
+  })
+  assert.equal(items.length, 0); assert.equal(requests, 1)
+})
+
+
+test('Teams coalesces an edited quoted parent before caching roots and emits only its latest version', async () => {
+  const old = message('101', { attachments: quoteReference('100'), lastModifiedDateTime: '2026-11-01T00:00:00Z', body: { contentType: 'text', content: 'Old quote' } })
+  const edited = message('101', { attachments: quoteReference('200'), lastModifiedDateTime: '2026-11-02T00:00:00Z', body: { contentType: 'text', content: 'Edited quote' } })
+  const paths: string[] = []
+  const items = await pollTeams(teams, undefined, async request => {
+    const path = new URL(String(request)).pathname; paths.push(path)
+    if (path === chatPath()) return json({ value: [old, edited, message('102', { attachments: quoteReference('101') })] })
+    assert.equal(path, `${chatPath()}/200`)
+    return json(message('200'))
+  })
+  assert.equal(items.length, 2)
+  assert.deepEqual(items.map(item => item.text), ['Edited quote', 'Fix & test\nplease'])
+  assert.ok(items.every(item => item.thread === `chat:${teams.chatIds[0]}:200`))
+  assert.deepEqual(paths, [chatPath(), `${chatPath()}/200`])
+})
+
+test('Teams conflicting duplicate native IDs without a provably newer version fail before ancestry reads', async () => {
+  let requests = 0
+  await assert.rejects(pollTeams(teams, undefined, async () => {
+    requests++; assert.equal(requests, 1)
+    return json({ value: [message('101', { attachments: quoteReference('100') }), message('101', { attachments: quoteReference('200') })] })
+  }), ancestryError)
+  assert.equal(requests, 1)
+})
+
+
+test('Teams duplicate batch and ancestor rows with recursively reordered object keys resolve once without a false conflict', async () => {
+  const reorder = (value: unknown): unknown => Array.isArray(value) ? value.map(reorder)
+    : value !== null && typeof value === 'object' ? Object.fromEntries(Object.entries(value).reverse().map(([key, entry]) => [key, reorder(entry)])) : value
+  const version = '2026-11-02T00:00:00Z'
+  const leaf = message('102', { from: { user: { id: teamId, tenantId: tenant } }, lastModifiedDateTime: version, attachments: quoteReference('101') })
+  const parent = message('101', { from: { user: { id: teamId, tenantId: tenant } }, lastModifiedDateTime: version, attachments: quoteReference('100') })
+  const root = message('100', { lastModifiedDateTime: version })
+  let requests = 0
+  const items = await pollTeams({ ...teams, allowedActors: [teamId], accountId: actor }, undefined, async request => {
+    requests++; assert.equal(new URL(String(request)).pathname, chatPath())
+    return json({ value: [leaf, reorder(leaf), parent, reorder(parent), root, reorder(root)] })
+  })
+  assert.equal(requests, 1); assert.equal(items.length, 2)
+  assert.deepEqual(items.map(item => item.context?.provider === 'teams' && item.context.messageId), ['102', '101'])
+  assert.ok(items.every(item => item.thread === `chat:${teams.chatIds[0]}:100`))
 })
