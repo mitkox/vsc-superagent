@@ -60,6 +60,8 @@ interface StateData {
 }
 
 const MAX_STATE_BYTES = 16 * 1024 * 1024
+const MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024
+const TRANSCRIPT_STATE_SLACK_BYTES = 64 * 1024
 const clone = <T>(value: T): T => structuredClone(value)
 const digest = (data: StateData): string => createHash('sha256').update(JSON.stringify(data)).digest('hex')
 const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -236,7 +238,32 @@ export class DurableRepositories implements Repositories {
     }
   }
 
+  /** Transcripts are diagnostic tails; business records keep the full state capacity. */
+  private trimTranscripts(): void {
+    const sessions = this.data.extension?.sessions
+    if (!sessions?.some(session => session.transcript.length)) return
+    const business = { ...this.data, extension: { ...this.data.extension!, sessions: sessions.map(session => ({ ...session, transcript: [] })) } }
+    // A SHA-256 checksum has a fixed serialized size. Account for the entire envelope,
+    // UTF-8 and JSON escaping before hashing or serializing retained diagnostics.
+    const businessBytes = Buffer.byteLength(JSON.stringify({ version: 1, checksum: '0'.repeat(64), data: business }))
+    const budget = Math.min(MAX_TRANSCRIPT_BYTES, Math.max(0, MAX_STATE_BYTES - businessBytes - TRANSCRIPT_STATE_SLACK_BYTES))
+    const events = sessions.flatMap(session => session.transcript.map(event => ({ event, time: Date.parse(event.at) || 0 })))
+    const recent = events.map((entry, order) => ({ ...entry, order })).sort((a, b) => b.time - a.time || b.order - a.order)
+    const retained = new Set<number>()
+    let bytes = 0
+    for (const { event, order } of recent) {
+      // Count a comma even for each array's first event, conservatively below capacity.
+      const size = Buffer.byteLength(JSON.stringify(event)) + 1
+      if (bytes + size > budget) break
+      bytes += size
+      retained.add(order)
+    }
+    let order = 0
+    for (const session of sessions) session.transcript = session.transcript.filter(() => retained.has(order++))
+  }
+
   private persist(): void {
+    this.trimTranscripts()
     const body = JSON.stringify({ version: 1, checksum: digest(this.data), data: this.data })
     if (Buffer.byteLength(body) > MAX_STATE_BYTES) throw new Error('Superagent state capacity reached; archive reviewed work before continuing')
     const temporary = join(this.directory, `.state-${randomUUID()}.tmp`)
