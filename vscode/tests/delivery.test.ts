@@ -290,3 +290,22 @@ test('review resolution rechecks a late native precondition after its proof look
     assert.equal(requests, 1)
   }
 })
+
+
+test('raw GitHub and Teams source delivery accepts exactly 30000 units and rejects 30001 before POST', async () => {
+  for (const [target, credential] of [[github, githubCredential], [chat, teamsCredential]] as const) {
+    let posts = 0
+    const text = 'x'.repeat(30_000)
+    const transport: typeof fetch = async (_url, init) => {
+      posts++; assert.equal(init?.method, 'POST')
+      const body = JSON.parse(String(init?.body)), content: string = credential.provider === 'github' ? body.body : body.replyMessage.body.content
+      assert.ok(content.startsWith(text + '\n\n'))
+      return json({ id: credential.provider === 'github' ? 400 : '400' })
+    }
+    await deliverSourceReply(target, { ...message, text }, credential, { transport })
+    assert.equal(posts, 1)
+    await assert.rejects(deliverSourceReply(target, { ...message, text: text + 'x' }, credential, { transport }),
+      error => error instanceof DeliveryError && error.outcome === 'not-sent')
+    assert.equal(posts, 1)
+  }
+})

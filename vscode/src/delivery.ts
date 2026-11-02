@@ -41,6 +41,7 @@ export interface DeliveryOptions {
   signal?: AbortSignal
   transport?: typeof fetch
 }
+export const MAX_SOURCE_REPLY_LENGTH = 30_000
 type Row = Record<string, unknown>
 const object = (value: unknown): Row | undefined => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Row : undefined
 const str = (value: unknown): string => typeof value === 'string' ? value : ''
@@ -97,7 +98,7 @@ function graphMessages(context: TeamsContext): string {
 }
 function operationMarker(context: SourceContext, message: SourceReply): string {
   if (typeof message.id !== 'string' || !message.id || message.id.length > 256 || /[\x00-\x1f\x7f]/.test(message.id)
-    || typeof message.text !== 'string' || !message.text.trim() || message.text.length > 30_000
+    || typeof message.text !== 'string' || !message.text.trim() || message.text.length > MAX_SOURCE_REPLY_LENGTH
     || !['acknowledgement', 'reply', 'notice', 'question', 'result'].includes(message.kind)) throw new DeliveryError('Invalid source delivery', 'not-sent')
   return `superagent:${createHash('sha256').update(JSON.stringify([sourceNamespace(context), context.nativeThreadId, context.provider === 'github' ? context.reviewRootCommentId ?? '' : '', message.id])).digest('hex')}`
 }
