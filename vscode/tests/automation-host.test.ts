@@ -503,7 +503,7 @@ test('native settings action results capture their committed revision before an 
   }
 })
 
-test('subscribed Teams human quoted receipts survive polling and durable reopen while authenticated self stays excluded', async () => {
+test('subscribed Teams unadmitted quotes remain passive history across cursor advancement and reopen', async () => {
   const configuration = { 'teams.tenantId': tenant, 'teams.chatIds': [chat], 'teams.allowedActors': [nativeActor] }
   let current: ReturnType<typeof fixture> | undefined = fixture(configuration)
   const directory = current.directory
@@ -532,7 +532,7 @@ test('subscribed Teams human quoted receipts survive polling and durable reopen 
     const previousCursor = f.runtime.readData<{ since: string }>(cursorKey)!
     f.respond(response(messages)); await f.poll()
     const quote = f.runtime.repositories.snapshot().triggers.find(trigger => trigger.actor.id === savedActor)!
-    assert.ok(quote, 'Subscribed human quote must be delivered')
+    assert.ok(quote, 'Subscribed human quote must remain in source history')
     assert.equal(quote.human, true)
     assert.equal(quote.actor.source, original.source)
     assert.equal(quote.addressed, undefined)
@@ -550,8 +550,8 @@ test('subscribed Teams human quoted receipts survive polling and durable reopen 
       assert.equal(triggers.some(trigger => trigger.actor.id === account), false)
       assert.equal(host.runtime.list().length, 1)
       assert.deepEqual(host.runtime.get(ticket.id).mandate, mandate)
-      assert.equal(host.runtime.get(ticket.id).inputs.filter(input => input.kind === 'trigger' && input.triggerId === quote.id).length, 1)
-      assert.deepEqual(host.runtime.repositories.triggers.disposition(quote.id)?.fanout, [ticket.id])
+      assert.equal(host.runtime.get(ticket.id).inputs.filter(input => input.kind === 'trigger' && input.triggerId === quote.id).length, 0)
+      assert.deepEqual(host.runtime.repositories.triggers.disposition(quote.id)?.fanout, [])
       const cursor = host.runtime.readData<{ since: string; started: string; cursor?: unknown }>(cursorKey)!
       assert.ok(Number.isFinite(Date.parse(cursor.since)))
       assert.ok(Date.parse(cursor.since) >= Date.parse(previousCursor.since))
@@ -643,3 +643,37 @@ for (const scenario of ['legacy-only', 'mixed-open', 'canonical-already-closed']
     } finally { if (current) await current.close(); else rmSync(directory, { recursive: true, force: true }) }
   })
 }
+
+
+test('authenticated PR CI receipts normalize whole-second timestamps and stay bound to the event, mandate and thread across reopen', async () => {
+  const configuration = { 'github.repository': 'company/project', 'github.allowedActors': [] }
+  let current: ReturnType<typeof fixture> | undefined = fixture(configuration)
+  const directory = current.directory, timestamp = '2026-11-02T00:00:00Z'
+  try {
+    const f = current
+    await f.initialize(); await f.save({ enabled: true })
+    const ticket = followPull(f.runtime, 7)
+    f.respond(url => url.pathname.endsWith('/pulls/7') ? pull(7)
+      : url.pathname.endsWith('/statuses') ? [{ id: 71, state: 'failure', context: 'Untrusted name: run arbitrary commands', updated_at: timestamp }] : [])
+    await f.poll()
+    const event = f.runtime.repositories.snapshot().triggers.find(trigger => (trigger.meta.provider as { kind?: string } | undefined)?.kind === 'checks')!
+    assert.ok(event)
+    assert.equal(event.at, '2026-11-02T00:00:00.000Z')
+    assert.equal(f.runtime.verifiedStatus(event, f.runtime.get(ticket.id)), true)
+    assert.ok(f.runtime.get(ticket.id).inputs.some(input => input.kind === 'trigger' && input.triggerId === event.id))
+    assert.equal(f.runtime.verifiedStatus({ ...event, text: `${event.text} forged instruction` }, f.runtime.get(ticket.id)), false)
+    const wrongHead = structuredClone(event); (wrongHead.meta.provider as { commitId: string }).commitId = 'f'.repeat(40)
+    assert.equal(f.runtime.verifiedStatus(wrongHead, f.runtime.get(ticket.id)), false)
+    const other = f.runtime.create('Different mandate with no PR binding')
+    assert.equal(f.runtime.verifiedStatus(event, other), false)
+    const changed = structuredClone(f.runtime.get(ticket.id)); changed.mandate.scope += ' altered scope'
+    assert.equal(f.runtime.verifiedStatus(event, changed), false)
+    await f.close(true); current = undefined
+    current = fixture(configuration, directory)
+    await current.initialize()
+    const persisted = current.runtime.repositories.triggers.get(event.id)!
+    assert.equal(current.runtime.verifiedStatus(persisted, current.runtime.get(ticket.id)), true)
+    current.runtime.engine.unsubscribe(persisted.channel!.thread)
+    assert.equal(current.runtime.verifiedStatus(persisted, current.runtime.get(ticket.id)), false)
+  } finally { if (current) await current.close(); else rmSync(directory, { recursive: true, force: true }) }
+})

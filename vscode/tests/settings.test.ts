@@ -45,7 +45,7 @@ for (const family of ['github', 'teams'] as const) {
       assert.equal(automationGate(value, trigger(family, 'owner', false)).admissible, false)
       assert.equal(automationGate(value, trigger(family, 'owner')).admissible, true)
       const followup = automationGate(value, trigger(family, 'owner', false), true)
-      assert.equal(followup.admissible && followup.strength, 'explicit')
+      assert.equal(followup.admissible, false)
       source.allowUnaddressed = false
       source.admission = undefined
     }
@@ -82,11 +82,17 @@ for (const family of ['github', 'teams'] as const) {
     assert.equal(automationPolicy(value).revalidate(inferred), true)
     source.allowUnaddressed = false
     assert.equal(automationPolicy(value).revalidate(inferred), false)
-    const contextFollowup = mandate(value, trigger(family, 'stranger', false), true)
-    assert.equal(contextFollowup.basis.via, 'followup')
-    assert.equal(automationPolicy(value).revalidate(contextFollowup), true)
+    // Old participating-only inferred mandates lack a provable admission cell and fail closed.
+    const legacyFollowup: Mandate = { ...inferred, basis: { via: 'followup', source: inferred.actor.source, rules: ['repair'] } }
+    assert.equal(automationPolicy(value).revalidate(legacyFollowup), false)
+    source.allowUnaddressed = true
+    const current = mandate(value, trigger(family, 'stranger', false), true)
+    assert.equal(current.basis.via, 'admission')
+    assert.equal(automationPolicy(value).revalidate(current), true)
+    source.admission = { unlistedUnaddressed: 'ignore' }
+    assert.equal(automationPolicy(value).revalidate(current), false)
     value.acceptMode = 'off'
-    assert.equal(automationPolicy(value).revalidate(contextFollowup), false)
+    assert.equal(automationPolicy(value).revalidate(current), false)
   })
 
   test(`${family} bot mandates retain addressing and lose observation, bot or rule authority when revoked`, () => {

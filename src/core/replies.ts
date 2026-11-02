@@ -41,7 +41,7 @@ export class Replies extends EnginePart {
    * and a person wrote it.
    */
   acknowledgeAccepted(ticketId: string, trigger: Trigger, text: string): void {
-    if (trigger.channel && trigger.human) this.options.outbox.send({ id: key('ack', trigger.id), channel: trigger.channel, text, kind: 'acknowledgement', ticketId })
+    if (trigger.channel && trigger.human) this.options.outbox.send({ id: key('ack', trigger.id), channel: trigger.channel, text, kind: 'acknowledgement', ticketId, ...this.policy().admitsInput ? { triggerId: trigger.id } : {} })
   }
   /** Withdraw a ticket's question for a person from the outbox, unless it went out already. */
   withdrawAttention(attentionId: string): void { this.options.outbox.withdraw(key('attention-reply', attentionId)) }
@@ -51,13 +51,13 @@ export class Replies extends EnginePart {
     const trigger = this.repo.triggers.get(request.triggerId)
     if (!trigger) throw new UserError('unknownTrigger')
     // Context-only threads are read-only and cannot receive acknowledgements.
-    if (!this.reaches(ticket, trigger, false)) throw new UserError('notReached')
+    if (!this.reaches(ticket, trigger, false) || !this.ticketsInputAllowed(ticket, trigger)) throw new UserError('notReached')
     if (!trigger.channel) throw new UserError('ackNoChannel')
     const id = key('ack', trigger.id)
     const existing = this.options.outbox.status(id)
     if (!existing && !trigger.human) throw new UserError('ackNotPerson')
     // Preserve the automatic or first queued acknowledgement.
-    if (!existing) this.options.outbox.send({ id, channel: trigger.channel, text: request.text, kind: 'acknowledgement', ticketId: ticket.id })
+    if (!existing) this.options.outbox.send({ id, channel: trigger.channel, text: request.text, kind: 'acknowledgement', ticketId: ticket.id, ...this.policy().admitsInput ? { triggerId: trigger.id } : {} })
     this.takeUp(ticket.id, trigger.id)
     return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined }
   }
@@ -72,6 +72,7 @@ export class Replies extends EnginePart {
       const ready = outcome === 'merged' || outcome === 'completed' || outcome === 'dropped' || reported
       if (!ticket || !ready) throw new UserError('notReady')
     }
+    if (trigger && !this.ticketsInputAllowed(ticket, trigger)) throw new UserError('notReached')
     const attention = request.purpose === 'attention' ? ticket?.attention : undefined
     // Attention replies must match the ticket's currently open question text.
     if (request.purpose === 'attention' && (!attention || attention.question !== request.question)) throw new UserError('notAttention')
@@ -81,14 +82,25 @@ export class Replies extends EnginePart {
     const ready = !ticket || !trigger || ticket.answers?.includes(trigger.id)
     if (request.purpose === 'answer' && !ready && !existing) throw new UserError('noAnswer')
     const asker = attention?.triggerId ? this.repo.triggers.get(attention.triggerId) : undefined
+    if (asker && !this.ticketsInputAllowed(ticket, asker)) throw new UserError('notReached')
     const channel = request.purpose === 'answer' ? trigger!.channel : asker?.channel ?? (ticket ? this.sourceChannel(ticket) : undefined)
     if (!channel) throw new UserError('noChannel')
-    this.options.outbox.send({ id, channel, text: request.text, kind: 'reply', ...ticket ? { ticketId: ticket.id } : {} })
+    this.options.outbox.send({ id, channel, text: request.text, kind: 'reply', ...ticket ? { ticketId: ticket.id } : {},
+      ...this.policy().admitsInput && (trigger || asker || ticket) ? { triggerId: (trigger ?? asker ?? this.source(ticket!))?.id } : {} })
     if (request.purpose === 'answer' && ticket && trigger && ticket.answers?.includes(trigger.id)) {
       ticket.answers = ticket.answers.filter(item => item !== trigger.id)
       this.repo.tickets.save(ticket)
     }
     return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined }
+  }
+  private ticketsInputAllowed(ticket: Ticket | undefined, trigger: Trigger): boolean {
+    const policy = this.policy()
+    if (!policy.admitsInput) return true
+    if (ticket) return !ticket.inputs.some(input => input.kind === 'trigger' && input.triggerId === trigger.id && input.passive)
+      && policy.admitsInput(trigger, ticket, false)
+    const thread = this.thread(trigger.threads[0]!)
+    const gate = policy.gate(trigger, thread, this.ticketsOnThread(thread))
+    return gate.admissible && gate.strength === 'explicit'
   }
   /** The conversation a ticket started in: its origin Trigger's Channel, else its first Channel. */
   private sourceChannel(ticket: Ticket): ChannelRef | undefined { return this.source(ticket)?.channel ?? ticket.channels[0] }

@@ -46,6 +46,10 @@ export class Intake extends EnginePart {
       }
       this.repo.threads.save(thread)
     }
+    const policy = this.policy()
+    for (const [ticketId, { ticket, context }] of reached) {
+      if (policy.admitsInput && !policy.admitsInput(trigger, ticket, context)) reached.delete(ticketId)
+    }
     for (const [ticketId, { ticket, context: followed }] of reached) {
       this.tickets.addInput(ticket, { id: key('input', ticketId, 'trigger', trigger.id), kind: 'trigger', triggerId: trigger.id, at,
         ...trigger.human ? { human: true } : {}, ...followed ? { context: true } : {} })
@@ -55,7 +59,8 @@ export class Intake extends EnginePart {
     this.repo.triggers.saveDisposition(trigger.id, disposition)
     // A person's message that no ticket decides, such as one that reached only tickets a person stopped or that follow the
     // Thread for context, and every bot's, goes to Eval.
-    if (!this.owners(trigger).length) this.queueForEval(trigger)
+    if (!this.owners(trigger).length && (!policy.admitsInput || policy.gate(trigger, this.thread(trigger.threads[0]!),
+      this.ticketsOnThread(this.thread(trigger.threads[0]!))).admissible)) this.queueForEval(trigger)
     for (const ticketId of fanout) this.tickets.wake(ticketId)
     this.emit('trigger.received', { triggerId: trigger.id, threads: trigger.threads.map(threadKey) })
     return 'stored'

@@ -124,13 +124,15 @@ test('stopping and restarting during preparation retains pending work', async ()
   } finally { release(); await f.clean() }
 })
 
-test('unmentioned followups and CI wake an existing subscription without another ticket', async () => {
+test('admitted unmentioned followups reuse the session while unlisted bot text stays passive', async () => {
   const f = fixture(async request => { await request.tools.find(tool => tool.name === 'superagent_report')!.invoke({ state: 'waiting', summary: 'Awaiting CI' }) })
   try {
     f.inbox.push(trigger('initial')); f.service.start(); await f.service.pollNow(); await eventually(() => f.runs.length === 1)
     const session = f.runs[0]!.sessionId
     f.inbox.push(trigger('followup', { addressed: undefined })); await f.service.pollNow(); await eventually(() => f.runs.length === 2)
-    f.inbox.push(trigger('ci', { human: false, addressed: undefined, actor: { source: 'github:scope', id: 'unlisted-bot' } })); await f.service.pollNow(); await eventually(() => f.runs.length === 3)
+    f.inbox.push(trigger('ci', { human: false, addressed: undefined, actor: { source: 'github:scope', id: 'unlisted-bot' } })); await f.service.pollNow(); await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(f.runs.length, 2)
+    assert.ok(f.runtime.repositories.triggers.get('ci'))
     assert.equal(f.runtime.list().length, 1)
     assert.ok(f.runs.every(run => run.sessionId === session))
   } finally { await f.clean() }
@@ -333,9 +335,10 @@ test('worker PR claims are verified before report mutation and context-only repl
     f.inbox.push(trigger('scope')); f.service.start(); await f.service.pollNow(); await eventually(() => rejected)
     assert.equal(f.runtime.list()[0]?.follows?.length ?? 0, 0)
     f.inbox.push(trigger('context', { threads: [{ source: 'github:scope', id: 'related' }], addressed: undefined, actor: { source: 'github:scope', id: 'outsider' } }))
-    await f.service.pollNow(); await eventually(() => f.runs.length === 2)
-    const ack = f.runs[1]!.tools.find(tool => tool.name === 'orchestrator_ack')!
-    await assert.rejects(() => ack.invoke({ trigger_id: 'context', text: 'Cannot claim context as authority' }), /reach|belong|abort/i)
+    await f.service.pollNow(); await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(f.runs.length, 1)
+    const ack = f.runs[0]!.tools.find(tool => tool.name === 'orchestrator_ack')!
+    await assert.rejects(() => ack.invoke({ trigger_id: 'context', text: 'Cannot claim context as authority' }), /reach|belong|abort|passive|admit/i)
     assert.equal(f.runtime.list().length, 1)
   } finally { await f.clean() }
 })
@@ -403,9 +406,11 @@ test('unlisted human and bot followups cannot withdraw a ticket even if an asses
   try {
     f.inbox.push(trigger('original')); f.service.start(); await f.service.pollNow(); await eventually(() => f.runs.length === 1)
     f.inbox.push(trigger('outsider-stop', { addressed: undefined, actor: { source: 'github:scope', id: 'outsider' }, text: 'Stop' }))
-    await f.service.pollNow(); await eventually(() => f.runs.length === 2)
+    await f.service.pollNow(); await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(f.runs.length, 1)
     f.inbox.push(trigger('bot-stop', { addressed: undefined, human: false, actor: { source: 'github:scope', id: 'bot' }, text: 'Stop' }))
-    await f.service.pollNow(); await eventually(() => f.runs.length === 3)
+    await f.service.pollNow(); await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(f.runs.length, 1)
     assert.equal(f.runtime.get(f.runs[0]!.ticketId).ended, undefined)
     assert.equal(f.service.snapshot().decisions.filter(decision => decision.kind === 'stop').length, 0)
   } finally { await f.clean() }

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { Engine, latestAssignment, runningAssignment, threadKey } from '../../src/core/index.ts'
+import { Engine, latestAssignment, runningAssignment, threadKey, isoTime } from '../../src/core/index.ts'
 import type { Follow, Policy, ReportState, SourceScope, Ticket, Trigger } from '../../src/core/index.ts'
 import { DurableRepositories } from './state.ts'
 import type { GitHubRepositoryScope, SourceContext } from './sources.ts'
@@ -113,6 +113,53 @@ export class TicketRuntime {
     if (value !== undefined && (encoded === undefined || Buffer.byteLength(encoded) > 1_000_000)) throw new Error('Metadata exceeds the size limit')
     this.repo.mutateAutomation(data => { if (value === undefined) delete data.metadata[key]; else data.metadata[key] = JSON.parse(encoded!) })
   }
+  /** Native host boundary: call only after authenticated, repository-scoped PR/head status readback. */
+  receiveVerifiedStatus(received: Trigger, scope: GitHubRepositoryScope): void {
+    const trigger = { ...received, at: isoTime(received.at) }
+    const provider = trigger.meta.provider as { kind?: unknown; number?: unknown; commitId?: unknown } | undefined
+    const ref = githubRepositoryRef(scope, Number(provider?.number))
+    if (provider?.kind !== 'checks' || trigger.human || trigger.actor.id !== 'github-actions[bot]' || trigger.actor.source !== ref.source
+      || trigger.source !== ref.source || !trigger.threads.some(thread => threadKey(thread) === threadKey(ref))
+      || typeof provider.commitId !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(provider.commitId)) throw new Error('Invalid verified PR status')
+    this.repo.atomic(() => {
+      const bindings = this.list().filter(ticket => this.sourceBinding(ticket, trigger, true)).map(ticket => ({ ticketId: ticket.id, mandate: this.digest(ticket.mandate) }))
+      this.writeData(`verified-ci:${trigger.id}`, { event: this.digest(trigger), bindings })
+      this.engine.receive(trigger)
+    })
+  }
+
+  /** Host-only result of a successful configured-bot assessment; no new mandate is granted. */
+  approveBotInput(trigger: Trigger, ticketIds: string[], rules: string[], policyVersion: string): void {
+    if (trigger.human || !rules.length || !['github', 'teams'].some(family => trigger.source.startsWith(`${family}:`))) throw new Error('Invalid approved bot context')
+    const bindings = ticketIds.flatMap(id => {
+      const ticket = this.get(id)
+      return !ticket.ended && this.sourceBinding(ticket, trigger) ? [{ ticketId: id, mandate: this.digest(ticket.mandate) }] : []
+    })
+    this.writeData(`approved-bot:${trigger.id}`, { event: this.digest({ ...trigger, at: isoTime(trigger.at) }), bindings, rules: [...rules], policyVersion })
+  }
+  approvedBotInput(trigger: Trigger, ticket: Ticket, enabledRules: string[], policyVersion: string): boolean {
+    const receipt = this.readData<{ event: string; bindings: { ticketId: string; mandate: string }[]; rules: string[]; policyVersion: string }>(`approved-bot:${trigger.id}`)
+    return !!receipt && receipt.event === this.digest(trigger) && receipt.policyVersion === policyVersion && receipt.rules.length > 0 && receipt.rules.every(rule => enabledRules.includes(rule))
+      && receipt.bindings.some(binding => binding.ticketId === ticket.id && binding.mandate === this.digest(ticket.mandate)) && this.sourceBinding(ticket, trigger)
+  }
+  botInputTargets(trigger: Trigger): Ticket[] { return this.list().filter(ticket => !ticket.ended && this.sourceBinding(ticket, trigger)) }
+
+  verifiedStatus(trigger: Trigger, ticket: Ticket): boolean {
+    const receipt = this.readData<{ event: string; bindings: { ticketId: string; mandate: string }[] }>(`verified-ci:${trigger.id}`)
+    return !!receipt && receipt.event === this.digest(trigger) && receipt.bindings.some(binding => binding.ticketId === ticket.id && binding.mandate === this.digest(ticket.mandate))
+      && this.sourceBinding(ticket, trigger, true)
+  }
+
+  private sourceBinding(ticket: Ticket, trigger: Trigger, pullRequest = false): boolean {
+    return trigger.threads.some(ref => {
+      const key = threadKey(ref), thread = this.repo.threads.get(key)
+      if (!thread?.subscriptions.includes(ticket.id) || thread.context?.includes(ticket.id)) return false
+      const origin = this.repo.triggers.get(ticket.origin.triggerId), provider = origin?.meta.provider as { isPullRequest?: unknown } | undefined
+      return !!ticket.follows?.some(follow => follow.thread === key) || (!pullRequest || provider?.isPullRequest === true) && !!origin?.threads.some(ref => threadKey(ref) === key)
+    })
+  }
+  private digest(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex') }
+
   list(): Ticket[] { this.repo.assertOpen(); return this.repo.tickets.list() }
   get(id: string): Ticket {
     this.repo.assertOpen()

@@ -82,8 +82,8 @@ export function followupOwners(trigger: Pick<Trigger, 'id' | 'human' | 'threads'
   if (!reached.length || records.threads.get(threadKey(trigger.threads[0]!))?.evaluating?.triggerIds.includes(trigger.id)) return []
   return reached.filter(id => {
     const ticket = records.tickets.get(id)
-    return !!ticket && (liveTicket(ticket) || (ticket.ended?.by !== 'human'
-      && ticket.inputs.some(input => input.kind === 'trigger' && input.triggerId === trigger.id && ticket.undelivered.includes(input.id))))
+    return !!ticket && !ticket.inputs.some(input => input.passive && input.kind === 'trigger' && input.triggerId === trigger.id) && (liveTicket(ticket) || (ticket.ended?.by !== 'human'
+      && ticket.inputs.some(input => !input.passive && input.kind === 'trigger' && input.triggerId === trigger.id && ticket.undelivered.includes(input.id))))
   })
 }
 /**
@@ -232,7 +232,7 @@ export interface Assignment {
   idleAt?: string
 }
 
-export type TicketInput =
+export type TicketInput = (
   /** A Trigger on one of its Threads, or attached to it; `human` when a person wrote it. */
   | { id: string; kind: 'trigger'; triggerId: string; at: string; note?: string; human?: true
     /** It reached the ticket only on a Thread its Executor follows for context. */
@@ -251,10 +251,11 @@ export type TicketInput =
   /** A Decision reopened the ticket; written before ended tickets resumed on their own. */
   | { id: string; kind: 'reopen'; decisionId: string; at: string }
   /** A human's message on one of its Threads resumed the ended ticket under its unchanged Mandate. */
-  | { id: string; kind: 'resumed'; triggerId: string; at: string }
+  | { id: string; kind: 'resumed'; triggerId: string; at: string; previousEnd?: Ticket['ended'] }
   | { id: string; kind: 'text'; text: string; at: string }
   /** A fact the main Session gave the ticket from other work: context, which asks for nothing and grants nothing. */
   | { id: string; kind: 'note'; text: string; at: string }
+) & { /** Retained history, permanently excluded from automatic delivery and work ownership. */ passive?: true }
 
 /**
  * How a Policy change bears on a ticket: the rules it was accepted under that changed, with their instruction now, or no
@@ -349,5 +350,5 @@ export function readUntil(ticket: Pick<Ticket, 'assignments'>, progress = true):
 export function waitsForPerson(ticket: Ticket): boolean {
   const report = latestAssignment(ticket)?.report
   if (report?.state !== 'blocked' && report?.state !== 'failed') return false
-  return !ticket.inputs.some(input => input.kind === 'trigger' && input.human && !input.context && input.at > report.at)
+  return !ticket.inputs.some(input => !input.passive && input.kind === 'trigger' && input.human && !input.context && input.at > report.at)
 }

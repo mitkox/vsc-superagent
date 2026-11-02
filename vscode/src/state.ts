@@ -70,13 +70,13 @@ const report = (value: unknown): boolean => record(value) && reportStates.includ
 const assignment = (value: unknown): boolean => record(value) && text(value.id) && ['pending', 'running', 'ended'].includes(String(value.state))
   && text(value.createdAt) && optional(value.report, report) && optional(value.startedAt, text) && optional(value.endedAt, text)
 const input = (value: unknown): boolean => {
-  if (!record(value) || !text(value.id) || !text(value.at)) return false
+  if (!record(value) || !text(value.id) || !text(value.at) || value.passive !== undefined && value.passive !== true) return false
   switch (value.kind) {
     case 'trigger': return text(value.triggerId) && optional(value.note, text) && (value.readAt === null || optional(value.readAt, text)) && optional(value.deliveredTo, text)
     case 'text': case 'note': return text(value.text)
     case 'policy-changed': return text(value.from) && text(value.to) && optional(value.effect, record)
     case 'reopen': return text(value.decisionId)
-    case 'resumed': return text(value.triggerId)
+    case 'resumed': return text(value.triggerId) && optional(value.previousEnd, ended)
     default: return false
   }
 }

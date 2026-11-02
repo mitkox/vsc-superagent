@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import type { AcceptMode, AdmissionCell, GateResult, Mandate, Policy, SourceScope, Trigger } from '../../src/core/index.ts'
+import type { AcceptMode, AdmissionCell, GateResult, Mandate, Policy, SourceScope, Ticket, Trigger } from '../../src/core/index.ts'
 
 export type SourceFamily = 'github' | 'teams'
 export interface AutomationRule { id: string; name: string; instruction: string; enabled: boolean }
@@ -120,7 +120,7 @@ export function validateSettings(value: unknown, current: AutomationSettings = D
   return result
 }
 
-export const automationPolicyVersion = (settings: AutomationSettings): string => createHash('sha256').update(JSON.stringify({ version: 1, mode: settings.acceptMode, sources: settings.sources, rules: settings.rules })).digest('hex')
+export const automationPolicyVersion = (settings: AutomationSettings): string => createHash('sha256').update(JSON.stringify({ version: 2, mode: settings.acceptMode, sources: settings.sources, rules: settings.rules })).digest('hex')
 const has = (list: string[], id: string) => list.some(value => value.toLowerCase() === id.toLowerCase())
 const local = (source: string, id: string) => source === 'vscode' && id === 'local-operator'
 
@@ -144,7 +144,7 @@ export function automationGate(settings: AutomationSettings, trigger: Trigger, p
   const receivable = !!trigger.addressed || source.allowUnaddressed
   const basis = { ...recorded, via: 'admission' as const, cell, ...(trigger.addressed ? { addressed: trigger.addressed } : {}) }
   if (trigger.human && receivable && admission === 'explicit') return { admissible: true, strength: 'explicit', basis }
-  if (trigger.human && participating && (listed || settings.acceptMode !== 'off')) return { admissible: true, strength: listed ? 'explicit' : 'inferred', basis: { ...recorded, via: 'followup' } }
+  if (trigger.human && participating && listed && admission !== 'ignore') return { admissible: true, strength: listed ? 'explicit' : 'inferred', basis: { ...recorded, via: 'followup' } }
   if (settings.acceptMode === 'off' || !receivable) return { admissible: false, reason: 'admissionIgnored' }
   if (!trigger.human) return has(source.allowedBots, trigger.actor.id)
     ? { admissible: true, strength: 'inferred', basis: { ...recorded, via: 'bot', ...(trigger.addressed ? { addressed: trigger.addressed } : {}), observation: { mode: settings.acceptMode } } }
@@ -154,18 +154,36 @@ export function automationGate(settings: AutomationSettings, trigger: Trigger, p
     : { admissible: false, reason: 'actorNotAllowed' }
 }
 
-export function automationPolicy(settings: AutomationSettings, paused = false): Policy {
+export function automationPolicy(settings: AutomationSettings, paused = false, verifiedStatus?: (trigger: Trigger, ticket: Ticket) => boolean): Policy {
   const inferred = (rules: readonly string[]) => settings.acceptMode === 'auto' && rules.length > 0 && rules.every(id => settings.rules.some(rule => rule.enabled && rule.id === id))
   const gate = (trigger: Trigger, participating: boolean) => automationGate(settings, trigger, participating)
-  return {
+  const policy: Policy = {
     version: automationPolicyVersion(settings), paused: paused || !settings.enabled, evalTimeoutMs: settings.assessment.timeoutMs,
     gate: (trigger, thread, tickets) => gate(trigger, [...thread.subscriptions, ...tickets.map(ticket => ticket.id)].some(id => !thread.context?.includes(id))),
+    admitsInput(trigger, ticket, contextOnly) {
+      const origin = [ticket.origin.triggerId, ...ticket.origin.triggerIds ?? []].includes(trigger.id)
+      if (origin && ticket.mandate.strength === 'inferred' && ticket.mandate.actor.source === trigger.actor.source && ticket.mandate.actor.id === trigger.actor.id
+        && policy.revalidate(ticket.mandate)) {
+        const admitted = gate(trigger, false)
+        if (admitted.admissible && admitted.strength === 'inferred') return true
+      }
+      const family = sourceFamily(trigger.source)
+      if (family && settings.sources[family].enabled && !trigger.human && trigger.actor.source === trigger.source && verifiedStatus?.(trigger, ticket)) return true
+      const admitted = gate(trigger, !contextOnly)
+      // Inferred senders still require an assessment and enabled matching rules, even on subscribed threads.
+      return admitted.admissible && admitted.strength === 'explicit'
+    },
     admitsInferred: inferred,
     revalidate(mandate: Mandate) {
       if (local(mandate.actor.source, mandate.actor.id)) return true
       const family = sourceFamily(mandate.actor.source), source = family && settings.sources[family]
       if (!source?.enabled || (mandate.strength === 'inferred' && !inferred(mandate.basis.rules ?? []))) return false
-      if (mandate.basis.via === 'followup') return mandate.strength === 'explicit' ? has(source.allowedActors, mandate.actor.id) : inferred(mandate.basis.rules ?? [])
+      if (mandate.basis.via === 'followup') {
+        // Legacy inferred followup bases never recorded an admission cell or addressing.
+        if (mandate.strength !== 'explicit') return false
+        const result = gate({ id: '', source: mandate.actor.source, actor: mandate.actor, human: true, threads: [], at: '', text: '', meta: mandate.basis.scope ?? {} }, true)
+        return has(source.allowedActors, mandate.actor.id) && result.admissible && result.strength === 'explicit'
+      }
       if (mandate.basis.via === 'bot') {
         const result = gate({ id: '', source: mandate.actor.source, actor: mandate.actor, human: false, addressed: mandate.basis.addressed, threads: [], at: '', text: '', meta: mandate.basis.scope ?? {} }, false)
         return mandate.strength === 'inferred' && result.admissible && result.strength === 'inferred'
@@ -179,4 +197,5 @@ export function automationPolicy(settings: AutomationSettings, paused = false): 
       return has(source.allowedActors, mandate.actor.id)
     },
   }
+  return policy
 }

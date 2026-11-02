@@ -161,7 +161,7 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
         for (const number of prNumbers) {
           try {
             const checks = await pollGitHubChecks(cfg, [number], signal)
-            h.runtime.repositories.atomic(() => checks.map(sourceTrigger).forEach(event => h.runtime.engine.receive(event)))
+            h.runtime.repositories.atomic(() => checks.map(sourceTrigger).forEach(event => h.runtime.receiveVerifiedStatus(event, base)))
           } catch { signal.throwIfAborted(); errors.push(`PR #${number} CI could not be read.`) }
           try {
             const pr = await readPullRequest(base, number, signal)
@@ -261,12 +261,12 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
       backend = new CopilotBackend({ cliPath: config().get<string>('copilot.cliPath', 'copilot'), onPermissionRequest: async (request, invocation) => {
         assertCurrent()
         const ticket = h.runtime.get(invocation.ticketId)
-        if (ticket.ended || h.runtime.paused) return { kind: 'reject', feedback: 'The ticket is stopped or paused.' }
+        if (ticket.ended || h.runtime.paused || !service?.permitsWorkerTurn(ticket.id, invocation.rootSessionId)) return { kind: 'reject', feedback: 'The ticket or its current source inputs are no longer authorized.' }
         if (ticketPermission(request, invocation.directory, config().get<string>('execution.permissionMode', 'ask') === 'ticket') === 'allow') return { kind: 'approve-once' }
         const answer = await vscode.window.showWarningMessage(`Allow ${request.kind} for ${ticket.title}?`,
           { modal: true, detail: JSON.stringify(request, null, 2).slice(0, 18000) }, 'Allow once')
         assertCurrent()
-        if (h.runtime.get(ticket.id).ended || h.runtime.paused) return { kind: 'reject', feedback: 'Authorization was withdrawn.' }
+        if (h.runtime.get(ticket.id).ended || h.runtime.paused || !service?.permitsWorkerTurn(ticket.id, invocation.rootSessionId)) return { kind: 'reject', feedback: 'Authorization was withdrawn.' }
         return answer === 'Allow once' ? { kind: 'approve-once', approvedInteractively: true } : { kind: 'reject', feedback: 'Declined by the operator.' }
       } })
       const prompt = await readFile(vscode.Uri.joinPath(context.extensionUri, 'dist', 'prompts', 'worker.md').fsPath, 'utf8').catch(() => '')
