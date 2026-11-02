@@ -238,8 +238,15 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
     if (!config().get('delivery.enabled', false)) throw new Error('Source replies are disabled in application settings')
     const family = message.channel.source.split(':')[0]
     const credential = family === 'github' ? await github(true) : family === 'teams' ? await teams(true) : undefined
+    assertCurrent(); signal.throwIfAborted()
+    if (!config().get('delivery.enabled', false)) throw new Error('Source replies are disabled in application settings')
     if (!credential) throw new Error('Unsupported reply source')
-    await sendDurableReply(owner!.runtime, message, credential, { signal })
+    service!.assertOutboundAllowed(message, signal)
+    await sendDurableReply(owner!.runtime, message, credential, { signal, beforeSubmit: () => {
+      assertCurrent()
+      if (!config().get('delivery.enabled', false)) throw new Error('Source replies are disabled in application settings')
+      service!.assertOutboundAllowed(message, signal)
+    } })
   }
 
   async function claimPullRequest(ticket: Ticket, number: number, signal: AbortSignal): Promise<ThreadRef> {
@@ -272,7 +279,7 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
       const prompt = await readFile(vscode.Uri.joinPath(context.extensionUri, 'dist', 'prompts', 'worker.md').fsPath, 'utf8').catch(() => '')
       const promptParts: Record<string, string> = JSON.parse(await readFile(vscode.Uri.joinPath(context.extensionUri, 'dist', 'prompts', 'defaults.json').fsPath, 'utf8').catch(() => '{}'))
       service = new AutomationService(h.runtime, { backend, prepare: (ticket, directory) => directory === undefined ? h.trees.prepare(ticket.id) : h.trees.validate(ticket.id, directory), poll, send, changed: notify,
-        systemPrompt: prompt, promptParts, claimPullRequest,
+        systemPrompt: prompt, promptParts, claimPullRequest, canSend: () => config().get('delivery.enabled', false),
         resolveThread: async (family, id, signal) => {
           if (family !== 'github' || !/^[1-9]\d*$/.test(id)) throw new Error('Use a complete scoped Teams thread identity')
           const credential = await github(); signal.throwIfAborted()
@@ -287,7 +294,12 @@ export function activateAutomation(context: vscode.ExtensionContext, hooks: Auto
           const credential = family === 'github' || channel?.source.startsWith('github:') ? await github(input.action === 'resolve') : await teams()
           if (input.action === 'resolve') {
             if (!channel || credential.provider !== 'github' || !config().get('delivery.enabled', false)) throw new Error('Review writes are not enabled')
-            return resolveGitHubReviewThread(channel, credential, { signal })
+            service!.assertReviewWriteAllowed(ticketId, String(input.triggerId), signal)
+            return resolveGitHubReviewThread(channel, credential, { signal, beforeSubmit: () => {
+              assertCurrent()
+              if (!config().get('delivery.enabled', false)) throw new Error('Review writes are disabled in application settings')
+              service!.assertReviewWriteAllowed(ticketId, String(input.triggerId), signal)
+            } })
           }
           return resources.read(ticketId, channel, credential, input, signal)
         } })

@@ -227,3 +227,66 @@ test('Teams copied receipt quotes cannot reconcile another sender or application
   ] }) })
   assert.equal(copied, undefined)
 })
+
+
+test('each new GitHub and Teams reply checks its native precondition at the POST boundary', async () => {
+  for (const [target, credential] of [[github, githubCredential], [channel, teamsCredential], [chat, teamsCredential]] as const) {
+    let allowed = false, checks = 0, posts = 0
+    const beforeSubmit = () => { checks++; if (!allowed) throw new Error('native-secret and revoked authority') }
+    const transport: typeof fetch = async (_url, init) => {
+      posts++; assert.equal(init?.method, 'POST'); assert.equal(checks, 2)
+      return json({ id: credential.provider === 'github' ? 400 : '400' })
+    }
+    await assert.rejects(deliverSourceReply(target, message, credential, { transport, beforeSubmit }), error => {
+      assert.ok(error instanceof DeliveryError); assert.equal(error.outcome, 'not-sent')
+      assert.doesNotMatch(error.message, /native-secret|revoked authority/); return true
+    })
+    assert.equal(checks, 1); assert.equal(posts, 0)
+    allowed = true
+    await deliverSourceReply(target, message, credential, { transport, beforeSubmit })
+    assert.equal(checks, 2); assert.equal(posts, 1)
+  }
+})
+
+test('abort raised by the last precondition prevents a POST and reconciliation never calls that write precondition', async () => {
+  const controller = new AbortController()
+  let checks = 0, reads = 0
+  await assert.rejects(deliverSourceReply(github, message, githubCredential, {
+    signal: controller.signal, beforeSubmit: () => { checks++; controller.abort() },
+    transport: async () => assert.fail('aborted precondition must not dispatch'),
+  }), error => error instanceof DeliveryError && error.outcome === 'not-sent')
+  assert.equal(checks, 1)
+  await assert.rejects(deliverSourceReply(github, message, githubCredential, {
+    retry: 'reconcile', beforeSubmit: () => assert.fail('receipt read cannot use write authority'),
+    transport: async (_url, init) => { reads++; assert.equal(init?.method, 'GET'); return json([]) },
+  }), error => error instanceof DeliveryError && error.outcome === 'unknown')
+  assert.equal(reads, 1)
+})
+
+test('review resolution rechecks a late native precondition after its proof lookup and skips it for an existing resolution', async () => {
+  for (const alreadyResolved of [false, true]) {
+    let requests = 0, checks = 0, allowed = true
+    let readStarted!: () => void, release!: (response: Response) => void
+    const started = new Promise<void>(resolve => { readStarted = resolve })
+    const response = new Promise<Response>(resolve => { release = resolve })
+    const pending = resolveGitHubReviewThread(github, githubCredential, {
+      beforeSubmit: () => { checks++; if (!allowed) throw new Error('native authority revoked during lookup') },
+      transport: async (_url, init) => {
+        requests++
+        assert.match(JSON.parse(String(init?.body)).query, /^query/)
+        readStarted(); return response
+      },
+    })
+    await started; allowed = false
+    release(json({ data: { repository: { pullRequest: { reviewThreads: { nodes: [
+      { id: 'PRRT_safe', isResolved: alreadyResolved, comments: { nodes: [{ databaseId: 300 }] } },
+    ], pageInfo: { hasNextPage: false } } } } } }))
+    if (alreadyResolved) {
+      assert.deepEqual(await pending, { threadId: 'PRRT_safe', resolved: true }); assert.equal(checks, 0)
+    } else {
+      await assert.rejects(pending, error => error instanceof DeliveryError && error.outcome === 'not-sent')
+      assert.equal(checks, 1)
+    }
+    assert.equal(requests, 1)
+  }
+})

@@ -7,13 +7,18 @@ export async function sendDurableReply(journal: Pick<TicketRuntime, 'readData' |
   credential: SourceDeliveryCredential, options: Omit<DeliveryOptions, 'retry'> = {}): Promise<void> {
   const key = `delivery:${message.id}`, prior = journal.readData<{ attempted: boolean; receipt?: unknown }>(key)
   if (prior?.receipt) return
-  journal.writeData(key, { attempted: true })
+  let attempted = false
   try {
     const receipt = await deliverSourceReply(message.channel, message, credential,
-      { ...options, ...(prior?.attempted ? { retry: 'reconcile' as const } : {}) })
+      { ...options, beforeSubmit: () => {
+        options.beforeSubmit?.()
+        if (options.signal?.aborted) throw new DeliveryError('Source request cancelled', 'not-sent')
+        journal.writeData(key, { attempted: true })
+        attempted = true
+      }, ...(prior?.attempted ? { retry: 'reconcile' as const } : {}) })
     journal.writeData(key, { attempted: true, receipt })
   } catch (error) {
-    if (error instanceof DeliveryError && error.outcome === 'not-sent') journal.writeData(key, { attempted: false })
+    if (!prior?.attempted && attempted && error instanceof DeliveryError && error.outcome === 'not-sent') journal.writeData(key, { attempted: false })
     throw error
   }
 }

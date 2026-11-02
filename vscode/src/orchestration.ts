@@ -16,6 +16,7 @@ export interface AutomationDependencies {
   prepare(ticket: Ticket, directory?: string): Promise<string>
   poll(signal: AbortSignal): Promise<Trigger[]>
   send(message: OutboundMessage, signal: AbortSignal): Promise<void>
+  canSend?(): boolean
   readSource?(ticketId: string, request: unknown, signal: AbortSignal): Promise<unknown>
   claimPullRequest?(ticket: Ticket, number: number, signal: AbortSignal): Promise<ThreadRef>
   resolveThread?(family: 'github' | 'teams', id: string, signal: AbortSignal): Promise<ThreadRef>
@@ -277,6 +278,42 @@ export class AutomationService {
     if (!trigger || !origin && (!input || input.passive) || !this.policy().admitsInput!(trigger, ticket, input?.kind === 'trigger' && !!input.context)) throw new Error('Source message is passive context or no longer admitted for this ticket')
     return trigger
   }
+  private outboundState(message: OutboundMessage): 'allowed' | 'pending' | 'revoked' {
+    const settings = this.settings.value, family = sourceFamily(message.channel.source)
+    if (!this.running || this.disposed || this.runtime.paused || !settings.enabled || this.deps.canSend?.() === false || family && !settings.sources[family].enabled) return 'pending'
+    if (!message.ticketId) return 'allowed'
+    const ticket = this.runtime.repositories.tickets.get(message.ticketId)
+    if (!ticket || ticket.ended?.by === 'human' || !this.policy().revalidate(ticket.mandate)) return 'revoked'
+    // Legacy queued replies predate explicit trigger attribution; recover their durable purpose identity.
+    const triggerId = message.triggerId ?? this.runtime.repositories.snapshot().triggers.find(trigger => message.id === key('ack', trigger.id) || message.id === key('reply', trigger.id, message.text))?.id
+    if (triggerId) { try { this.actionableTrigger(ticket.id, triggerId) } catch { return 'revoked' } }
+    return 'allowed'
+  }
+  /** Native credential/consent and provider pre-submit boundaries recheck the same current grant. */
+  assertOutboundAllowed(message: OutboundMessage, signal: AbortSignal): void {
+    signal.throwIfAborted()
+    if (this.outboundState(message) !== 'allowed') throw new Error('Source delivery authority is no longer available')
+  }
+  assertReviewWriteAllowed(ticketId: string, triggerId: string, signal: AbortSignal): void {
+    const operation = this.workers().find(operation => operation.effect.ticketId === ticketId && operation.controller.signal === signal)
+    if (!operation || operation.inputIds === undefined) throw new Error('Review mutation no longer belongs to an authorized worker turn')
+    this.authorized(ticketId, operation.effect.assignmentId!, signal, operation.inputIds)
+    const trigger = this.actionableTrigger(ticketId, triggerId)
+    if (!trigger.channel) throw new Error('Review source channel is missing')
+    this.assertOutboundAllowed({ id: `review:${triggerId}`, ticketId, triggerId, channel: trigger.channel, text: '', kind: 'notice' }, signal)
+  }
+  private deferOutbound(id: string): void {
+    this.updateEffect(id, row => { row.status = 'pending'; row.waitingForPermission = true; row.nextAttemptAt = Date.now() + this.settings.value.pollIntervalMs })
+  }
+  private retireOutbound(effect: PendingEffect): void {
+    const prior = this.runtime.readData<{ attempted: boolean; receipt?: unknown }>(`delivery:${effect.message!.id}`)
+    if (prior?.receipt) this.updateEffect(effect.id, row => { row.status = 'completed'; delete row.waitingForPermission; delete row.error })
+    else if (prior?.attempted) this.updateEffect(effect.id, row => {
+      row.status = 'failed'; delete row.waitingForPermission
+      row.error = 'Delivery may already have been submitted; authorization was withdrawn. Reconcile before any retry.'
+    })
+    else this.cancel(effect.id)
+  }
   private pump(): void {
     const settings = this.settings.value, paused = this.runtime.paused || !settings.enabled
     this.runtime.engine.revalidateInputs()
@@ -285,7 +322,7 @@ export class AutomationService {
       const effect = operation.effect
       const ticket = effect.ticketId ? this.runtime.repositories.tickets.get(effect.ticketId) : undefined
       const invalid = (['start', 'deliver'].includes(effect.kind) && (!ticket || !!ticket.ended || latestAssignment(ticket)?.id !== effect.assignmentId || !automationPolicy(settings).revalidate(ticket.mandate) || operation.inputIds?.some(id => !this.inputAllowed(ticket, id))))
-        || (effect.kind === 'outbound' && ticket?.ended?.by === 'human')
+        || (effect.kind === 'outbound' && this.outboundState(effect.message!) !== 'allowed')
       const staleEval = effect.kind === 'assessment' && !(effect.followup ? this.currentFollowup(effect) : this.currentCandidate(effect))
       const withdrawn = this.runtime.repositories.automation().effects.find(row => row.id === effect.id)?.status === 'cancelled'
       if (paused || invalid || staleEval || withdrawn) {
@@ -296,12 +333,17 @@ export class AutomationService {
     this.queueFollowupChecks()
     this.runtime.engine.evaluateDue()
     this.relayReports()
-    const due = this.runtime.repositories.automation().effects.filter(effect => effect.status === 'pending' && effect.nextAttemptAt <= Date.now())
+    const due = this.runtime.repositories.automation().effects.filter(effect => effect.status === 'pending' && (effect.kind === 'outbound' && effect.waitingForPermission
+      ? this.outboundState(effect.message!) !== 'pending' : effect.nextAttemptAt <= Date.now()))
     // A stop is serviced even while processing is paused.
     due.sort((a, b) => Number(b.kind === 'stop') - Number(a.kind === 'stop') || Number(!!b.followup) - Number(!!a.followup) || this.priority(b) - this.priority(a) || a.createdAt.localeCompare(b.createdAt))
     for (const effect of due) {
       if (this.active.has(effect.id)) continue
-      if (effect.kind === 'outbound' && effect.ticketId && this.runtime.repositories.tickets.get(effect.ticketId)?.ended?.by === 'human') { this.cancel(effect.id); continue }
+      if (effect.kind === 'outbound') {
+        const state = this.outboundState(effect.message!)
+        if (state === 'pending') { this.deferOutbound(effect.id); continue }
+        if (state === 'revoked') { this.retireOutbound(effect); continue }
+      }
       if (effect.kind !== 'stop' && paused) continue
       if (effect.kind === 'assessment' && [...this.active.values()].some(item => item.effect.kind === 'assessment' && !!item.effect.followup === !!effect.followup)) continue
       if (effect.kind === 'outbound' && [...this.active.values()].filter(item => item.effect.kind === 'outbound').length >= 4) continue
@@ -323,7 +365,7 @@ export class AutomationService {
   private workers() { return [...this.active.values()].filter(item => ['start', 'deliver'].includes(item.effect.kind)) }
   private launch(effect: PendingEffect): void {
     const controller = new AbortController()
-    this.updateEffect(effect.id, row => { row.status = 'running'; row.attempts++; row.updatedAt = at() })
+    this.updateEffect(effect.id, row => { row.status = 'running'; delete row.waitingForPermission; row.attempts++; row.updatedAt = at() })
     const current = this.runtime.repositories.automation().effects.find(row => row.id === effect.id)!
     // Defer the async handler until the active slot has been registered.
     const promise = Promise.resolve().then(() => this.perform(current, controller.signal)).then(() => {
@@ -336,13 +378,10 @@ export class AutomationService {
     signal.throwIfAborted()
     if (effect.kind === 'assessment') { if (effect.followup) await this.assessFollowup(effect, signal); else await this.assess(effect, signal); return }
     if (effect.kind === 'outbound') {
-      const message = effect.message!
-      const ticket = message.ticketId ? this.runtime.get(message.ticketId) : undefined
-      // Legacy queued replies predate explicit trigger attribution; recover their durable purpose identity.
-      const triggerId = message.triggerId ?? this.runtime.repositories.snapshot().triggers.find(trigger => message.id === key('ack', trigger.id) || message.id === key('reply', trigger.id, message.text))?.id
-      if (ticket && (!this.policy().revalidate(ticket.mandate) || triggerId && (() => { try { this.actionableTrigger(ticket.id, triggerId); return false } catch { return true } })())) { this.cancel(effect.id); return }
-      const family = sourceFamily(message.channel.source)
-      if (family && !this.settings.value.sources[family].enabled) return this.pending(effect.id)
+      const message = effect.message!, state = this.outboundState(message)
+      if (state === 'pending') { this.deferOutbound(effect.id); return }
+      if (state === 'revoked') { this.retireOutbound(effect); return }
+      this.assertOutboundAllowed(message, signal)
       await this.deps.send(message, signal); signal.throwIfAborted(); return
     }
     if (effect.kind === 'stop') {
@@ -682,6 +721,13 @@ export class AutomationService {
     })
   }
   private failed(effect: PendingEffect, signal: AbortSignal, error: unknown): void {
+    if (effect.kind === 'outbound') {
+      const state = this.outboundState(effect.message!)
+      const prior = this.runtime.readData<{ receipt?: unknown }>(`delivery:${effect.message!.id}`)
+      if (prior?.receipt) { this.updateEffect(effect.id, row => { row.status = 'completed'; delete row.error; delete row.waitingForPermission }); return }
+      if (state === 'pending') { this.deferOutbound(effect.id); return }
+      if (state === 'revoked' || signal.aborted && this.runtime.repositories.automation().effects.find(row => row.id === effect.id)?.status === 'cancelled') { this.retireOutbound(effect); return }
+    }
     const ticket = effect.ticketId ? this.runtime.repositories.tickets.get(effect.ticketId) : undefined
     if (signal.aborted) {
       this.runtime.repositories.atomic(() => {

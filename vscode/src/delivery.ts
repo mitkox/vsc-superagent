@@ -36,6 +36,8 @@ export class DeliveryError extends SourceError {
 export interface DeliveryOptions {
   /** An ambiguous POST must only be reconciled; an absent match never automatically repeats the POST. */
   retry?: 'reconcile'
+  /** Re-check native authority synchronously immediately before a new provider write, never a receipt lookup. */
+  beforeSubmit?: () => void
   signal?: AbortSignal
   transport?: typeof fetch
 }
@@ -108,6 +110,33 @@ function receipt(value: unknown, context: SourceContext, message: SourceReply, m
   return { operationId: message.id, provider: context.provider, messageId: native, marker, reconciled, ...(url ? { url } : {}) }
 }
 
+/** A refusal before dispatch proves that this attempt made no provider write. */
+function beforeSubmit(options: DeliveryOptions, signal?: AbortSignal | null): void {
+  const cancelled = () => options.signal?.aborted || signal?.aborted
+  if (cancelled()) throw new DeliveryError('Source request cancelled', 'not-sent')
+  try { options.beforeSubmit?.() } catch { throw new DeliveryError('Source delivery precondition rejected', 'not-sent') }
+  if (cancelled()) throw new DeliveryError('Source request cancelled', 'not-sent')
+}
+
+async function submitReply(url: URL, token: string, body: unknown, options: DeliveryOptions): Promise<{ value: unknown }> {
+  let submitted = false
+  const transport: typeof fetch = (input, init) => {
+    beforeSubmit(options, init?.signal)
+    const signal = options.signal && init?.signal ? AbortSignal.any([options.signal, init.signal]) : options.signal ?? init?.signal
+    submitted = true
+    return (options.transport ?? fetch)(input, { ...init, signal })
+  }
+  try {
+    // Abort the transport, but keep a valid late receipt: cancellation cannot undo a committed provider write.
+    // The response parser retains sourceRequest's independent size and timeout bounds.
+    return await sourceRequest(url, token, undefined, transport, { body })
+  } catch (error) {
+    if (!submitted) throw error instanceof DeliveryError ? error : new DeliveryError('Source delivery rejected before submission', 'not-sent')
+    const rejected = error instanceof SourceError && error.status !== undefined && error.status >= 400 && error.status < 500 && error.status !== 408
+    throw new DeliveryError(rejected ? 'Source delivery rejected' : 'Source delivery outcome unknown; reconcile before retrying', rejected ? 'not-sent' : 'unknown')
+  }
+}
+
 /** Read-only receipt lookup. A missing receipt after an ambiguous send is not proof that no message was created. */
 export async function reconcileSourceReply(target: SourceContext | ChannelRef, message: SourceReply, credential: SourceDeliveryCredential,
   options: Omit<DeliveryOptions, 'retry'> = {}): Promise<DeliveryReceipt | undefined> {
@@ -144,13 +173,12 @@ export async function reconcileSourceReply(target: SourceContext | ChannelRef, m
 export async function deliverSourceReply(target: SourceContext | ChannelRef, message: SourceReply, credential: SourceDeliveryCredential,
   options: DeliveryOptions = {}): Promise<DeliveryReceipt> {
   const context = authorize(target, credential, true), marker = operationMarker(context, message)
-  if (options.signal?.aborted) throw new DeliveryError('Source request cancelled', 'not-sent')
+  if (options.signal?.aborted) throw new DeliveryError('Source request cancelled', options.retry === 'reconcile' ? 'unknown' : 'not-sent')
   if (options.retry === 'reconcile') {
     const existing = await reconcileSourceReply(target, message, credential, options)
     if (existing) return existing
     throw new DeliveryError('Source delivery not yet reconciled; do not resend automatically', 'unknown')
   }
-  const transport = options.transport ?? fetch
   let url: URL, body: unknown
   if (context.provider === 'github') {
     url = githubPath(context, context.reviewRootCommentId ? `/pulls/${context.number}/comments/${context.reviewRootCommentId}/replies` : `/issues/${context.number}/comments`)
@@ -163,15 +191,8 @@ export async function deliverSourceReply(target: SourceContext | ChannelRef, mes
     body = context.chatId ? { messageIds: [context.rootMessageId], replyMessage: { body: { contentType: 'text', content } } }
       : { body: { contentType: 'text', content } }
   }
-  try {
-    const { value } = await sourceRequest(url, credential.token, options.signal, transport, { body })
-    return receipt(value, context, message, marker, false)
-  } catch (error) {
-    if (error instanceof DeliveryError) throw error
-    // A server error or timeout can follow a committed write; only definitive client rejection permits a new POST.
-    const rejected = error instanceof SourceError && error.status !== undefined && error.status >= 400 && error.status < 500 && error.status !== 408
-    throw new DeliveryError(rejected ? 'Source delivery rejected' : 'Source delivery outcome unknown; reconcile before retrying', rejected ? 'not-sent' : 'unknown')
-  }
+  const { value } = await submitReply(url, credential.token, body, options)
+  return receipt(value, context, message, marker, false)
 }
 
 /** Reads bounded original conversation context using the same exact provider/tenant/repository allowlist as delivery. */
@@ -217,6 +238,7 @@ export async function resolveGitHubReviewThread(target: SourceContext | ChannelR
   }
   if (!found || context.reviewThreadId && context.reviewThreadId !== found.id) return reject()
   if (!found.resolved) {
+    beforeSubmit(options)
     try {
       const { value } = await sourceRequest(url, credential.token, options.signal, transport, { body: {
         query: 'mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id isResolved}}}', variables: { id: found.id },

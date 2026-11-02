@@ -8,9 +8,11 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { runInNewContext } from 'node:vm'
 import { TicketRuntime } from '../src/runtime.ts'
-import { githubThreadRef } from '../src/sources.ts'
+import { githubThreadRef, sourceTrigger } from '../src/sources.ts'
+import type { SourceContext } from '../src/sources.ts'
 import type { AutomationSettings } from '../src/settings.ts'
 import type { PanelHost } from '../src/panel.ts'
+import type { AgentRun } from '../src/agent-backend.ts'
 
 const requireModule = createRequire(import.meta.url)
 const code = buildSync({
@@ -36,10 +38,11 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
   const runtime = new TicketRuntime(directory)
   const values: Record<string, unknown> = { ...initial }
   const commands = new Map<string, () => Promise<unknown>>()
-  const requests: { url: URL; authorization: string | null }[] = [], signins: string[][] = []
+  const requests: { url: URL; authorization: string | null; method: string; body?: string }[] = [], signins: string[][] = []
   const errors: string[] = []
-  let panel!: PanelHost, signIn: (() => void) | undefined, response: (url: URL) => unknown = () => []
-  let credentials = 0
+  let panel!: PanelHost, signIn: (() => void | Promise<void>) | undefined, githubCredential: (() => void | Promise<void>) | undefined, response: (url: URL, init?: RequestInit) => unknown = () => []
+  let credentials = 0, worker: ((request: AgentRun) => Promise<void>) | undefined
+  const runs: AgentRun[] = []
   const disposable = { dispose() {} }
   const api = {
     workspace: { getConfiguration: () => ({
@@ -47,7 +50,7 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
       update: async (key: string, value: unknown) => { values[key] = value },
     }) },
     authentication: { getSession: async (_provider: string, scopes: string[]) => {
-      signins.push(scopes); signIn?.(); return { accessToken: 'graph-credential' }
+      signins.push(scopes); await signIn?.(); return { accessToken: 'graph-credential' }
     } },
     commands: { registerCommand: (name: string, callback: () => Promise<unknown>) => { commands.set(name, callback); return disposable } },
     window: { showErrorMessage: async (error: string) => { errors.push(error) },
@@ -59,7 +62,8 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
   const module = { exports: {} as { activateAutomation(context: unknown, hooks: unknown): { shutdown(): Promise<void> } } }
   runInNewContext(code, {
     module, exports: module.exports, require: (name: string) => name === 'vscode' ? api : name === './copilot.ts' ? {
-      CopilotBackend: class { async check() { return { authenticated: true } } async dispose() {} },
+      CopilotBackend: class { async check() { return { authenticated: true } } async abort() {} async dispose() {} async assess() { return { kind: 'ignore', reason: 'No stop or new task' } }
+        async run(request: AgentRun) { runs.push(request); if (worker) await worker(request); else await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'waiting', summary: 'Waiting for a native input' }) } },
     } : name === './panel.ts' ? { SuperagentPanel: class {
       constructor(host: PanelHost) { panel = host }
       show() {} refresh() {} dispose() {}
@@ -67,31 +71,33 @@ function fixture(initial: Record<string, unknown> = {}, storageDirectory?: strin
     process, Buffer, structuredClone, AbortController, AbortSignal, URL, URLSearchParams, setTimeout, clearTimeout, queueMicrotask,
     fetch: async (input: URL, init?: RequestInit) => {
       const url = new URL(String(input))
-      requests.push({ url, authorization: new Headers(init?.headers).get('authorization') })
+      requests.push({ url, authorization: new Headers(init?.headers).get('authorization'), method: init?.method ?? 'GET', ...(init?.body ? { body: String(init.body) } : {}) })
       if (url.origin === 'https://graph.microsoft.com' && url.pathname === '/v1.0/me') return Response.json({ id: account })
       if (url.pathname === '/repos/company/project') return Response.json({ default_branch: 'main' })
       if (url.pathname.endsWith('/branches/main')) return Response.json({ commit: { sha: head } })
       if (url.pathname.endsWith('/check-runs')) return Response.json({ check_runs: [] })
-      return Response.json(response(url))
+      return Response.json(await response(url, init))
     },
   })
   const lifecycle = module.exports.activateAutomation({ subscriptions: [], extensionUri: {} }, {
-    host: async () => ({ runtime, root: directory, identity: 'local-test', trees: { prepare: async () => directory } }),
+    host: async () => ({ runtime, root: directory, identity: 'local-test', trees: { prepare: async () => directory, validate: async () => directory } }),
     guard: () => 'local-test', changed() {}, github: async () => {
-      credentials++
+      credentials++; await githubCredential?.()
       return { origin: 'https://api.github.com', repository: values['github.repository'], account: 'agent',
         allowedActors: values['github.allowedActors'] ?? [], token: `github-credential-${credentials}` }
     },
   })
   const snapshot = () => panel.snapshot() as { settings: { revision: number; value: AutomationSettings } }
-  return { directory, runtime, values, requests, signins, errors, snapshot, get credentials() { return credentials },
+  return { directory, runtime, values, requests, signins, errors, runs, snapshot,
+    onWorker: (handler: (request: AgentRun) => Promise<void>) => { worker = handler }, get credentials() { return credentials },
     initialize: () => commands.get('superagent.dashboard')!(),
     start: () => commands.get('superagent.startService')!(),
     save: (value: unknown) => panel.action({ action: 'saveSettings', revision: snapshot().settings.revision, value }),
     restore: (revision: number) => panel.action({ action: 'restoreSettings', revision, baseRevision: snapshot().settings.revision }),
     poll: () => panel.action({ action: 'poll' }),
-    respond: (handler: (url: URL) => unknown) => { response = handler },
-    onSignIn: (handler: () => void) => { signIn = handler },
+    respond: (handler: (url: URL, init?: RequestInit) => unknown) => { response = handler },
+    onSignIn: (handler: () => void | Promise<void>) => { signIn = handler },
+    onGitHubCredential: (handler: () => void | Promise<void>) => { githubCredential = handler },
     close: async (preserveStorage = false) => { await lifecycle.shutdown(); runtime.dispose(); if (!preserveStorage) rmSync(directory, { recursive: true, force: true }) },
   }
 }
@@ -677,3 +683,122 @@ test('authenticated PR CI receipts normalize whole-second timestamps and stay bo
     assert.equal(current.runtime.verifiedStatus(persisted, current.runtime.get(ticket.id)), false)
   } finally { if (current) await current.close(); else rmSync(directory, { recursive: true, force: true }) }
 })
+
+
+for (const family of ['github', 'teams'] as const) for (const change of ['requester', 'source', 'delivery'] as const) {
+  test(`${family} native deferred credentials recheck ${change} withdrawal before POST and restore reversible pending results`, async () => {
+    const configuration = family === 'github' ? { 'github.repository': 'company/project', 'github.allowedActors': ['owner'] }
+      : { 'teams.tenantId': tenant, 'teams.chatIds': [chat], 'teams.allowedActors': [nativeActor] }
+    const f = fixture(configuration)
+    let release!: () => void, held = false, signins = 0
+    const credential = new Promise<void>(resolve => { release = resolve })
+    const wait = async (check: () => boolean) => {
+      const until = Date.now() + 3000
+      while (!check()) { if (Date.now() > until) assert.fail('Native outbound fixture did not settle'); await new Promise(resolve => setTimeout(resolve, 5)) }
+    }
+    try {
+      await f.initialize(); await f.save({ enabled: true })
+      const context: SourceContext = family === 'github'
+        ? { provider: 'github', sourceConfigId: 'native-approved', origin: 'https://api.github.com', repository: 'company/project', account: 'agent', number: 7,
+          nativeThreadId: '7', isPullRequest: false, kind: 'comment', human: true, bot: false, allowedActor: true, subscribed: false, addressed: 'mention' }
+        : { provider: 'teams', sourceConfigId: 'native-approved', tenantId: tenant, chatId: chat, rootMessageId: 'root', messageId: 'root', nativeThreadId: 'root',
+          human: true, bot: false, allowedActor: true, subscribed: false, addressed: 'mention' }
+      const trigger = sourceTrigger({ id: `deferred-${family}-${change}`, source: family, actor: family === 'github' ? 'owner' : nativeActor,
+        text: 'Approved source request', thread: context.nativeThreadId, context })
+      // Delivery toggling also exercises an explicitly imported native mandate.
+      let ticket
+      if (change === 'delivery') ticket = f.runtime.create('Locally imported source request', { source: family, id: trigger.id, actor: trigger.actor.id, context })
+      else {
+        f.runtime.engine.receive(trigger)
+        const decision = f.runtime.engine.decide(trigger.id, { kind: 'accept', title: 'Approved repair', scope: 'Repair the requested issue', reason: 'Allowed requester' })
+        ticket = f.runtime.get(decision.ticketId!)
+      }
+      f.runtime.begin(ticket.id); f.runtime.report(ticket.id, 'ready', 'Ready after verified local work')
+      assert.equal(f.runtime.get(ticket.id).ended?.outcome, 'completed')
+      const block = async () => { held = true; await credential }
+      if (family === 'github') f.onGitHubCredential(block)
+      else f.onSignIn(async () => { if (++signins > 1) await block() })
+      f.respond((url, init) => init?.method === 'POST' ? { id: family === 'github' ? 701 : '701' } : url.origin === 'https://graph.microsoft.com' ? { value: [] } : [])
+      await f.start()
+      await wait(() => held && f.runtime.repositories.automation().effects.some(effect => effect.kind === 'outbound' && effect.status === 'running'))
+      if (change === 'requester') await f.save({ sources: { [family]: { allowedActors: [] } } })
+      else if (change === 'source') await f.save({ sources: { [family]: { enabled: false } } })
+      else f.values['delivery.enabled'] = false // Native consent/config change need not emit a repository commit.
+      release()
+      await wait(() => !f.runtime.repositories.automation().effects.some(effect => effect.kind === 'outbound' && effect.status === 'running'))
+      assert.equal(f.requests.filter(request => request.method === 'POST').length, 0, 'Withdrawn authority must prevent the deferred POST')
+      const effects = () => f.runtime.repositories.automation().effects.filter(effect => effect.kind === 'outbound')
+      if (change === 'requester') assert.ok(effects().every(effect => effect.status === 'cancelled'))
+      else {
+        assert.ok(effects().some(effect => effect.status === 'pending'))
+        const attempts = effects().reduce((total, effect) => total + effect.attempts, 0)
+        await new Promise(resolve => setTimeout(resolve, 30))
+        assert.equal(effects().reduce((total, effect) => total + effect.attempts, 0), attempts)
+        if (change === 'source') await f.save({ sources: { [family]: { enabled: true } } })
+        else f.values['delivery.enabled'] = true
+        await wait(() => f.requests.some(request => request.method === 'POST'))
+        assert.equal(f.requests.filter(request => request.method === 'POST').length, 1)
+        await wait(() => effects().every(effect => effect.status === 'completed'))
+      }
+    } finally { release(); await f.close() }
+  })
+}
+
+
+for (const change of ['requester', 'source', 'delivery'] as const) {
+  test(`native review resolution rechecks ${change} grant after the asynchronous thread lookup`, async () => {
+    const f = fixture({ 'github.repository': 'company/project', 'github.allowedActors': ['owner'] })
+    let release!: () => void, lookupStarted = false, rejected = false, resolving = false, resolutionFinished = false
+    const lookup = new Promise<void>(resolve => { release = resolve })
+    const wait = async (check: () => boolean) => {
+      const until = Date.now() + 3000
+      while (!check()) { if (Date.now() > until) assert.fail('Review authority fixture did not settle'); await new Promise(resolve => setTimeout(resolve, 5)) }
+    }
+    try {
+      await f.initialize(); await f.save({ enabled: true })
+      const ticket = f.runtime.create('Native approved repair')
+      f.runtime.engine.bindThread(ticket.id, githubThreadRef(repositoryConfig, 7), true)
+      const context: SourceContext = { provider: 'github', sourceConfigId: 'native', origin: 'https://api.github.com', repository: 'company/project', account: 'agent', number: 7,
+        nativeThreadId: '7', isPullRequest: true, kind: 'review-comment', reviewRootCommentId: 70, reviewThreadId: 'PRRT_native', commentId: 70,
+        human: true, bot: false, allowedActor: true, subscribed: true, addressed: 'mention' }
+      const review = sourceTrigger({ id: `native-review-${change}`, source: 'github', actor: 'owner', text: 'Please resolve the addressed feedback', thread: '7', context })
+      f.onWorker(async request => {
+        if (resolving) {
+          assert.match(request.prompt, /Native-only instruction/)
+          const inputLine = request.prompt.split('\n').find(line => line.startsWith('New inputs: '))!
+          assert.doesNotMatch(inputLine, /Please resolve the addressed feedback/)
+          try { await request.tools.find(tool => tool.name === 'orchestrator_review_resolve')!.invoke({ trigger_id: review.id }) } catch { rejected = true }
+          resolutionFinished = true
+        }
+        await request.tools.find(tool => tool.name === 'orchestrator_report')!.invoke({ state: 'waiting', summary: 'Waiting for an approved instruction' })
+      })
+      f.respond(async (url, init) => {
+        if (url.pathname.endsWith('/pulls/7')) return pull(7)
+        if (url.pathname === '/graphql') {
+          const body = JSON.parse(String(init?.body))
+          if (body.query.startsWith('query')) {
+            lookupStarted = true; await lookup
+            return { data: { repository: { pullRequest: { reviewThreads: { nodes: [{ id: 'PRRT_native', isResolved: false, comments: { nodes: [{ databaseId: 70 }] } }], pageInfo: { hasNextPage: false } } } } } }
+          }
+          return { data: { resolveReviewThread: { thread: { id: 'PRRT_native', isResolved: true } } } }
+        }
+        return []
+      })
+      await f.start(); await wait(() => f.runs.length >= 1 && f.runtime.repositories.automation().sessions[0]?.status === 'idle'
+        && !f.runtime.repositories.automation().effects.some(effect => ['start', 'deliver'].includes(effect.kind) && ['pending', 'running'].includes(effect.status)))
+      f.runtime.engine.receive(review)
+      await wait(() => f.runs.some(run => run.prompt.includes(review.text)) && f.runtime.repositories.automation().sessions[0]?.status === 'idle')
+      resolving = true
+      f.runtime.followup(ticket.id, 'Native-only instruction: review the completed feedback resolution')
+      await wait(() => lookupStarted)
+      if (change === 'requester') await f.save({ sources: { github: { allowedActors: [] } } })
+      else if (change === 'source') await f.save({ sources: { github: { enabled: false } } })
+      else f.values['delivery.enabled'] = false
+      release(); await wait(() => resolutionFinished)
+      assert.equal(f.requests.filter(request => request.body && JSON.parse(request.body).query?.startsWith('mutation')).length, 0)
+      assert.equal(rejected, true)
+      assert.equal(f.runtime.get(ticket.id).mandate.actor.source, 'vscode')
+      assert.equal(f.runtime.get(ticket.id).ended, undefined)
+    } finally { release(); await f.close() }
+  })
+}
